@@ -26,6 +26,7 @@ cuda = [
 [project.scripts]
 demo01 = "llmrefresher.demos.d01_attention:main"
 demo02 = "llmrefresher.demos.d02_kv_cache:main"
+demo03 = "llmrefresher.demos.d03_flash_attention:main"
 
 [build-system]
 requires = ["hatchling"]

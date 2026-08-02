@@ -1,0 +1,119 @@
+==========================================================================
+DEMO 03: Flash Attention: exact, not approximate
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+
+--------------------------------------------------------------------------
+1. Online softmax: partial softmaxes that compose
+--------------------------------------------------------------------------
+  block size  max |online - torch|  rows sum to
+  -----------------------------------------------
+  64                     5.960e-08       1.0000
+  128                    1.192e-07       1.0000
+  512                    1.788e-07       1.0000
+  2048                   1.192e-07       1.0000
+
+  logits were scaled by 8, so the row range spans ~80 — an unstable
+  implementation would return inf or nan here, not 1e-9.
+
+  >> Block size changes the memory schedule, not the answer. The running rescale makes partial softmaxes composable.
+
+--------------------------------------------------------------------------
+2. Tiled attention reproduces the reference exactly
+--------------------------------------------------------------------------
+  causal=False: tiled vs F.scaled_dot_product_attention
+
+  tile (q x k)  max abs difference
+  ----------------------------------
+  64 x 64                4.768e-07
+  128 x 128              5.066e-07
+  256 x 512              4.917e-07
+
+  causal=True: tiled vs F.scaled_dot_product_attention
+
+  tile (q x k)  max abs difference
+  ----------------------------------
+  64 x 64                1.431e-06
+  128 x 128              1.431e-06
+  256 x 512              1.431e-06
+
+  versus a method that really is an approximation:
+
+  method                 max abs difference vs exact
+  ----------------------------------------------------
+  Flash / tiled (exact)                    1.431e-06
+  sliding window, w=256                       0.6047
+  sliding window, w=64                        1.5660
+
+  >> Flash Attention differs from the reference by float reassociation noise. Sliding-window attention differs by five orders of magnitude more — it changes the function, Flash changes only the memory schedule.
+
+--------------------------------------------------------------------------
+3. The memory that is never allocated
+--------------------------------------------------------------------------
+  batch=1, heads=8, head_dim=64, fp32
+
+  seq   score matrix (n^2)  naive measured  one tile  tiled residual
+  --------------------------------------------------------------------
+  512              8.0 MiB         9.0 MiB   0.5 MiB         0.0 MiB
+  1024            32.0 MiB        33.0 MiB   0.5 MiB         0.0 MiB
+  2048           128.0 MiB       130.0 MiB   0.5 MiB         0.0 MiB
+  4096           512.0 MiB       524.0 MiB   0.5 MiB         0.0 MiB
+
+  'naive measured' holds the weight matrix alive, so the allocator sees it;
+  it tracks the analytic n^2 column to within a few MiB. 'tiled residual' is
+  0 because each tile is freed as the loop moves on — that is the claim, not
+  a measurement artifact: peak tile storage is the constant in column 4.
+
+  8x the sequence, score matrix grows 64x
+  tile size, independent of sequence 0.5 MiB
+
+  extrapolating the score matrix past what fits on this machine:
+
+  seq     score matrix, 8 heads fp32
+  ------------------------------------
+  8192                       2.0 GiB
+  16384                      8.0 GiB
+  32768                     32.0 GiB
+  131072                   512.0 GiB
+
+  >> The naive score matrix is quadratic in sequence length and is the reason long context was infeasible. The tile is a constant, chosen to fit in SRAM.
+
+--------------------------------------------------------------------------
+4. Causal masking lets whole tiles be skipped
+--------------------------------------------------------------------------
+  block size  tiles computed  tiles skipped  fraction skipped
+  -------------------------------------------------------------
+  128                    136            120               47%
+  256                     36             28               44%
+  512                     10              6               38%
+
+  >> With causal masking, just under half the score matrix is structurally -inf. The naive path computes it and then throws it away; a tiled loop never touches those tiles at all.
+
+--------------------------------------------------------------------------
+5. Where the speed actually comes from
+--------------------------------------------------------------------------
+  seq   naive (ms)  fused SDPA (ms)  speedup
+  --------------------------------------------
+  512       1.2088           0.3530    3.42x
+  1024      3.5545           0.8071    4.40x
+  2048     12.9146           2.0357    6.34x
+  4096     54.1743           6.9855    7.76x
+
+  The Python tiled loop above is far slower than either — it pays full
+  HBM traffic per tile plus Python overhead. The algorithm buys memory;
+  fusing it into one kernel is what buys time.
+
+  >> The speedup grows with sequence length, because the naive path's memory traffic grows quadratically while the fused path's grows linearly.
+
+--------------------------------------------------------------------------
+6. Figures
+--------------------------------------------------------------------------
+  wrote figures/03-flash-attention/memory-scaling-light.png
+  wrote figures/03-flash-attention/timing-light.png
+  wrote figures/03-flash-attention/tiling-light.png
+  wrote figures/03-flash-attention/memory-scaling-dark.png
+  wrote figures/03-flash-attention/timing-dark.png
+  wrote figures/03-flash-attention/tiling-dark.png

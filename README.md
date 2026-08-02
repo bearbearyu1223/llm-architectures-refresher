@@ -50,6 +50,7 @@ speedup" is actually just measuring Python dispatch overhead.
 | --- | --- | --- |
 | `demo01` | Attention & RoPE | Attention in 5 lines matched against PyTorch's fused kernel; softmax saturation without `1/sqrt(d_k)`; causal masking; RoPE scores depending only on relative offset |
 | `demo02` | KV cache | Cached and uncached generation producing identical tokens; the 284x repeated-work multiplier without a cache; the cache outgrowing the weights at 128k context; prefill at 256 FLOP/byte vs decode at 0.5; and the batch sweep where KV traffic overtakes weight traffic |
+| `demo03` | Flash Attention | Online softmax matching `torch.softmax` to 1e-7; tiled attention reproducing the fused kernel exactly while sliding-window attention misses by 0.6; the n^2 score matrix reaching 512 GiB at 128k context; and ~47% of causal tiles skipped outright |
 
 More land as the series is written.
 
