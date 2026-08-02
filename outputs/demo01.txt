@@ -15,6 +15,17 @@ device memory : 17.2 GB
   >> The fused kernel is an optimization, not a different algorithm. Differences are float reassociation noise, ~1e-6.
 
 --------------------------------------------------------------------------
+1b. Where attention sits in the block
+--------------------------------------------------------------------------
+  block shape                  attention params  FFN params  FFN share
+  ----------------------------------------------------------------------
+  GPT-2 style (MHA, ReLU FFN)             10.2M       20.5M        67%
+  Llama-3-8B (GQA, SwiGLU)                41.9M      176.2M        81%
+  Llama-3-70B (GQA, SwiGLU)              151.0M      704.6M        82%
+
+  >> Attention is where tokens interact, but it is the minority of the weights — 67% of a classic block is FFN, and modern GQA + SwiGLU decoders push that past 80%. Knowledge lives mostly in the FFN; routing lives in attention.
+
+--------------------------------------------------------------------------
 2. Why divide by sqrt(d_k)?
 --------------------------------------------------------------------------
   d_k   logit std  max w (raw)  H (raw)  max w (/sqrt)  H (/sqrt)
@@ -78,9 +89,11 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 5. Figures
 --------------------------------------------------------------------------
+  wrote figures/01-attention-and-rope/block-anatomy-light.png
   wrote figures/01-attention-and-rope/softmax-saturation-light.png
   wrote figures/01-attention-and-rope/causal-mask-light.png
   wrote figures/01-attention-and-rope/rope-relative-light.png
+  wrote figures/01-attention-and-rope/block-anatomy-dark.png
   wrote figures/01-attention-and-rope/softmax-saturation-dark.png
   wrote figures/01-attention-and-rope/causal-mask-dark.png
   wrote figures/01-attention-and-rope/rope-relative-dark.png

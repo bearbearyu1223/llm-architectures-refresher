@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -86,8 +87,110 @@ def check_against_pytorch(rep: Report, device: torch.device) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Why the 1/sqrt(d_k) scale exists
+# 1b. Where attention sits in the block
 # ---------------------------------------------------------------------------
+
+
+def block_parameter_split(rep: Report) -> dict[str, dict[str, float]]:
+    """Count attention vs FFN parameters in one transformer block.
+
+    Attention gets the attention, but it is the minority of the weights. The
+    familiar "the FFN is about two-thirds of the parameters" comes from the
+    original shape: multi-head attention with four ``d x d`` projections, and an
+    FFN that expands to ``4d`` with two matrices.
+
+        attention = 4 * d^2          FFN = 2 * d * 4d = 8 * d^2
+
+    Modern decoders move further in that direction from both sides: GQA shrinks
+    the K and V projections, while SwiGLU adds a third FFN matrix.
+    """
+    configs = {
+        "GPT-2 style (MHA, ReLU FFN)": dict(d_model=1600, n_heads=25, n_kv_heads=25, head_dim=64, d_ff=6400, ffn_mats=2),
+        "Llama-3-8B (GQA, SwiGLU)": dict(d_model=4096, n_heads=32, n_kv_heads=8, head_dim=128, d_ff=14336, ffn_mats=3),
+        "Llama-3-70B (GQA, SwiGLU)": dict(d_model=8192, n_heads=64, n_kv_heads=8, head_dim=128, d_ff=28672, ffn_mats=3),
+    }
+
+    out: dict[str, dict[str, float]] = {}
+    rows = []
+    for name, c in configs.items():
+        d = c["d_model"]
+        # q and o are d x (n_heads*head_dim); k and v are d x (n_kv_heads*head_dim).
+        attn = d * c["n_heads"] * c["head_dim"] * 2 + d * c["n_kv_heads"] * c["head_dim"] * 2
+        ffn = c["ffn_mats"] * d * c["d_ff"]
+        total = attn + ffn
+        out[name] = {"attn": attn, "ffn": ffn, "ffn_share": ffn / total}
+        rows.append([name, f"{attn / 1e6:.1f}M", f"{ffn / 1e6:.1f}M", f"{ffn / total:.0%}"])
+
+    rep.table(["block shape", "attention params", "FFN params", "FFN share"], rows)
+    rep.takeaway(
+        "Attention is where tokens interact, but it is the minority of the "
+        "weights — 67% of a classic block is FFN, and modern GQA + SwiGLU "
+        "decoders push that past 80%. Knowledge lives mostly in the FFN; "
+        "routing lives in attention."
+    )
+    return out
+
+
+def figure_block(theme: Theme) -> Path:
+    """Schematic of one pre-norm decoder block, and where attention sits."""
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(6.4, 6.6))
+        ax.grid(False)
+        ax.set_xlim(0, 10)
+        ax.set_ylim(0, 13)
+        ax.axis("off")
+
+        def box(y, height, label, sub, color, text_color=None):
+            ax.add_patch(
+                patches.FancyBboxPatch(
+                    (2.0, y), 6.0, height,
+                    boxstyle="round,pad=0.08", facecolor=color,
+                    edgecolor=theme.surface, linewidth=1.5,
+                )
+            )
+            tc = text_color or theme.ink
+            ax.text(5.0, y + height / 2 + (0.16 if sub else 0), label,
+                    ha="center", va="center", fontsize=10.5, fontweight="bold", color=tc)
+            if sub:
+                ax.text(5.0, y + height / 2 - 0.28, sub, ha="center", va="center",
+                        fontsize=8.5, color=tc)
+
+        def arrow(y0, y1):
+            ax.annotate("", xy=(5.0, y1), xytext=(5.0, y0),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+
+        neutral = theme.ramp[0]
+        box(0.3, 1.0, "Token embeddings", None, neutral)
+        arrow(1.3, 1.9)
+
+        # The block itself, drawn as a dashed container.
+        ax.add_patch(
+            patches.FancyBboxPatch(
+                (1.4, 1.85), 7.2, 8.0, boxstyle="round,pad=0.1",
+                facecolor="none", edgecolor=theme.axis, linewidth=1.4, linestyle="--",
+            )
+        )
+        ax.text(8.75, 5.85, "x N layers", rotation=90, ha="center", va="center",
+                fontsize=9.5, color=theme.muted)
+
+        box(2.1, 0.85, "RMSNorm", None, neutral)
+        arrow(2.95, 3.35)
+        box(3.5, 1.25, "Multi-Head Attention", "the only place tokens mix", theme.ramp[4], theme.surface)
+        arrow(4.75, 5.15)
+        box(5.2, 0.85, "+  residual", None, neutral)
+        arrow(6.05, 6.45)
+        box(6.5, 0.85, "RMSNorm", None, neutral)
+        arrow(7.35, 7.75)
+        box(7.9, 1.25, "SwiGLU FFN", "per position; ~2/3+ of the weights", theme.ramp[2])
+        arrow(9.15, 9.55)
+        box(9.6, 0.85, "+  residual", None, neutral)
+
+        arrow(10.45, 10.9)
+        box(11.0, 0.9, "Final norm  ->  LM head", None, neutral)
+
+        ax.text(5.0, 12.5, "Where attention sits in a decoder block",
+                ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
+        return save_both(fig, SLUG, "block-anatomy", theme)
 
 
 def scaling_sweep(rep: Report, device: torch.device) -> list[dict[str, float]]:
@@ -420,6 +523,7 @@ def make_figures(
     """Render every figure in both light and dark variants."""
     for theme in THEMES:
         for path in (
+            figure_block(theme),
             figure_saturation(rows, theme),
             figure_causal_mask(weights, theme),
             figure_rope(rope_data, theme),
@@ -437,6 +541,9 @@ def main() -> None:
 
     rep.section("1. Our 5-line attention vs PyTorch's fused kernel")
     check_against_pytorch(rep, device)
+
+    rep.section("1b. Where attention sits in the block")
+    block_parameter_split(rep)
 
     rep.section("2. Why divide by sqrt(d_k)?")
     rows = scaling_sweep(rep, device)
