@@ -1,0 +1,76 @@
+==========================================================================
+DEMO 01: Attention from scratch, and RoPE's relative-position trick
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+
+--------------------------------------------------------------------------
+1. Our 5-line attention vs PyTorch's fused kernel
+--------------------------------------------------------------------------
+  max |ours - torch|  (causal=False) 5.364e-07
+  max |ours - torch|  (causal=True)  4.768e-07
+
+  >> The fused kernel is an optimization, not a different algorithm. Differences are float reassociation noise, ~1e-6.
+
+--------------------------------------------------------------------------
+2. Why divide by sqrt(d_k)?
+--------------------------------------------------------------------------
+  d_k   logit std  max w (raw)  H (raw)  max w (/sqrt)  H (/sqrt)
+  -----------------------------------------------------------------
+  4        1.9642       0.5222   1.2986         0.3401     1.7548
+  16       3.9493       0.7428   0.6825         0.3523     1.7350
+  64       7.9399       0.8738   0.3223         0.3506     1.7407
+  256     15.9159       0.9326   0.1691         0.3533     1.7318
+  1024    32.4533       0.9735   0.0674         0.3701     1.7103
+
+  uniform-over-8 entropy would be ln(8) = 2.0794
+
+  >> Unscaled, attention collapses to a hard argmax as d_k grows. Scaled, the entropy barely moves — that is the entire point of 1/sqrt(d_k).
+
+--------------------------------------------------------------------------
+3. Causal masking
+--------------------------------------------------------------------------
+  attention weights, row i = query at position i:
+
+        key0    key1    key2    key3    key4    key5    
+  q0    1.000    0.000    0.000    0.000    0.000    0.000    
+  q1    0.180    0.820    0.000    0.000    0.000    0.000    
+  q2    0.366    0.477    0.157    0.000    0.000    0.000    
+  q3    0.717    0.176    0.072    0.035    0.000    0.000    
+  q4    0.238    0.015    0.342    0.345    0.060    0.000    
+  q5    0.126    0.348    0.240    0.160    0.040    0.086    
+
+  mass on future positions           0.0000
+  each row sums to 1                 yes
+
+  >> Zero mass above the diagonal is what makes the model autoregressive: token i's representation cannot depend on token i+1.
+
+--------------------------------------------------------------------------
+4. RoPE: absolute rotation, relative score
+--------------------------------------------------------------------------
+  same q, k vectors; same offset (3); different absolute positions:
+
+  query pos m  key pos n  offset m-n  q_m . k_n
+  -----------------------------------------------
+  0                    3          -3    -1.1905
+  5                    8          -3    -1.1905
+  105                108          -3    -1.1905
+  4093              4096          -3    -1.1905
+
+  spread across absolute positions   1.073e-06
+
+  now vary the offset instead, holding the query at position 0:
+
+  offset  q_0 . k_offset
+  ------------------------
+  0              -0.0071
+  1               0.0917
+  2              -0.4322
+  4              -1.5648
+  8               2.2522
+  32             -0.2377
+  128             9.3205
+
+  >> Rotating by absolute position makes the dot product a function of the difference of angles — relative position falls out of the geometry, with no learned position embedding and no extra parameters.
