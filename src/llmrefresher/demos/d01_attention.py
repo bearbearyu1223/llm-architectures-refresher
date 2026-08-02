@@ -18,11 +18,15 @@ Run: ``uv run demo01``
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from ..device import get_device
+from ..plotting import THEMES, Theme, save_both, sequential_cmap, styled
 from ..report import Report
 
 
@@ -146,7 +150,7 @@ def scaling_sweep(rep: Report, device: torch.device) -> list[dict[str, float]]:
 # ---------------------------------------------------------------------------
 
 
-def causal_mask_demo(rep: Report, device: torch.device) -> None:
+def causal_mask_demo(rep: Report, device: torch.device) -> torch.Tensor:
     """Print the weight matrix so the lower-triangular structure is visible."""
     torch.manual_seed(1)
     seq, head_dim = 6, 16
@@ -171,6 +175,7 @@ def causal_mask_demo(rep: Report, device: torch.device) -> None:
         "Zero mass above the diagonal is what makes the model autoregressive: "
         "token i's representation cannot depend on token i+1."
     )
+    return w
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +230,7 @@ def apply_rope(x: torch.Tensor, positions: torch.Tensor, base: float = 10_000.0)
     return x * cos + rotate_half(x) * sin
 
 
-def rope_demo(rep: Report, device: torch.device) -> None:
+def rope_demo(rep: Report, device: torch.device) -> dict[str, list]:
     """The property that matters: the score depends only on ``m - n``.
 
     We take one fixed query vector and one fixed key vector, place the pair at
@@ -258,11 +263,12 @@ def rope_demo(rep: Report, device: torch.device) -> None:
     rep.note("now vary the offset instead, holding the query at position 0:")
     rep.blank()
     q0 = apply_rope(q, torch.tensor([0], device=device))
+    printed = (0, 1, 2, 4, 8, 32, 128)
     rep.table(
         ["offset", "q_0 . k_offset"],
         [
             [off, (q0 * apply_rope(k, torch.tensor([off], device=device))).sum().item()]
-            for off in (0, 1, 2, 4, 8, 32, 128)
+            for off in printed
         ],
     )
 
@@ -271,6 +277,154 @@ def rope_demo(rep: Report, device: torch.device) -> None:
         "difference of angles — relative position falls out of the geometry, with "
         "no learned position embedding and no extra parameters."
     )
+
+    # Denser sweeps for the figure than for the printed table.
+    abs_positions = list(range(0, 129))
+    abs_scores = [
+        (
+            apply_rope(q, torch.tensor([m + 3], device=device))
+            * apply_rope(k, torch.tensor([m], device=device))
+        )
+        .sum()
+        .item()
+        for m in abs_positions
+    ]
+    offsets = list(range(0, 129))
+    offset_scores = [
+        (q0 * apply_rope(k, torch.tensor([off], device=device))).sum().item()
+        for off in offsets
+    ]
+    return {
+        "abs_positions": abs_positions,
+        "abs_scores": abs_scores,
+        "offsets": offsets,
+        "offset_scores": offset_scores,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. Figures
+# ---------------------------------------------------------------------------
+
+SLUG = "01-attention-and-rope"
+
+
+def figure_saturation(rows: list[dict[str, float]], theme: Theme) -> Path:
+    """Entropy vs d_k, scaled and unscaled, against the uniform reference."""
+    d_k = [r["d_k"] for r in rows]
+    raw = [r["unscaled_entropy"] for r in rows]
+    scaled = [r["scaled_entropy"] for r in rows]
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(7.0, 4.2))
+
+        uniform = math.log(8)
+        ax.axhline(uniform, color=theme.muted, linewidth=1.2, linestyle=(0, (4, 3)))
+        ax.text(
+            d_k[0], uniform + 0.05, "uniform over 8 keys  ln(8) = 2.08",
+            color=theme.muted, fontsize=9.5, va="bottom",
+        )
+
+        ax.plot(d_k, scaled, color=theme.series[0], marker="o", label="scaled by 1/sqrt(d_k)")
+        ax.plot(d_k, raw, color=theme.series[1], marker="o", label="unscaled")
+
+        # Direct labels as well as the legend: identity never rests on color alone.
+        ax.text(d_k[-1] * 1.15, scaled[-1], "scaled", color=theme.series[0],
+                fontsize=10.5, fontweight="bold", va="center")
+        ax.text(d_k[-1] * 1.15, raw[-1], "unscaled", color=theme.series[1],
+                fontsize=10.5, fontweight="bold", va="center")
+
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(d_k)
+        ax.set_xticklabels([str(int(v)) for v in d_k])
+        ax.set_xlim(d_k[0] * 0.8, d_k[-1] * 2.6)
+        ax.set_ylim(0, 2.35)
+        ax.set_xlabel("head dimension  d_k")
+        ax.set_ylabel("attention entropy (nats)")
+        ax.set_title("Without 1/sqrt(d_k), attention collapses to a hard argmax")
+        ax.legend(loc="lower left")
+        return save_both(fig, SLUG, "softmax-saturation", theme)
+
+
+def figure_causal_mask(weights: torch.Tensor, theme: Theme) -> Path:
+    """Heatmap of the causal weight matrix: magnitude, so one hue light-to-dark."""
+    w = weights.numpy()
+    seq = w.shape[0]
+
+    # Masked positions are blanked to the surface color rather than drawn as the
+    # palest ramp step. Otherwise "forbidden" and "allowed but ~0" look the same,
+    # which is precisely the distinction the figure exists to make.
+    blocked = np.triu(np.ones_like(w, dtype=bool), 1)
+    shown = np.ma.masked_array(w, mask=blocked)
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(5.4, 4.6))
+        ax.grid(False)
+        cmap = sequential_cmap(theme)
+        cmap.set_bad(theme.surface)
+        im = ax.imshow(shown, cmap=cmap, vmin=0.0, vmax=1.0)
+
+        for i in range(seq):
+            for j in range(seq):
+                if j > i:
+                    ax.text(j, i, "masked", ha="center", va="center",
+                            fontsize=7.5, color=theme.muted, style="italic")
+                    continue
+                # Ink flips on the dark end of the ramp so labels stay legible.
+                shade = theme.ink if w[i, j] < 0.55 else theme.surface
+                ax.text(j, i, f"{w[i, j]:.2f}", ha="center", va="center",
+                        fontsize=8.5, color=shade)
+
+        ax.set_xticks(range(seq), [f"k{j}" for j in range(seq)])
+        ax.set_yticks(range(seq), [f"q{i}" for i in range(seq)])
+        ax.set_xlabel("key position")
+        ax.set_ylabel("query position")
+        ax.set_title("Causal mask: zero mass above the diagonal")
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        bar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        bar.set_label("attention weight", color=theme.secondary, fontsize=10)
+        bar.ax.tick_params(colors=theme.muted)
+        bar.outline.set_visible(False)
+        return save_both(fig, SLUG, "causal-mask", theme)
+
+
+def figure_rope(data: dict[str, list], theme: Theme) -> Path:
+    """Two panels, one shared y-axis: invariant to absolute, sensitive to relative."""
+    with styled(theme):
+        fig, (left, right) = plt.subplots(1, 2, figsize=(9.6, 3.9), sharey=True)
+
+        left.plot(data["abs_positions"], data["abs_scores"], color=theme.series[0])
+        left.set_title("Fixed offset (+3), sliding absolute position", fontsize=11.5)
+        left.set_xlabel("absolute position m")
+        left.set_ylabel("attention score  q_m . k_n")
+
+        right.plot(data["offsets"], data["offset_scores"], color=theme.series[1])
+        right.set_title("Query pinned at 0, sweeping the offset", fontsize=11.5)
+        right.set_xlabel("relative offset  m - n")
+
+        fig.suptitle(
+            "RoPE: the score ignores where you are, only how far apart you are",
+            fontsize=13, fontweight="bold", color=theme.ink, y=1.03,
+        )
+        return save_both(fig, SLUG, "rope-relative", theme)
+
+
+def make_figures(
+    rep: Report,
+    rows: list[dict[str, float]],
+    weights: torch.Tensor,
+    rope_data: dict[str, list],
+) -> None:
+    """Render every figure in both light and dark variants."""
+    for theme in THEMES:
+        for path in (
+            figure_saturation(rows, theme),
+            figure_causal_mask(weights, theme),
+            figure_rope(rope_data, theme),
+        ):
+            rep.note(f"wrote {path.relative_to(path.parents[2])}")
 
 
 # ---------------------------------------------------------------------------
@@ -285,13 +439,16 @@ def main() -> None:
     check_against_pytorch(rep, device)
 
     rep.section("2. Why divide by sqrt(d_k)?")
-    scaling_sweep(rep, device)
+    rows = scaling_sweep(rep, device)
 
     rep.section("3. Causal masking")
-    causal_mask_demo(rep, device)
+    weights = causal_mask_demo(rep, device)
 
     rep.section("4. RoPE: absolute rotation, relative score")
-    rope_demo(rep, device)
+    rope_data = rope_demo(rep, device)
+
+    rep.section("5. Figures")
+    make_figures(rep, rows, weights, rope_data)
 
 
 if __name__ == "__main__":

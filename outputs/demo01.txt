@@ -74,3 +74,13 @@ device memory : 17.2 GB
   128             9.3205
 
   >> Rotating by absolute position makes the dot product a function of the difference of angles — relative position falls out of the geometry, with no learned position embedding and no extra parameters.
+
+--------------------------------------------------------------------------
+5. Figures
+--------------------------------------------------------------------------
+  wrote figures/01-attention-and-rope/softmax-saturation-light.png
+  wrote figures/01-attention-and-rope/causal-mask-light.png
+  wrote figures/01-attention-and-rope/rope-relative-light.png
+  wrote figures/01-attention-and-rope/softmax-saturation-dark.png
+  wrote figures/01-attention-and-rope/causal-mask-dark.png
+  wrote figures/01-attention-and-rope/rope-relative-dark.png
