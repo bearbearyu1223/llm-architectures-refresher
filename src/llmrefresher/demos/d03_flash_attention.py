@@ -33,7 +33,7 @@ import torch
 import torch.nn.functional as F
 
 from ..device import benchmark_ms, get_device, peak_memory_bytes, reset_peak_memory, sync
-from ..plotting import THEMES, Theme, save_both, styled
+from ..plotting import THEMES, Theme, ink_for, save_both, styled
 from ..report import Report
 
 SLUG = "03-flash-attention"
@@ -437,7 +437,7 @@ def figure_tiling(theme: Theme) -> Path:
                     )
                 )
                 label = "skip" if skipped else ("partial" if j == i else "full")
-                color = theme.muted if skipped else (theme.ink if j < i else theme.surface)
+                color = theme.muted if skipped else ink_for(face)
                 ax.text(j + 0.5, n_blocks - 0.5 - i, label, ha="center", va="center",
                         fontsize=8.5, color=color, style="italic" if skipped else "normal")
 

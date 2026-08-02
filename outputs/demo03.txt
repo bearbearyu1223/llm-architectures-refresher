@@ -97,10 +97,10 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
   seq   naive (ms)  fused SDPA (ms)  speedup
   --------------------------------------------
-  512       1.2088           0.3530    3.42x
-  1024      3.5545           0.8071    4.40x
-  2048     12.9146           2.0357    6.34x
-  4096     54.1743           6.9855    7.76x
+  512       1.2126           0.3504    3.46x
+  1024      3.5275           0.8312    4.24x
+  2048     12.9022           2.0488    6.30x
+  4096     54.5067           6.9834    7.81x
 
   The Python tiled loop above is far slower than either — it pays full
   HBM traffic per tile plus Python overhead. The algorithm buys memory;

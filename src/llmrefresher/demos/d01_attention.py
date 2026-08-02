@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from ..device import get_device
-from ..plotting import THEMES, Theme, save_both, sequential_cmap, styled
+from ..plotting import THEMES, Theme, ink_for, save_both, sequential_cmap, styled
 from ..report import Report
 
 
@@ -132,64 +132,106 @@ def block_parameter_split(rep: Report) -> dict[str, dict[str, float]]:
 
 
 def figure_block(theme: Theme) -> Path:
-    """Schematic of one pre-norm decoder block, and where attention sits."""
+    """Schematic of one pre-norm decoder block, and where attention sits.
+
+    The residual is drawn as an actual skip: it branches off the trunk *before*
+    the norm, bypasses both the norm and the sublayer, and rejoins at an add
+    node. That routing is the substance of "pre-norm" — the normalization sits
+    inside the residual branch, so there is an unnormalized path from the
+    embeddings to the output that the gradient can travel without attenuation.
+    Drawing the add as just another box in a chain hides exactly that.
+    """
+    TRUNK = 4.6      # x of the main path
+    SKIP = 8.5       # x of the bypass rail
+    LEFT, WIDTH = 2.0, 5.2
+
     with styled(theme):
-        fig, ax = plt.subplots(figsize=(6.4, 6.6))
+        fig, ax = plt.subplots(figsize=(6.8, 8.4))
         ax.grid(False)
         ax.set_xlim(0, 10)
-        ax.set_ylim(0, 13)
+        ax.set_ylim(0, 13.0)
         ax.axis("off")
 
         def box(y, height, label, sub, color, text_color=None):
             ax.add_patch(
                 patches.FancyBboxPatch(
-                    (2.0, y), 6.0, height,
-                    boxstyle="round,pad=0.08", facecolor=color,
+                    (LEFT, y), WIDTH, height,
+                    boxstyle="round,pad=0.06", facecolor=color,
                     edgecolor=theme.surface, linewidth=1.5,
                 )
             )
-            tc = text_color or theme.ink
-            ax.text(5.0, y + height / 2 + (0.16 if sub else 0), label,
+            tc = text_color or ink_for(color)
+            ax.text(TRUNK, y + height / 2 + (0.15 if sub else 0), label,
                     ha="center", va="center", fontsize=10.5, fontweight="bold", color=tc)
             if sub:
-                ax.text(5.0, y + height / 2 - 0.28, sub, ha="center", va="center",
+                ax.text(TRUNK, y + height / 2 - 0.26, sub, ha="center", va="center",
                         fontsize=8.5, color=tc)
 
         def arrow(y0, y1):
-            ax.annotate("", xy=(5.0, y1), xytext=(5.0, y0),
+            ax.annotate("", xy=(TRUNK, y1), xytext=(TRUNK, y0),
                         arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
 
-        neutral = theme.ramp[0]
-        box(0.3, 1.0, "Token embeddings", None, neutral)
-        arrow(1.3, 1.9)
+        def add_node(y):
+            """The circled plus where the branch rejoins the trunk."""
+            ax.add_patch(patches.Circle((TRUNK, y), 0.30, facecolor=theme.surface,
+                                        edgecolor=theme.secondary, linewidth=1.6, zorder=4))
+            ax.text(TRUNK, y, "+", ha="center", va="center", fontsize=13,
+                    color=theme.secondary, fontweight="bold", zorder=5)
 
-        # The block itself, drawn as a dashed container.
+        def skip(y_branch, y_join, label):
+            """Branch off the trunk, run up the rail, rejoin at the add node."""
+            ax.add_patch(patches.Circle((TRUNK, y_branch), 0.075,
+                                        facecolor=theme.secondary, edgecolor="none", zorder=4))
+            ax.plot([TRUNK, SKIP], [y_branch, y_branch], color=theme.secondary, linewidth=1.4, zorder=2)
+            ax.plot([SKIP, SKIP], [y_branch, y_join], color=theme.secondary, linewidth=1.4, zorder=2)
+            ax.annotate("", xy=(TRUNK + 0.30, y_join), xytext=(SKIP, y_join),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.secondary, linewidth=1.4))
+            ax.text(SKIP + 0.18, (y_branch + y_join) / 2, label, rotation=90,
+                    ha="left", va="center", fontsize=8.5, color=theme.secondary, style="italic")
+
+        neutral = theme.ramp[0]
+
+        box(0.25, 0.85, "Token embeddings", None, neutral)
+        arrow(1.10, 1.55)
+
+        # Dashed container marking one repeated block.
         ax.add_patch(
             patches.FancyBboxPatch(
-                (1.4, 1.85), 7.2, 8.0, boxstyle="round,pad=0.1",
-                facecolor="none", edgecolor=theme.axis, linewidth=1.4, linestyle="--",
+                (1.5, 1.50), 7.9, 8.35, boxstyle="round,pad=0.10",
+                facecolor="none", edgecolor=theme.axis, linewidth=1.3, linestyle="--", zorder=1,
             )
         )
-        ax.text(8.75, 5.85, "x N layers", rotation=90, ha="center", va="center",
+
+        # --- attention sublayer -------------------------------------------
+        skip(1.75, 5.35, "residual")
+        arrow(1.75, 2.05)
+        box(2.05, 0.78, "RMSNorm", None, neutral)
+        arrow(2.83, 3.15)
+        box(3.15, 1.20, "Multi-Head Attention", "the only place tokens mix",
+            theme.ramp[4])
+        arrow(4.35, 5.05)
+        add_node(5.35)
+
+        # --- FFN sublayer --------------------------------------------------
+        arrow(5.65, 6.05)
+        skip(6.15, 9.55, "residual")
+        arrow(6.15, 6.45)
+        box(6.45, 0.78, "RMSNorm", None, neutral)
+        arrow(7.23, 7.55)
+        box(7.55, 1.20, "SwiGLU FFN", "per position; ~2/3+ of the weights", theme.ramp[2])
+        arrow(8.75, 9.25)
+        add_node(9.55)
+
+        ax.text(1.12, 5.7, "x N", rotation=90, ha="center", va="center",
                 fontsize=9.5, color=theme.muted)
 
-        box(2.1, 0.85, "RMSNorm", None, neutral)
-        arrow(2.95, 3.35)
-        box(3.5, 1.25, "Multi-Head Attention", "the only place tokens mix", theme.ramp[4], theme.surface)
-        arrow(4.75, 5.15)
-        box(5.2, 0.85, "+  residual", None, neutral)
-        arrow(6.05, 6.45)
-        box(6.5, 0.85, "RMSNorm", None, neutral)
-        arrow(7.35, 7.75)
-        box(7.9, 1.25, "SwiGLU FFN", "per position; ~2/3+ of the weights", theme.ramp[2])
-        arrow(9.15, 9.55)
-        box(9.6, 0.85, "+  residual", None, neutral)
+        arrow(9.85, 10.35)
+        box(10.35, 0.85, "Final norm  ->  LM head", None, neutral)
 
-        arrow(10.45, 10.9)
-        box(11.0, 0.9, "Final norm  ->  LM head", None, neutral)
-
-        ax.text(5.0, 12.5, "Where attention sits in a decoder block",
+        ax.text(TRUNK, 12.55, "Where attention sits in a decoder block",
                 ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
+        ax.text(TRUNK, 12.10, "pre-norm: the norm is inside the residual branch",
+                ha="center", va="center", fontsize=9.5, color=theme.muted)
         return save_both(fig, SLUG, "block-anatomy", theme)
 
 
@@ -474,7 +516,10 @@ def figure_causal_mask(weights: torch.Tensor, theme: Theme) -> Path:
                             fontsize=7.5, color=theme.muted, style="italic")
                     continue
                 # Ink flips on the dark end of the ramp so labels stay legible.
-                shade = theme.ink if w[i, j] < 0.55 else theme.surface
+                # Ink is chosen from the cell's own fill, so labels stay legible
+                # at both ends of the ramp and in both themes.
+                rgb = cmap(float(w[i, j]))[:3]
+                shade = ink_for("#%02x%02x%02x" % tuple(int(c * 255) for c in rgb))
                 ax.text(j, i, f"{w[i, j]:.2f}", ha="center", va="center",
                         fontsize=8.5, color=shade)
 

@@ -32,7 +32,31 @@ matplotlib.use("Agg")  # headless: works the same on a Mac and on a Lambda box
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
-__all__ = ["Theme", "LIGHT", "DARK", "THEMES", "figure_dir", "save_both", "styled"]
+__all__ = ["Theme", "LIGHT", "DARK", "THEMES", "figure_dir", "save_both", "styled", "ink_for"]
+
+
+def ink_for(fill: str) -> str:
+    """Pick readable text ink for a filled mark, by the fill's own luminance.
+
+    Text on a colored mark must never inherit the theme's ink. The sequential
+    ramp is shared by both themes, so a pale ramp step keeps its pale value in
+    dark mode — and ``theme.ink`` there is white, which puts white text on a
+    near-white fill. Choose from the fill instead of from the theme.
+
+    Rather than guess a lightness threshold, compute the WCAG contrast ratio of
+    the fill against black and against white and return whichever wins. The two
+    are equal at luminance ~0.179, which is well below the midpoint — a mid-blue
+    that "looks dark" still reads better with black text than with white.
+    """
+    r, g, b = (int(fill.lstrip("#")[i : i + 2], 16) / 255 for i in (0, 2, 4))
+
+    def linear(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+    against_white = 1.05 / (luminance + 0.05)
+    against_black = (luminance + 0.05) / 0.05
+    return "#0b0b0b" if against_black >= against_white else "#ffffff"
 
 
 @dataclass(frozen=True)
