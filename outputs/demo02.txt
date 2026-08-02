@@ -1,0 +1,125 @@
+==========================================================================
+DEMO 02: The KV cache, and why decode is memory-bandwidth-bound
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+
+--------------------------------------------------------------------------
+1. The cache changes nothing about the output
+--------------------------------------------------------------------------
+  generated shape                    (2, 40)
+  token ids identical                yes
+  first 8 new tokens (cached)        [228, 432, 131, 158, 24, 111, 281, 506]
+  first 8 new tokens (uncached)      [228, 432, 131, 158, 24, 111, 281, 506]
+
+  >> The cache is a memoization of keys and values already computed. It is exact — if your cached and uncached outputs differ, you have a bug.
+
+--------------------------------------------------------------------------
+2. Without a cache, generation is quadratic
+--------------------------------------------------------------------------
+  prompt: 64 tokens; model: 7.8M params
+
+  tokens generated  cached (ms)  uncached (ms)  speedup
+  -------------------------------------------------------
+  64                    54.3366        97.4107    1.79x
+  128                   94.8022       226.8279    2.39x
+  256                  151.1748       614.8851    4.07x
+  512                  285.3990      1930.5575    6.76x
+
+  8x more tokens costs (cached)      5.3x
+  8x more tokens costs (uncached)    19.8x
+  tokens processed at n=512 (cached) 576
+  tokens processed at n=512 (uncached) 163584
+  wasted work multiplier             284x
+
+  >> Cached generation scales roughly linearly in tokens. Uncached scales quadratically, because every step redoes the whole prefix.
+
+--------------------------------------------------------------------------
+3. How big the cache actually gets
+--------------------------------------------------------------------------
+  KV bytes = 2 (K and V) x layers x kv_heads x head_dim x seq x batch x dtype
+
+  Llama-3-8B shapes, fp16, batch 1 — weights are 15.0 GiB:
+
+  variant           kv heads    4k ctx    8k ctx    32k ctx   128k ctx
+  ----------------------------------------------------------------------
+  as MHA                  32  2.00 GiB  4.00 GiB  16.00 GiB  64.00 GiB
+  Llama-3-8B (GQA)         8  0.50 GiB  1.00 GiB   4.00 GiB  16.00 GiB
+  as MQA                   1  0.06 GiB  0.12 GiB   0.50 GiB   2.00 GiB
+
+  and at 128k context, how the cache compares to the weights:
+
+  model        batch    weights  KV cache @128k  cache/weights
+  --------------------------------------------------------------
+  Llama-3-8B       1   15.0 GiB        16.0 GiB          1.07x
+  Llama-3-8B       8   15.0 GiB       128.0 GiB          8.56x
+  Llama-3-8B      32   15.0 GiB       512.0 GiB         34.23x
+  Llama-3-70B      1  131.5 GiB        40.0 GiB          0.30x
+  Llama-3-70B      8  131.5 GiB       320.0 GiB          2.43x
+  Llama-3-70B     32  131.5 GiB      1280.0 GiB          9.73x
+
+  GQA vs MHA cache reduction         4.0x
+
+  >> At long context the KV cache is larger than the model. It scales with batch AND sequence, while the weights are fixed — so it, not the checkpoint, is what caps concurrent users.
+
+--------------------------------------------------------------------------
+4. Prefill vs decode
+--------------------------------------------------------------------------
+  toy model parameters               62.6M
+  weight bytes (fp32)                0.23 GiB
+
+  phase    tokens/pass  ms/pass  ms/token    tokens/s
+  -----------------------------------------------------
+  prefill          512  33.3497    0.0651  15352.4776
+  decode             1   5.4728    5.4728    182.7235
+
+  per-token cost, decode / prefill   84.0x
+  Both passes read the same weights. Prefill amortizes that read over
+  512 tokens; decode pays it for one.
+
+  arithmetic intensity (FLOPs per byte of weights read):
+
+  phase    tokens  FLOPs (2*N*P)  weight bytes  FLOP/byte
+  ---------------------------------------------------------
+  prefill     512         64.1 G      0.23 GiB   256.0000
+  decode        1        0.125 G      0.23 GiB     0.5000
+  Modern accelerators need ~100-300 FLOP/byte to saturate their ALUs.
+
+  decode step with a 32-token prefix (KV traffic at batch 32: 0.016 GiB vs 0.23 GiB of weights):
+
+  batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
+  -------------------------------------------------------------
+  1       4.0630           1.00x       246               1.0x
+  2       4.2936           1.06x       466               1.9x
+  4       4.7160           1.16x       848               3.4x
+  8       5.5821           1.37x      1433               5.8x
+  16      6.8356           1.68x      2341               9.5x
+  32      8.0027           1.97x      3999              16.2x
+
+  decode step with a 512-token prefix (KV traffic at batch 32: 0.250 GiB vs 0.23 GiB of weights):
+
+  batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
+  -------------------------------------------------------------
+  1       5.3520           1.00x       187               1.0x
+  2       6.7004           1.25x       298               1.6x
+  4       9.0736           1.70x       441               2.4x
+  8      14.0928           2.63x       568               3.0x
+  16     22.4036           4.19x       714               3.8x
+  32     39.6401           7.41x       807               4.3x
+
+  throughput gain at batch 32, 32-tok prefix 16.2x
+  throughput gain at batch 32, 512-tok prefix 4.3x
+
+  >> With a short prefix, 32x the work costs far less than 32x the time: the weight read was the bottleneck and the extra sequences rode along free. With a long prefix the gain shrinks, because KV traffic scales with batch while weight traffic does not. That is the whole economics of serving.
+
+--------------------------------------------------------------------------
+5. Figures
+--------------------------------------------------------------------------
+  wrote figures/02-kv-cache/cache-vs-nocache-light.png
+  wrote figures/02-kv-cache/cache-size-light.png
+  wrote figures/02-kv-cache/batch-sweep-light.png
+  wrote figures/02-kv-cache/cache-vs-nocache-dark.png
+  wrote figures/02-kv-cache/cache-size-dark.png
+  wrote figures/02-kv-cache/batch-sweep-dark.png

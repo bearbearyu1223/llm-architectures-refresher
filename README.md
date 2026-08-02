@@ -49,6 +49,7 @@ speedup" is actually just measuring Python dispatch overhead.
 | Command | Post | What it shows |
 | --- | --- | --- |
 | `demo01` | Attention & RoPE | Attention in 5 lines matched against PyTorch's fused kernel; softmax saturation without `1/sqrt(d_k)`; causal masking; RoPE scores depending only on relative offset |
+| `demo02` | KV cache | Cached and uncached generation producing identical tokens; the 284x repeated-work multiplier without a cache; the cache outgrowing the weights at 128k context; prefill at 256 FLOP/byte vs decode at 0.5; and the batch sweep where KV traffic overtakes weight traffic |
 
 More land as the series is written.
 
@@ -58,6 +59,8 @@ More land as the series is written.
 src/llmrefresher/
 ├── device.py      device / dtype / sync / memory abstraction (MPS + CUDA)
 ├── report.py      fixed-width console output, paste-ready for the posts
+├── plotting.py    shared matplotlib style; every figure in light and dark
+├── toy_model.py   small Llama-shaped LM (RMSNorm, RoPE, SwiGLU, GQA, KV cache)
 └── demos/         one module per post, each with a main()
 figures/           generated plots, copied into the blog's assets
 outputs/           captured stdout, so post text always matches a real run
