@@ -15,7 +15,30 @@ device memory : 17.2 GB
   >> The fused kernel is an optimization, not a different algorithm. Differences are float reassociation noise, ~1e-6.
 
 --------------------------------------------------------------------------
-1b. Where attention sits in the block
+1b. What a head is: splitting a fixed budget
+--------------------------------------------------------------------------
+  d_model=4096, seq=1024, multi-head attention
+
+  n_heads  head_dim (= d_k)  projection params  score FLOPs
+  -----------------------------------------------------------
+  1                    4096              67.1M        8.6 G
+  8                     512              67.1M        8.6 G
+  32                    128              67.1M        8.6 G
+  64                     64              67.1M        8.6 G
+
+  where each head's last query puts its attention (same input):
+
+  head  pos0  pos1  pos2  pos3  pos4  pos5  entropy
+  ---------------------------------------------------
+  0     0.04  0.04  0.06  0.50  0.02  0.02     1.72
+  1     0.09  0.18  0.08  0.04  0.20  0.07     2.28
+  2     0.01  0.33  0.03  0.01  0.18  0.03     1.86
+  3     0.05  0.08  0.12  0.13  0.00  0.16     2.19
+
+  >> More heads costs nothing: the same parameters and the same FLOPs, carved into narrower slices. What you buy is several attention patterns at once instead of one averaged compromise.
+
+--------------------------------------------------------------------------
+1c. Where attention sits in the block
 --------------------------------------------------------------------------
   block shape                  attention params  FFN params  FFN share
   ----------------------------------------------------------------------

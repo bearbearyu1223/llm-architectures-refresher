@@ -131,6 +131,60 @@ def block_parameter_split(rep: Report) -> dict[str, dict[str, float]]:
     return out
 
 
+def head_split_arithmetic(rep: Report, device: torch.device) -> None:
+    """Heads are a reshape of a fixed budget, not extra capacity bolted on.
+
+    ``d_model`` is split into ``n_heads`` slices of ``head_dim = d_model /
+    n_heads``. Each head runs the whole Q/K/V mechanism on its own slice, and the
+    results are concatenated back to ``d_model``. So the projections are the same
+    four ``d x d`` matrices no matter how many heads you carve them into, and the
+    score computation is ``n_heads * seq^2 * head_dim = seq^2 * d_model`` — also
+    independent of the count.
+
+    Note ``head_dim`` *is* the ``d_k`` in the attention formula. The 1/sqrt(d_k)
+    scale is set by the per-head width, not by d_model.
+    """
+    d_model, seq = 4096, 1024
+    rows = []
+    for n_heads in (1, 8, 32, 64):
+        head_dim = d_model // n_heads
+        params = 4 * d_model * d_model  # q, k, v, o projections
+        score_flops = 2 * n_heads * seq * seq * head_dim
+        rows.append([n_heads, head_dim, f"{params / 1e6:.1f}M", f"{score_flops / 1e9:.1f} G"])
+
+    rep.note(f"d_model={d_model}, seq={seq}, multi-head attention")
+    rep.blank()
+    rep.table(["n_heads", "head_dim (= d_k)", "projection params", "score FLOPs"], rows)
+
+    # And the outputs really are different per head, not redundant copies.
+    torch.manual_seed(3)
+    n_heads, head_dim, small_seq = 4, 32, 12
+    q = torch.randn(1, n_heads, small_seq, head_dim, device=device)
+    k = torch.randn(1, n_heads, small_seq, head_dim, device=device)
+    _, weights = scaled_dot_product_attention(q, k, k, causal=True)
+    w = weights[0]
+
+    rep.blank()
+    rep.note("where each head's last query puts its attention (same input):")
+    rep.blank()
+    rep.table(
+        ["head", *[f"pos{j}" for j in range(6)], "entropy"],
+        [
+            [
+                h,
+                *[f"{w[h, -1, j]:.2f}" for j in range(6)],
+                f"{-(w[h, -1] * w[h, -1].clamp_min(1e-12).log()).sum():.2f}",
+            ]
+            for h in range(n_heads)
+        ],
+    )
+    rep.takeaway(
+        "More heads costs nothing: the same parameters and the same FLOPs, "
+        "carved into narrower slices. What you buy is several attention "
+        "patterns at once instead of one averaged compromise."
+    )
+
+
 def figure_block(theme: Theme) -> Path:
     """Schematic of one pre-norm decoder block, and where attention sits.
 
@@ -587,7 +641,10 @@ def main() -> None:
     rep.section("1. Our 5-line attention vs PyTorch's fused kernel")
     check_against_pytorch(rep, device)
 
-    rep.section("1b. Where attention sits in the block")
+    rep.section("1b. What a head is: splitting a fixed budget")
+    head_split_arithmetic(rep, device)
+
+    rep.section("1c. Where attention sits in the block")
     block_parameter_split(rep)
 
     rep.section("2. Why divide by sqrt(d_k)?")
