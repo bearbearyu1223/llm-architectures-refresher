@@ -17,14 +17,40 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 1b. What a head is: splitting a fixed budget
 --------------------------------------------------------------------------
-  d_model=4096, seq=1024, multi-head attention
+  d_model = 4096,  seq = 1024
 
-  n_heads  head_dim (= d_k)  projection params  score FLOPs
+  PARAMETERS — four projections, each d_model x d_model:
+
+  matrix                         maps         shape  params
   -----------------------------------------------------------
-  1                    4096              67.1M        8.6 G
-  8                     512              67.1M        8.6 G
-  32                    128              67.1M        8.6 G
-  64                     64              67.1M        8.6 G
+  W_q     d_model -> n_heads x d_head  (4096, 4096)   16.8M
+  W_k     d_model -> n_heads x d_head  (4096, 4096)   16.8M
+  W_v     d_model -> n_heads x d_head  (4096, 4096)   16.8M
+  W_o     n_heads x d_head -> d_model  (4096, 4096)   16.8M
+  total                                               67.1M
+
+  4 x 4096 x 4096 = 67,108,864 = 67.1M, for any head count,
+  because n_heads x d_head = d_model no matter how you split it.
+
+  SCORE FLOPs — Q @ K.T, counting a multiply-add as 2 FLOPs:
+
+    per head:  (seq, d_head) @ (d_head, seq) -> (seq, seq)
+               = 2 x seq x seq x d_head FLOPs
+    all heads: x n_heads
+
+  n_heads  d_head  n_heads x d_head  FLOPs per head  x n_heads = total
+  ----------------------------------------------------------------------
+  1          4096              4096          8.59 G             8.59 G
+  8           512              4096          1.07 G             8.59 G
+  32          128              4096          0.27 G             8.59 G
+  64           64              4096          0.13 G             8.59 G
+
+  Halving d_head halves the per-head cost and doubles the head count.
+  The product is always 2 x seq^2 x d_model = 8.59 G.
+
+  params, 1 head vs 64 heads         67.1M vs 67.1M
+  score FLOPs, 1 head vs 64 heads    8.59 G vs 8.59 G
+  d_head is the d_k in 1/sqrt(d_k)   yes — per-head width, not d_model
 
   where each head's last query puts its attention (same input):
 
@@ -35,7 +61,7 @@ device memory : 17.2 GB
   2     0.01  0.33  0.03  0.01  0.18  0.03     1.86
   3     0.05  0.08  0.12  0.13  0.00  0.16     2.19
 
-  >> More heads costs nothing: the same parameters and the same FLOPs, carved into narrower slices. What you buy is several attention patterns at once instead of one averaged compromise.
+  >> More heads costs nothing: identical parameters and identical FLOPs, carved into narrower slices. What you buy is several attention patterns at once instead of one averaged compromise.
 
 --------------------------------------------------------------------------
 1c. Every shape, end to end

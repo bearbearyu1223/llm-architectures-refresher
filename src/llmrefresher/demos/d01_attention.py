@@ -131,36 +131,87 @@ def block_parameter_split(rep: Report) -> dict[str, dict[str, float]]:
     return out
 
 
-def head_split_arithmetic(rep: Report, device: torch.device) -> None:
+def head_split_arithmetic(rep: Report, device: torch.device):
     """Heads are a reshape of a fixed budget, not extra capacity bolted on.
 
-    ``d_model`` is split into ``n_heads`` slices of ``head_dim = d_model /
-    n_heads``. Each head runs the whole Q/K/V mechanism on its own slice, and the
-    results are concatenated back to ``d_model``. So the projections are the same
-    four ``d x d`` matrices no matter how many heads you carve them into, and the
-    score computation is ``n_heads * seq^2 * head_dim = seq^2 * d_model`` — also
-    independent of the count.
+    Prints the derivation rather than just the result, because "the numbers are
+    identical" is only convincing if you can see *why* they cancel.
 
-    Note ``head_dim`` *is* the ``d_k`` in the attention formula. The 1/sqrt(d_k)
-    scale is set by the per-head width, not by d_model.
+    The one invariant behind both columns is ``n_heads * d_head = d_model``.
+    Choosing a head count only decides how that fixed width is partitioned.
     """
     d_model, seq = 4096, 1024
-    rows = []
-    for n_heads in (1, 8, 32, 64):
-        head_dim = d_model // n_heads
-        params = 4 * d_model * d_model  # q, k, v, o projections
-        score_flops = 2 * n_heads * seq * seq * head_dim
-        rows.append([n_heads, head_dim, f"{params / 1e6:.1f}M", f"{score_flops / 1e9:.1f} G"])
+    counts = (1, 8, 32, 64)
 
-    rep.note(f"d_model={d_model}, seq={seq}, multi-head attention")
+    # --- parameters -----------------------------------------------------
+    #
+    # W_q maps d_model -> n_heads * d_head, and n_heads * d_head IS d_model, so
+    # every projection is d_model x d_model whatever the head count. Four of
+    # them: query, key, value, output.
+    rep.note(f"d_model = {d_model},  seq = {seq}")
     rep.blank()
-    rep.table(["n_heads", "head_dim (= d_k)", "projection params", "score FLOPs"], rows)
+    rep.note("PARAMETERS — four projections, each d_model x d_model:")
+    rep.blank()
+    one = d_model * d_model
+    rep.table(
+        ["matrix", "maps", "shape", "params"],
+        [
+            ["W_q", "d_model -> n_heads x d_head", f"({d_model}, {d_model})", f"{one / 1e6:.1f}M"],
+            ["W_k", "d_model -> n_heads x d_head", f"({d_model}, {d_model})", f"{one / 1e6:.1f}M"],
+            ["W_v", "d_model -> n_heads x d_head", f"({d_model}, {d_model})", f"{one / 1e6:.1f}M"],
+            ["W_o", "n_heads x d_head -> d_model", f"({d_model}, {d_model})", f"{one / 1e6:.1f}M"],
+            ["total", "", "", f"{4 * one / 1e6:.1f}M"],
+        ],
+    )
+    rep.blank()
+    rep.note(f"4 x {d_model} x {d_model} = {4 * one:,} = {4 * one / 1e6:.1f}M, for any head count,")
+    rep.note("because n_heads x d_head = d_model no matter how you split it.")
 
-    # And the outputs really are different per head, not redundant copies.
+    # --- score FLOPs ----------------------------------------------------
+    #
+    # Per head: (seq, d_head) @ (d_head, seq) -> (seq, seq). Each output element
+    # costs d_head multiply-adds, and the usual convention counts a multiply-add
+    # as 2 FLOPs. So 2 * seq^2 * d_head per head, times n_heads.
+    rep.blank()
+    rep.note("SCORE FLOPs — Q @ K.T, counting a multiply-add as 2 FLOPs:")
+    rep.blank()
+    rep.note("  per head:  (seq, d_head) @ (d_head, seq) -> (seq, seq)")
+    rep.note("             = 2 x seq x seq x d_head FLOPs")
+    rep.note("  all heads: x n_heads")
+    rep.blank()
+
+    rows = []
+    for n_heads in counts:
+        d_head = d_model // n_heads
+        per_head = 2 * seq * seq * d_head
+        rows.append(
+            [
+                n_heads,
+                d_head,
+                n_heads * d_head,
+                f"{per_head / 1e9:.2f} G",
+                f"{n_heads * per_head / 1e9:.2f} G",
+            ]
+        )
+    rep.table(
+        ["n_heads", "d_head", "n_heads x d_head", "FLOPs per head", "x n_heads = total"],
+        rows,
+    )
+    rep.blank()
+    rep.note("Halving d_head halves the per-head cost and doubles the head count.")
+    rep.note(f"The product is always 2 x seq^2 x d_model = {2 * seq * seq * d_model / 1e9:.2f} G.")
+
+    rep.blank()
+    rep.kv("params, 1 head vs 64 heads", f"{4 * one / 1e6:.1f}M vs {4 * one / 1e6:.1f}M")
+    rep.kv("score FLOPs, 1 head vs 64 heads",
+           f"{2 * seq * seq * d_model / 1e9:.2f} G vs {2 * seq * seq * d_model / 1e9:.2f} G")
+    rep.kv("d_head is the d_k in 1/sqrt(d_k)", "yes — per-head width, not d_model")
+
+    # --- and the heads are not redundant --------------------------------
     torch.manual_seed(3)
-    n_heads, head_dim, small_seq = 4, 32, 12
-    q = torch.randn(1, n_heads, small_seq, head_dim, device=device)
-    k = torch.randn(1, n_heads, small_seq, head_dim, device=device)
+    n_heads, d_head, small_seq = 4, 32, 12
+    q = torch.randn(1, n_heads, small_seq, d_head, device=device)
+    k = torch.randn(1, n_heads, small_seq, d_head, device=device)
     _, weights = scaled_dot_product_attention(q, k, k, causal=True)
     w = weights[0]
 
@@ -179,9 +230,9 @@ def head_split_arithmetic(rep: Report, device: torch.device) -> None:
         ],
     )
     rep.takeaway(
-        "More heads costs nothing: the same parameters and the same FLOPs, "
-        "carved into narrower slices. What you buy is several attention "
-        "patterns at once instead of one averaged compromise."
+        "More heads costs nothing: identical parameters and identical FLOPs, "
+        "carved into narrower slices. What you buy is several attention patterns "
+        "at once instead of one averaged compromise."
     )
     return w.cpu()
 
