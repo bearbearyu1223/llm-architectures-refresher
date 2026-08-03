@@ -183,6 +183,140 @@ def head_split_arithmetic(rep: Report, device: torch.device) -> None:
         "carved into narrower slices. What you buy is several attention "
         "patterns at once instead of one averaged compromise."
     )
+    return w.cpu()
+
+
+def figure_multihead(theme: Theme) -> Path:
+    """Schematic: one vector split across heads, then concatenated back.
+
+    Drawn with 4 heads for legibility; real models use 32-64. The point the
+    figure has to carry is that the split is a *partition* — the slices are
+    disjoint pieces of one fixed-width vector, not copies of it — which is why
+    adding heads costs nothing.
+    """
+    n_heads = 4
+    x0, x1 = 0.6, 9.4
+    seg = (x1 - x0) / n_heads
+    centers = [x0 + seg * (h + 0.5) for h in range(n_heads)]
+    shades = [theme.ramp[i] for i in (1, 2, 3, 4)]
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(9.8, 7.2))
+        ax.grid(False)
+        # Extra room on the right so the side note never crowds head 3.
+        ax.set_xlim(0, 12.6)
+        ax.set_ylim(0.35, 12.5)
+        ax.axis("off")
+
+        def bar(y, height, label_above=None, label_below=None):
+            """A full-width vector, partitioned into per-head slices."""
+            for h in range(n_heads):
+                ax.add_patch(
+                    patches.Rectangle((x0 + seg * h, y), seg, height,
+                                      facecolor=shades[h], edgecolor=theme.surface, linewidth=2.0)
+                )
+                ax.text(centers[h], y + height / 2, f"slice {h}", ha="center", va="center",
+                        fontsize=9, color=ink_for(shades[h]))
+            if label_above:
+                ax.text(5.0, y + height + 0.22, label_above, ha="center", va="bottom",
+                        fontsize=9.5, color=theme.secondary)
+            if label_below:
+                ax.text(5.0, y - 0.22, label_below, ha="center", va="top",
+                        fontsize=9.5, color=theme.secondary)
+
+        def arrows(y0, y1):
+            for c in centers:
+                ax.annotate("", xy=(c, y1), xytext=(c, y0),
+                            arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.3))
+
+        # Input vector, cut into slices.
+        bar(9.9, 0.75, label_above="one token's vector,  d_model = 4096")
+        ax.annotate("", xy=(x1, 9.55), xytext=(x1 - seg, 9.55),
+                    arrowprops=dict(arrowstyle="<|-|>", color=theme.muted, linewidth=1.1))
+        ax.text(x1 - seg / 2, 9.28, "d_head = 4096 / 32 = 128", ha="center", va="top",
+                fontsize=8.5, color=theme.muted, style="italic")
+
+        arrows(9.9, 8.5)
+
+        # Per-head attention.
+        for h in range(n_heads):
+            ax.add_patch(
+                patches.FancyBboxPatch((centers[h] - seg / 2 + 0.12, 6.5), seg - 0.24, 2.0,
+                                       boxstyle="round,pad=0.06", facecolor=shades[h],
+                                       edgecolor=theme.surface, linewidth=1.8)
+            )
+            tc = ink_for(shades[h])
+            ax.text(centers[h], 8.05, f"head {h}", ha="center", va="center",
+                    fontsize=10.5, fontweight="bold", color=tc)
+            ax.text(centers[h], 7.55, "own Q, K, V", ha="center", va="center", fontsize=8.5, color=tc)
+            ax.text(centers[h], 7.18, "own scores", ha="center", va="center", fontsize=8.5, color=tc)
+            ax.text(centers[h], 6.81, "own softmax", ha="center", va="center", fontsize=8.5, color=tc)
+
+        # The misconception this note exists to block: the slices partition the
+        # vector's dimensions, never the sequence. Every head sees every token.
+        ax.text(9.75, 7.5, "each head attends over\nall tokens independently\n\n"
+                           "the split is across the\nvector's dimensions,\nnot across tokens",
+                ha="left", va="center", fontsize=8.5, color=theme.muted, style="italic")
+
+        arrows(6.5, 5.2)
+        bar(4.45, 0.75, label_below="concatenate the slices back to d_model = 4096")
+
+        # Starts below the concat caption, which is centred on the same x.
+        ax.annotate("", xy=(5.0, 3.45), xytext=(5.0, 3.92),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+
+        ax.add_patch(
+            patches.FancyBboxPatch((x0, 2.5), x1 - x0, 0.9, boxstyle="round,pad=0.06",
+                                   facecolor=theme.ramp[5], edgecolor=theme.surface, linewidth=1.8)
+        )
+        ax.text(5.0, 2.95, "output projection  W_o    (lets the heads' findings mix)",
+                ha="center", va="center", fontsize=10, fontweight="bold", color=ink_for(theme.ramp[5]))
+
+        ax.annotate("", xy=(5.0, 1.5), xytext=(5.0, 2.4),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+        ax.add_patch(
+            patches.Rectangle((x0, 0.7), x1 - x0, 0.75,
+                              facecolor=theme.ramp[0], edgecolor=theme.surface, linewidth=1.8)
+        )
+        ax.text(5.0, 1.07, "updated token vector,  d_model = 4096", ha="center", va="center",
+                fontsize=9.5, color=ink_for(theme.ramp[0]))
+
+        ax.text(5.0, 12.2, "Multi-head attention: split the vector, not the budget",
+                ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
+        ax.text(5.0, 11.78, "drawn with 4 heads; Llama-3-8B uses 32", ha="center", va="center",
+                fontsize=9.5, color=theme.muted)
+        return save_both(fig, SLUG, "multi-head", theme)
+
+
+def figure_head_patterns(weights: torch.Tensor, theme: Theme) -> Path:
+    """The same input through four heads, as four attention matrices."""
+    n_heads, seq, _ = weights.shape
+    w = weights.numpy()
+    blocked = np.triu(np.ones((seq, seq), dtype=bool), 1)
+
+    with styled(theme):
+        fig, axes = plt.subplots(1, n_heads, figsize=(10.0, 3.0))
+        cmap = sequential_cmap(theme)
+        cmap.set_bad(theme.surface)
+
+        for h, ax in enumerate(axes):
+            ax.grid(False)
+            ax.imshow(np.ma.masked_array(w[h], mask=blocked), cmap=cmap, vmin=0, vmax=0.6)
+            entropy = float(-(w[h][-1] * np.log(np.clip(w[h][-1], 1e-12, None))).sum())
+            ax.set_title(f"head {h}   (H = {entropy:.2f})", fontsize=10, color=theme.ink)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            if h == 0:
+                ax.set_ylabel("query position", fontsize=9, color=theme.secondary)
+
+        fig.suptitle("Same input, four heads, four different attention patterns",
+                     fontsize=13, fontweight="bold", color=theme.ink, y=1.06)
+        fig.text(0.5, -0.04, "key position  ->        (random weights: this shows heads are not "
+                             "redundant, not that they specialize)",
+                 ha="center", fontsize=8.5, color=theme.muted, style="italic")
+        return save_both(fig, SLUG, "head-patterns", theme)
 
 
 def figure_block(theme: Theme) -> Path:
@@ -618,10 +752,13 @@ def make_figures(
     rows: list[dict[str, float]],
     weights: torch.Tensor,
     rope_data: dict[str, list],
+    head_weights: torch.Tensor,
 ) -> None:
     """Render every figure in both light and dark variants."""
     for theme in THEMES:
         for path in (
+            figure_multihead(theme),
+            figure_head_patterns(head_weights, theme),
             figure_block(theme),
             figure_saturation(rows, theme),
             figure_causal_mask(weights, theme),
@@ -642,7 +779,7 @@ def main() -> None:
     check_against_pytorch(rep, device)
 
     rep.section("1b. What a head is: splitting a fixed budget")
-    head_split_arithmetic(rep, device)
+    head_weights = head_split_arithmetic(rep, device)
 
     rep.section("1c. Where attention sits in the block")
     block_parameter_split(rep)
@@ -657,7 +794,7 @@ def main() -> None:
     rope_data = rope_demo(rep, device)
 
     rep.section("5. Figures")
-    make_figures(rep, rows, weights, rope_data)
+    make_figures(rep, rows, weights, rope_data, head_weights)
 
 
 if __name__ == "__main__":
