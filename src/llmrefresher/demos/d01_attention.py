@@ -521,6 +521,96 @@ def figure_multihead(theme: Theme) -> Path:
         return save_both(fig, SLUG, "multi-head", theme)
 
 
+def why_the_ffn(rep: Report, device: torch.device) -> None:
+    """Why a transformer needs an FFN at all, and why knowledge ends up there.
+
+    Two facts, both checkable:
+
+    1. **Attention can only average.** Softmax weights are non-negative and sum
+       to 1, so every output is a *convex combination* of the value rows. It
+       cannot leave the range of what it was given, and — holding the weights
+       fixed — it is exactly linear in V. Attention moves information between
+       positions; it cannot compute anything new from it.
+    2. **The FFN is a key-value memory.** Its output is a weighted sum of the
+       rows of ``W_down``, with the weights coming from how strongly the input
+       matched each row of ``W_up``. That is a lookup table with ``d_ff`` slots,
+       which is why facts live here rather than in attention.
+    """
+    torch.manual_seed(0)
+    seq, d_model, d_ff = 12, 64, 256
+
+    q = torch.randn(seq, d_model, device=device)
+    k = torch.randn(seq, d_model, device=device)
+    v = torch.randn(seq, d_model, device=device)
+    w = torch.softmax(q @ k.T / math.sqrt(d_model), dim=-1)
+    attn = w @ v
+
+    # -- 1. attention averages, and averaging cannot invent -----------------
+    lo, hi = v.min(0).values, v.max(0).values
+    inside = ((attn >= lo - 1e-6) & (attn <= hi + 1e-6)).all().item()
+
+    rep.note("ATTENTION: a weighted average, and nothing more")
+    rep.blank()
+    rep.kv("softmax weights are all >= 0", bool((w >= 0).all()))
+    rep.kv("each row of weights sums to", w.sum(-1).mean().item())
+    rep.kv("so every output is a blend of V's rows", inside)
+    rep.kv("attn(2V) == 2 x attn(V)", torch.allclose(w @ (2 * v), 2 * attn, atol=1e-5))
+    rep.blank()
+    rep.note("Output can never leave the range of the values it was handed, and")
+    rep.note("scaling the values scales the output exactly. Attention relocates")
+    rep.note("information between tokens; it cannot compute a new feature from it.")
+
+    # -- 2. the FFN is the nonlinear part -----------------------------------
+    w_up = torch.randn(d_model, d_ff, device=device) / math.sqrt(d_model)
+    w_down = torch.randn(d_ff, d_model, device=device) / math.sqrt(d_ff)
+
+    def ffn(t: torch.Tensor) -> torch.Tensor:
+        return F.silu(t @ w_up) @ w_down
+
+    out = ffn(attn)
+    rep.blank()
+    rep.note("THE FFN: the one place a token's own features get transformed")
+    rep.blank()
+    rep.kv("ffn(2x) == 2 x ffn(x)", torch.allclose(ffn(2 * attn), 2 * out, atol=1e-3))
+    rep.kv("  relative gap", ((ffn(2 * attn) - 2 * out).norm() / (2 * out).norm()).item())
+    rep.note("Not linear — which is exactly the point. 'A and B both present ->")
+    rep.note("conclude C' is not something an average can express.")
+
+    # -- 3. and it is shaped like a lookup table ----------------------------
+    acts = F.silu(attn @ w_up)          # (seq, d_ff): one score per memory slot
+    row = 3
+    by_hand = (acts[row, :, None] * w_down).sum(0)
+
+    rep.blank()
+    rep.note("THE FFN AS MEMORY: output = sum over slots of (match) x (content)")
+    rep.blank()
+    rep.table(
+        ["piece", "shape", "reading"],
+        [
+            ["W_up column i", (d_model,), "the pattern slot i looks for"],
+            ["activation a_i", (1,), "how strongly this token matched it"],
+            ["W_down row i", (d_model,), "what slot i adds if it matched"],
+        ],
+    )
+    rep.blank()
+    rep.kv("ffn(x)[row 3] via matmul", tuple(out[row].shape))
+    rep.kv("same, as sum_i a_i * W_down[i]", tuple(by_hand.shape))
+    rep.kv("max abs difference", (out[row] - by_hand).abs().max().item())
+    rep.kv(f"slots with |a| > 0.1 (of {d_ff})", int((acts[row].abs() > 0.1).sum()))
+    rep.blank()
+    rep.note("Random weights here, so many slots respond. Trained FFNs are far")
+    rep.note("sparser — a given token lights up a small subset.")
+    rep.blank()
+    rep.kv("Llama-3-8B slots per layer (d_ff)", 14_336)
+    rep.kv("x 32 layers = total slots", f"{14_336 * 32:,}")
+
+    rep.takeaway(
+        "Attention decides *what to look at*; the FFN decides *what that means*. "
+        "The FFN is the only nonlinearity acting on a token's own features, and "
+        "its shape is a lookup table — which is why facts are stored there."
+    )
+
+
 def figure_tensor_3d(theme: Theme) -> Path:
     """Draw (32, 10, 128) as a deck of sheets, and label what each axis does.
 
@@ -1266,7 +1356,10 @@ def main() -> None:
     rep.section("1c. Every shape, end to end")
     shape_walkthrough(rep, device)
 
-    rep.section("1d. Where attention sits in the block")
+    rep.section("1d. Why the FFN exists")
+    why_the_ffn(rep, device)
+
+    rep.section("1e. Where attention sits in the block")
     block_parameter_split(rep)
 
     rep.section("2. Why divide by sqrt(d_k)?")

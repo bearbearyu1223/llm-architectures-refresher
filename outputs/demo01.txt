@@ -118,7 +118,49 @@ device memory : 17.2 GB
   >> Q keeps its full width; only K and V shrink. That asymmetry is the whole of GQA, and it is why the cached tensors are 4x smaller than the head count would suggest.
 
 --------------------------------------------------------------------------
-1d. Where attention sits in the block
+1d. Why the FFN exists
+--------------------------------------------------------------------------
+  ATTENTION: a weighted average, and nothing more
+
+  softmax weights are all >= 0       yes
+  each row of weights sums to        1.0000
+  so every output is a blend of V's rows yes
+  attn(2V) == 2 x attn(V)            yes
+
+  Output can never leave the range of the values it was handed, and
+  scaling the values scales the output exactly. Attention relocates
+  information between tokens; it cannot compute a new feature from it.
+
+  THE FFN: the one place a token's own features get transformed
+
+  ffn(2x) == 2 x ffn(x)              no
+    relative gap                     0.2095
+  Not linear — which is exactly the point. 'A and B both present ->
+  conclude C' is not something an average can express.
+
+  THE FFN AS MEMORY: output = sum over slots of (match) x (content)
+
+  piece           shape                             reading
+  -----------------------------------------------------------
+  W_up column i   (64,)        the pattern slot i looks for
+  activation a_i   (1,)  how strongly this token matched it
+  W_down row i    (64,)      what slot i adds if it matched
+
+  ffn(x)[row 3] via matmul           (64,)
+  same, as sum_i a_i * W_down[i]     (64,)
+  max abs difference                 8.941e-08
+  slots with |a| > 0.1 (of 256)      168
+
+  Random weights here, so many slots respond. Trained FFNs are far
+  sparser — a given token lights up a small subset.
+
+  Llama-3-8B slots per layer (d_ff)  14336
+  x 32 layers = total slots          458,752
+
+  >> Attention decides *what to look at*; the FFN decides *what that means*. The FFN is the only nonlinearity acting on a token's own features, and its shape is a lookup table — which is why facts are stored there.
+
+--------------------------------------------------------------------------
+1e. Where attention sits in the block
 --------------------------------------------------------------------------
   block shape                  attention params  FFN params  FFN share
   ----------------------------------------------------------------------
