@@ -146,6 +146,19 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 3. Causal masking
 --------------------------------------------------------------------------
+  the mask M, added to the scores before the softmax:
+
+        key0     key1     key2     key3     key4     key5     
+  q0    0        -inf     -inf     -inf     -inf     -inf     
+  q1    0        0        -inf     -inf     -inf     -inf     
+  q2    0        0        0        -inf     -inf     -inf     
+  q3    0        0        0        0        -inf     -inf     
+  q4    0        0        0        0        0        -inf     
+  q5    0        0        0        0        0        0        
+
+  0 = allowed, -inf = forbidden. exp(-inf) = 0, so those weights
+  become exactly zero and the rest renormalize to sum to 1.
+
   attention weights, row i = query at position i:
 
         key0    key1    key2    key3    key4    key5    

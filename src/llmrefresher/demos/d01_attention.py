@@ -942,12 +942,34 @@ def scaling_sweep(rep: Report, device: torch.device) -> list[dict[str, float]]:
 
 
 def causal_mask_demo(rep: Report, device: torch.device) -> torch.Tensor:
-    """Print the weight matrix so the lower-triangular structure is visible."""
+    """Print the mask matrix itself, then the weights it produces.
+
+    The mask is usually described in words and rarely shown. It is just an
+    ``n x n`` matrix ``M`` *added* to the scores before the softmax: 0 where a
+    position is allowed, ``-inf`` where it is forbidden. Adding ``-inf`` sends
+    ``exp`` to exactly 0, so the forbidden weights vanish and the surviving ones
+    renormalize among themselves.
+    """
     torch.manual_seed(1)
     seq, head_dim = 6, 16
     q = torch.randn(1, seq, head_dim, device=device)
     k = torch.randn(1, seq, head_dim, device=device)
     v = torch.randn(1, seq, head_dim, device=device)
+
+    # The mask as its own object, before it touches anything.
+    mask = torch.zeros(seq, seq)
+    mask[torch.ones(seq, seq, dtype=torch.bool).triu(1)] = float("-inf")
+
+    rep.note("the mask M, added to the scores before the softmax:")
+    rep.blank()
+    print("        " + "".join(f"key{j:<6}" for j in range(seq)))
+    for i in range(seq):
+        cells = "".join(f"{'0' if mask[i, j] == 0 else '-inf':<9}" for j in range(seq))
+        print(f"  q{i}    {cells}")
+    rep.blank()
+    rep.note("0 = allowed, -inf = forbidden. exp(-inf) = 0, so those weights")
+    rep.note("become exactly zero and the rest renormalize to sum to 1.")
+    rep.blank()
 
     _, weights = scaled_dot_product_attention(q, k, v, causal=True)
     w = weights[0].cpu()
