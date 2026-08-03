@@ -205,7 +205,7 @@ def figure_multihead(theme: Theme) -> Path:
         ax.grid(False)
         # Extra room on the right so the side note never crowds head 3.
         ax.set_xlim(0, 12.6)
-        ax.set_ylim(0.35, 12.5)
+        ax.set_ylim(0.35, 13.1)
         ax.axis("off")
 
         def bar(y, height, label_above=None, label_below=None):
@@ -230,11 +230,22 @@ def figure_multihead(theme: Theme) -> Path:
                             arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.3))
 
         # Input vector, cut into slices.
-        bar(9.9, 0.75, label_above="one token's vector,  d_model = 4096")
-        ax.annotate("", xy=(x1, 9.55), xytext=(x1 - seg, 9.55),
+        #
+        # Both dimension callouts sit ABOVE the bar. The space below it belongs to
+        # the per-head arrows, and a horizontal measuring line placed there gets
+        # crossed by the arrow dropping out of that very slice — which renders as
+        # a line struck through the label.
+        bar(9.9, 0.75)
+
+        ax.annotate("", xy=(x1, 11.45), xytext=(x0, 11.45),
                     arrowprops=dict(arrowstyle="<|-|>", color=theme.muted, linewidth=1.1))
-        ax.text(x1 - seg / 2, 9.28, "d_head = 4096 / 32 = 128", ha="center", va="top",
-                fontsize=8.5, color=theme.muted, style="italic")
+        ax.text(5.0, 11.55, "one token's vector   -   d_model = 4096",
+                ha="center", va="bottom", fontsize=9.5, color=theme.secondary)
+
+        ax.annotate("", xy=(x1, 10.85), xytext=(x1 - seg, 10.85),
+                    arrowprops=dict(arrowstyle="<|-|>", color=theme.muted, linewidth=1.1))
+        ax.text(x1 - seg / 2, 10.93, "d_head = 4096 / 32 = 128",
+                ha="center", va="bottom", fontsize=8.5, color=theme.muted, style="italic")
 
         arrows(9.9, 8.5)
 
@@ -281,9 +292,9 @@ def figure_multihead(theme: Theme) -> Path:
         ax.text(5.0, 1.07, "updated token vector,  d_model = 4096", ha="center", va="center",
                 fontsize=9.5, color=ink_for(theme.ramp[0]))
 
-        ax.text(5.0, 12.2, "Multi-head attention: split the vector, not the budget",
+        ax.text(5.0, 12.8, "Multi-head attention: split the vector, not the budget",
                 ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
-        ax.text(5.0, 11.78, "drawn with 4 heads; Llama-3-8B uses 32", ha="center", va="center",
+        ax.text(5.0, 12.4, "drawn with 4 heads; Llama-3-8B uses 32", ha="center", va="center",
                 fontsize=9.5, color=theme.muted)
         return save_both(fig, SLUG, "multi-head", theme)
 
