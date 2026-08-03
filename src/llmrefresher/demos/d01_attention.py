@@ -233,7 +233,7 @@ def shape_walkthrough(rep: Report, device: torch.device) -> None:
     out = merged @ w_o
     rows.append(["output  after W_o", tuple(out.shape), "same shape as the input"])
 
-    rep.note(f"seq={seq}, d_model={d_model}, n_heads={n_heads}, d_head={d_head}")
+    rep.note(f"classic MHA — seq={seq}, d_model={d_model}, n_heads={n_heads}, d_head={d_head}")
     rep.blank()
     rep.table(["tensor", "shape", "note"], rows)
     rep.blank()
@@ -243,6 +243,39 @@ def shape_walkthrough(rep: Report, device: torch.device) -> None:
         "Attention is shape-preserving end to end: a block takes (seq, d_model) "
         "and returns (seq, d_model). Only the score matrix is quadratic in seq, "
         "and only inside the module."
+    )
+
+    # The shapes above are classic multi-head attention, where K and V get one
+    # head each. Llama-3-8B does not do that: it uses grouped-query attention
+    # with 8 KV heads shared across 32 query heads, so its K and V projections
+    # are a quarter as wide. Quoting MHA shapes as "Llama-3-8B shapes" is wrong,
+    # and it is wrong in exactly the direction that hides why the KV cache is
+    # affordable at all.
+    n_kv = 8
+    rep.blank()
+    rep.note(f"the same model as actually configured — GQA with {n_kv} KV heads:")
+    rep.blank()
+
+    w_kv = torch.randn(d_model, n_kv * d_head, device=device) / math.sqrt(d_model)
+    k_g = (x @ w_kv).view(seq, n_kv, d_head).transpose(0, 1)
+
+    rep.table(
+        ["tensor", "MHA (32 kv heads)", "Llama-3-8B (8 kv heads)"],
+        [
+            ["W_q", tuple(w_q.shape), (d_model, n_heads * d_head)],
+            ["W_k, W_v", tuple(w_k.shape), tuple(w_kv.shape)],
+            ["Q  split into heads", tuple(qh.shape), (n_heads, seq, d_head)],
+            ["K, V  split into heads", tuple(kh.shape), tuple(k_g.shape)],
+        ],
+    )
+    rep.blank()
+    rep.kv("query heads per KV head", n_heads // n_kv)
+    rep.kv("K/V projection params, MHA", f"{2 * d_model * d_model / 1e6:.1f}M")
+    rep.kv("K/V projection params, GQA", f"{2 * d_model * n_kv * d_head / 1e6:.1f}M")
+    rep.takeaway(
+        "Q keeps its full width; only K and V shrink. That asymmetry is the whole "
+        "of GQA, and it is why the cached tensors are 4x smaller than the head "
+        "count would suggest."
     )
 
 

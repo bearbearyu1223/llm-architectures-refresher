@@ -40,7 +40,7 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 1c. Every shape, end to end
 --------------------------------------------------------------------------
-  seq=10, d_model=4096, n_heads=32, d_head=128
+  classic MHA — seq=10, d_model=4096, n_heads=32, d_head=128
 
   tensor                             shape                          note
   ------------------------------------------------------------------------
@@ -59,6 +59,21 @@ device memory : 17.2 GB
   attention weights row sum          1.0000
 
   >> Attention is shape-preserving end to end: a block takes (seq, d_model) and returns (seq, d_model). Only the score matrix is quadratic in seq, and only inside the module.
+
+  the same model as actually configured — GQA with 8 KV heads:
+
+  tensor                  MHA (32 kv heads)  Llama-3-8B (8 kv heads)
+  --------------------------------------------------------------------
+  W_q                          (4096, 4096)             (4096, 4096)
+  W_k, W_v                     (4096, 4096)             (4096, 1024)
+  Q  split into heads         (32, 10, 128)            (32, 10, 128)
+  K, V  split into heads      (32, 10, 128)             (8, 10, 128)
+
+  query heads per KV head            4
+  K/V projection params, MHA         33.6M
+  K/V projection params, GQA         8.4M
+
+  >> Q keeps its full width; only K and V shrink. That asymmetry is the whole of GQA, and it is why the cached tensors are 4x smaller than the head count would suggest.
 
 --------------------------------------------------------------------------
 1d. Where attention sits in the block
