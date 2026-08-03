@@ -187,12 +187,19 @@ def head_split_arithmetic(rep: Report, device: torch.device) -> None:
 
 
 def figure_multihead(theme: Theme) -> Path:
-    """Schematic: one vector split across heads, then concatenated back.
+    """Schematic: Q/K/V projected from the whole vector, then split across heads.
 
-    Drawn with 4 heads for legibility; real models use 32-64. The point the
-    figure has to carry is that the split is a *partition* — the slices are
-    disjoint pieces of one fixed-width vector, not copies of it — which is why
-    adding heads costs nothing.
+    The ordering here is the thing the figure has to get right, and it is the
+    detail most explanations blur. Heads do NOT each take a 128-number chunk of
+    the input and project it. The input is projected in full — every one of a
+    head's Q/K/V dimensions is a learned combination of all 4096 input numbers —
+    and it is the *projected* Q, K and V that get sliced into per-head groups.
+
+    Equivalently: head h owns the columns of W_q, W_k, W_v that produce its 128
+    dimensions, and those columns read the entire input. Slicing the input itself
+    would be a different, weaker architecture.
+
+    Drawn with 4 heads for legibility; real models use 32-64.
     """
     n_heads = 4
     x0, x1 = 0.6, 9.4
@@ -201,15 +208,15 @@ def figure_multihead(theme: Theme) -> Path:
     shades = [theme.ramp[i] for i in (1, 2, 3, 4)]
 
     with styled(theme):
-        fig, ax = plt.subplots(figsize=(9.8, 7.2))
+        fig, ax = plt.subplots(figsize=(9.8, 8.8))
         ax.grid(False)
-        # Extra room on the right so the side note never crowds head 3.
+        # Extra room on the right for the side notes.
         ax.set_xlim(0, 12.6)
-        ax.set_ylim(0.35, 13.1)
+        ax.set_ylim(1.5, 15.9)
         ax.axis("off")
 
-        def bar(y, height, label_above=None, label_below=None):
-            """A full-width vector, partitioned into per-head slices."""
+        def sliced_bar(y, height, label_below=None):
+            """A vector partitioned into per-head slices."""
             for h in range(n_heads):
                 ax.add_patch(
                     patches.Rectangle((x0 + seg * h, y), seg, height,
@@ -217,84 +224,94 @@ def figure_multihead(theme: Theme) -> Path:
                 )
                 ax.text(centers[h], y + height / 2, f"slice {h}", ha="center", va="center",
                         fontsize=9, color=ink_for(shades[h]))
-            if label_above:
-                ax.text(5.0, y + height + 0.22, label_above, ha="center", va="bottom",
-                        fontsize=9.5, color=theme.secondary)
             if label_below:
                 ax.text(5.0, y - 0.22, label_below, ha="center", va="top",
                         fontsize=9.5, color=theme.secondary)
+
+        def plain_bar(y, height, label, color, sub=None, size=10):
+            ax.add_patch(
+                patches.FancyBboxPatch((x0, y), x1 - x0, height, boxstyle="round,pad=0.05",
+                                       facecolor=color, edgecolor=theme.surface, linewidth=1.8)
+            )
+            tc = ink_for(color)
+            ax.text(5.0, y + height / 2 + (0.17 if sub else 0), label, ha="center", va="center",
+                    fontsize=size, fontweight="bold", color=tc)
+            if sub:
+                ax.text(5.0, y + height / 2 - 0.25, sub, ha="center", va="center",
+                        fontsize=8.5, color=tc)
+
+        def fan(y0, y1):
+            """One stub to a bus, then a drop into each column."""
+            bus = y0 - (y0 - y1) * 0.45
+            ax.plot([5.0, 5.0], [y0, bus], color=theme.muted, linewidth=1.4, solid_capstyle="round")
+            ax.plot([centers[0], centers[-1]], [bus, bus], color=theme.muted, linewidth=1.4,
+                    solid_capstyle="round")
+            for c in centers:
+                ax.annotate("", xy=(c, y1), xytext=(c, bus),
+                            arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
 
         def arrows(y0, y1):
             for c in centers:
                 ax.annotate("", xy=(c, y1), xytext=(c, y0),
                             arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.3))
 
-        # Input vector, cut into slices.
-        #
-        # Both dimension callouts sit ABOVE the bar. The space below it belongs to
-        # the per-head arrows, and a horizontal measuring line placed there gets
-        # crossed by the arrow dropping out of that very slice — which renders as
-        # a line struck through the label.
-        bar(9.9, 0.75)
+        def down(y0, y1):
+            ax.annotate("", xy=(5.0, y1), xytext=(5.0, y0),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
 
-        ax.annotate("", xy=(x1, 11.45), xytext=(x0, 11.45),
+        # 1. The input, whole.
+        plain_bar(13.35, 0.75, "one token's vector", theme.ramp[0], size=10.5)
+        ax.annotate("", xy=(x1, 14.32), xytext=(x0, 14.32),
                     arrowprops=dict(arrowstyle="<|-|>", color=theme.muted, linewidth=1.1))
-        ax.text(5.0, 11.55, "one token's vector   -   d_model = 4096",
-                ha="center", va="bottom", fontsize=9.5, color=theme.secondary)
+        ax.text(5.0, 14.42, "d_model = 4096", ha="center", va="bottom",
+                fontsize=9.5, color=theme.secondary)
+        down(13.35, 12.9)
 
-        ax.annotate("", xy=(x1, 10.85), xytext=(x1 - seg, 10.85),
-                    arrowprops=dict(arrowstyle="<|-|>", color=theme.muted, linewidth=1.1))
-        ax.text(x1 - seg / 2, 10.93, "d_head = 4096 / 32 = 128",
-                ha="center", va="bottom", fontsize=8.5, color=theme.muted, style="italic")
+        # 2. Projections that read ALL of it.
+        plain_bar(11.95, 0.95, "W_q,  W_k,  W_v", theme.ramp[5],
+                  sub="every output dimension reads all 4096 input numbers")
+        down(11.95, 11.5)
 
-        arrows(9.9, 8.5)
+        # 3. Only now is anything sliced.
+        sliced_bar(10.6, 0.75)
+        ax.text(9.7, 10.97, "Q, K and V — each\ncut into 32 slices\nd_head = 4096/32 = 128",
+                ha="left", va="center", fontsize=8.5, color=theme.muted, style="italic")
 
-        # Per-head attention.
+        fan(10.6, 9.25)
+
+        # 4. Per-head attention.
         for h in range(n_heads):
             ax.add_patch(
-                patches.FancyBboxPatch((centers[h] - seg / 2 + 0.12, 6.5), seg - 0.24, 2.0,
+                patches.FancyBboxPatch((centers[h] - seg / 2 + 0.12, 7.25), seg - 0.24, 2.0,
                                        boxstyle="round,pad=0.06", facecolor=shades[h],
                                        edgecolor=theme.surface, linewidth=1.8)
             )
             tc = ink_for(shades[h])
-            ax.text(centers[h], 8.05, f"head {h}", ha="center", va="center",
+            ax.text(centers[h], 8.80, f"head {h}", ha="center", va="center",
                     fontsize=10.5, fontweight="bold", color=tc)
-            ax.text(centers[h], 7.55, "own Q, K, V", ha="center", va="center", fontsize=8.5, color=tc)
-            ax.text(centers[h], 7.18, "own scores", ha="center", va="center", fontsize=8.5, color=tc)
-            ax.text(centers[h], 6.81, "own softmax", ha="center", va="center", fontsize=8.5, color=tc)
+            ax.text(centers[h], 8.30, "its own slice", ha="center", va="center", fontsize=8.5, color=tc)
+            ax.text(centers[h], 7.93, "own scores", ha="center", va="center", fontsize=8.5, color=tc)
+            ax.text(centers[h], 7.56, "own softmax", ha="center", va="center", fontsize=8.5, color=tc)
 
-        # The misconception this note exists to block: the slices partition the
-        # vector's dimensions, never the sequence. Every head sees every token.
-        ax.text(9.75, 7.5, "each head attends over\nall tokens independently\n\n"
-                           "the split is across the\nvector's dimensions,\nnot across tokens",
+        ax.text(9.7, 8.25, "each head attends over\nall tokens independently\n\n"
+                           "the slices divide Q/K/V —\nnever the input vector,\nnever the sequence",
                 ha="left", va="center", fontsize=8.5, color=theme.muted, style="italic")
 
-        arrows(6.5, 5.2)
-        bar(4.45, 0.75, label_below="concatenate the slices back to d_model = 4096")
+        arrows(7.25, 5.95)
 
-        # Starts below the concat caption, which is centred on the same x.
-        ax.annotate("", xy=(5.0, 3.45), xytext=(5.0, 3.92),
+        # 5. Back together.
+        sliced_bar(5.2, 0.75, label_below="concatenate the slices back to d_model = 4096")
+        ax.annotate("", xy=(5.0, 4.15), xytext=(5.0, 4.62),
                     arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
 
-        ax.add_patch(
-            patches.FancyBboxPatch((x0, 2.5), x1 - x0, 0.9, boxstyle="round,pad=0.06",
-                                   facecolor=theme.ramp[5], edgecolor=theme.surface, linewidth=1.8)
-        )
-        ax.text(5.0, 2.95, "output projection  W_o    (lets the heads' findings mix)",
-                ha="center", va="center", fontsize=10, fontweight="bold", color=ink_for(theme.ramp[5]))
+        plain_bar(3.25, 0.9, "output projection  W_o", theme.ramp[5],
+                  sub="lets the heads' findings mix")
+        down(3.25, 2.8)
+        plain_bar(1.95, 0.75, "updated token vector,  d_model = 4096", theme.ramp[0], size=9.5)
 
-        ax.annotate("", xy=(5.0, 1.5), xytext=(5.0, 2.4),
-                    arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
-        ax.add_patch(
-            patches.Rectangle((x0, 0.7), x1 - x0, 0.75,
-                              facecolor=theme.ramp[0], edgecolor=theme.surface, linewidth=1.8)
-        )
-        ax.text(5.0, 1.07, "updated token vector,  d_model = 4096", ha="center", va="center",
-                fontsize=9.5, color=ink_for(theme.ramp[0]))
-
-        ax.text(5.0, 12.8, "Multi-head attention: split the vector, not the budget",
+        ax.text(5.0, 15.6, "Multi-head attention: project first, then split",
                 ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
-        ax.text(5.0, 12.4, "drawn with 4 heads; Llama-3-8B uses 32", ha="center", va="center",
+        ax.text(5.0, 15.2, "drawn with 4 heads; Llama-3-8B uses 32", ha="center", va="center",
                 fontsize=9.5, color=theme.muted)
         return save_both(fig, SLUG, "multi-head", theme)
 
