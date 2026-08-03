@@ -113,12 +113,14 @@ device memory : 17.2 GB
 5. Figures
 --------------------------------------------------------------------------
   wrote figures/01-attention-and-rope/multi-head-light.png
+  wrote figures/01-attention-and-rope/attention-zoom-light.png
   wrote figures/01-attention-and-rope/head-patterns-light.png
   wrote figures/01-attention-and-rope/block-anatomy-light.png
   wrote figures/01-attention-and-rope/softmax-saturation-light.png
   wrote figures/01-attention-and-rope/causal-mask-light.png
   wrote figures/01-attention-and-rope/rope-relative-light.png
   wrote figures/01-attention-and-rope/multi-head-dark.png
+  wrote figures/01-attention-and-rope/attention-zoom-dark.png
   wrote figures/01-attention-and-rope/head-patterns-dark.png
   wrote figures/01-attention-and-rope/block-anatomy-dark.png
   wrote figures/01-attention-and-rope/softmax-saturation-dark.png

@@ -288,6 +288,125 @@ def figure_multihead(theme: Theme) -> Path:
         return save_both(fig, SLUG, "multi-head", theme)
 
 
+def figure_attention_zoom(theme: Theme) -> Path:
+    """Deep dive: the full data path inside one Multi-Head Attention box.
+
+    The block schematic draws attention as a single box and the split/concat
+    figure explains the head partition; neither shows the actual sequence of
+    operations. This one does, with the tensor shape carried down the right-hand
+    margin — shapes are where most confusion about attention actually lives.
+
+    Llama-3-8B numbers throughout, so the reader can check the arithmetic against
+    a config file: d_model 4096, 32 heads, head_dim 128.
+    """
+    LEFT, RIGHT = 1.5, 9.9
+    MID = (LEFT + RIGHT) / 2
+    SHAPE_X = 10.3
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(9.6, 10.4))
+        ax.grid(False)
+        ax.set_xlim(0, 13.4)
+        ax.set_ylim(1.0, 15.9)
+        ax.axis("off")
+
+        def band(y, h, label, color, sub=None, x0=LEFT, x1=RIGHT, weight="bold", size=10.5):
+            ax.add_patch(
+                patches.FancyBboxPatch((x0, y), x1 - x0, h, boxstyle="round,pad=0.05",
+                                       facecolor=color, edgecolor=theme.surface, linewidth=1.6)
+            )
+            tc = ink_for(color)
+            cx = (x0 + x1) / 2
+            ax.text(cx, y + h / 2 + (0.17 if sub else 0), label, ha="center", va="center",
+                    fontsize=size, fontweight=weight, color=tc)
+            if sub:
+                ax.text(cx, y + h / 2 - 0.25, sub, ha="center", va="center",
+                        fontsize=8.5, color=tc)
+
+        def down(y0, y1, x=MID):
+            ax.annotate("", xy=(x, y1), xytext=(x, y0),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+
+        def shape(y, text):
+            ax.text(SHAPE_X, y, text, ha="left", va="center", fontsize=8.5,
+                    color=theme.muted, family="monospace")
+
+        pale, mid, deep = theme.ramp[0], theme.ramp[2], theme.ramp[5]
+
+        # Input -------------------------------------------------------------
+        band(14.2, 0.75, "input:  one vector per token", pale)
+        shape(14.58, "(seq, 4096)")
+        down(14.2, 13.75)
+
+        # Q, K, V projections ------------------------------------------------
+        cols = [(2.55, "W_q  ->  Q"), (5.7, "W_k  ->  K"), (8.85, "W_v  ->  V")]
+        for cx, label in cols:
+            band(12.95, 0.8, label, mid, x0=cx - 1.35, x1=cx + 1.35, size=10)
+            ax.annotate("", xy=(cx, 12.95 + 0.8), xytext=(MID, 13.75),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.2))
+            ax.annotate("", xy=(cx, 12.5), xytext=(cx, 12.95),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.2))
+        shape(13.35, "3 x (seq, 4096)")
+        ax.text(MID, 12.48, "three learned projections of the same input",
+                ha="center", va="top", fontsize=8.5, color=theme.muted, style="italic")
+
+        # Split into heads ---------------------------------------------------
+        band(11.35, 0.8, "reshape into 32 heads", pale, sub="4096 = 32 x 128")
+        shape(11.75, "(seq, 32, 128)")
+        down(11.35, 10.9)
+
+        # RoPE ---------------------------------------------------------------
+        band(10.1, 0.8, "RoPE: rotate Q and K by position", mid,
+             sub="V is left alone - it is content, not an address")
+        shape(10.5, "unchanged")
+        down(10.1, 9.6)
+
+        # Per-head container --------------------------------------------------
+        ax.add_patch(
+            patches.FancyBboxPatch((LEFT - 0.35, 3.95), (RIGHT - LEFT) + 0.7, 5.6,
+                                   boxstyle="round,pad=0.1", facecolor="none",
+                                   edgecolor=theme.axis, linewidth=1.3, linestyle="--", zorder=1)
+        )
+        ax.text(LEFT - 0.78, 6.75, "repeated independently in all 32 heads", rotation=90,
+                ha="center", va="center", fontsize=9, color=theme.muted)
+
+        band(8.55, 0.85, "scores  =  Q Kt / sqrt(d_k)", deep,
+             sub="every query against every key;  d_k = 128, not 4096")
+        shape(8.97, "(seq, seq)")
+        down(8.55, 8.15)
+
+        band(7.25, 0.85, "causal mask", mid,
+             sub="set every score above the diagonal to -inf")
+        shape(7.67, "(seq, seq)")
+        down(7.25, 6.85)
+
+        band(5.95, 0.85, "softmax over each row", mid,
+             sub="scores become weights that sum to 1")
+        shape(6.37, "(seq, seq)")
+        down(5.95, 5.55)
+
+        band(4.35, 0.85, "weights  x  V", deep,
+             sub="the weighted average each token takes away")
+        shape(4.77, "(seq, 32, 128)")
+
+        ax.annotate("", xy=(MID, 3.35), xytext=(MID, 3.9),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+
+        # Concat, output projection, out --------------------------------------
+        band(2.55, 0.8, "concatenate the 32 heads", pale)
+        shape(2.95, "(seq, 4096)")
+        down(2.55, 2.1)
+
+        band(1.3, 0.8, "W_o  output projection", mid, sub="lets the heads' findings mix")
+        shape(1.70, "(seq, 4096)")
+
+        ax.text(MID, 15.65, "Inside the Multi-Head Attention box",
+                ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
+        ax.text(MID, 15.25, "Llama-3-8B shapes:  d_model 4096,  32 heads,  head_dim 128",
+                ha="center", va="center", fontsize=9.5, color=theme.muted)
+        return save_both(fig, SLUG, "attention-zoom", theme)
+
+
 def figure_head_patterns(weights: torch.Tensor, theme: Theme) -> Path:
     """The same input through four heads, as four attention matrices."""
     n_heads, seq, _ = weights.shape
@@ -758,6 +877,7 @@ def make_figures(
     for theme in THEMES:
         for path in (
             figure_multihead(theme),
+            figure_attention_zoom(theme),
             figure_head_patterns(head_weights, theme),
             figure_block(theme),
             figure_saturation(rows, theme),
