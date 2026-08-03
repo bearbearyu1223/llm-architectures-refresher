@@ -290,6 +290,36 @@ def shape_walkthrough(rep: Report, device: torch.device) -> None:
     rep.blank()
     rep.kv("input and output shapes match", tuple(x.shape) == tuple(out.shape))
     rep.kv("attention weights row sum", weights.sum(-1).mean().item())
+
+    # -- the two matmuls, and which axis each one eats --------------------
+    #
+    # Matrix multiply contracts the shared inner dimension: (a, b) @ (b, c) is
+    # (a, c), and b is summed away. Attention does this twice, and the two are
+    # mirror images — the first eats the feature axis and leaves a second token
+    # axis; the second eats a token axis and brings the features back.
+    rep.blank()
+    rep.note("the two matmuls inside one head, and the axis each one contracts:")
+    rep.blank()
+    rep.table(
+        ["step", "left", "right", "output", "axis summed away"],
+        [
+            ["Q @ K.T", (seq, d_head), (d_head, seq), (seq, seq), f"{d_head} (features)"],
+            ["weights @ V", (seq, seq), (seq, d_head), (seq, d_head), f"{seq} (keys)"],
+        ],
+    )
+    rep.blank()
+    rep.note("So 'weights @ V' is (10, 10) @ (10, 128): the 10 keys are summed over,")
+    rep.note("and V's 128 features survive — one 128-number answer per query.")
+
+    # Same thing spelled out as an explicit weighted sum of V's rows.
+    head, query = 0, 3
+    by_hand = sum(weights[head, query, j] * vh[head, j] for j in range(seq))
+    rep.blank()
+    rep.kv("out[h=0, q=3] via matmul", tuple(ctx[head, query].shape))
+    rep.kv("same, as sum_j w[3,j] * V[j]", tuple(by_hand.shape))
+    rep.kv("max abs difference", (ctx[head, query] - by_hand).abs().max().item())
+    rep.note("Each output row really is a weighted average of V's rows — the")
+    rep.note("weights pick how much of each token's value to take.")
     rep.takeaway(
         "Attention is shape-preserving end to end: a block takes (seq, d_model) "
         "and returns (seq, d_model). Only the score matrix is quadratic in seq, "
