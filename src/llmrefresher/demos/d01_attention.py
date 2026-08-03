@@ -440,6 +440,101 @@ def figure_multihead(theme: Theme) -> Path:
         return save_both(fig, SLUG, "multi-head", theme)
 
 
+def figure_tensor_3d(theme: Theme) -> Path:
+    """Draw (32, 10, 128) as a deck of sheets, and label what each axis does.
+
+    A 3-D tensor is easy to picture as a solid block and hard to *use* that way,
+    because the three axes are not interchangeable — each one has a different
+    job in the computation. Drawing it as a stack of separate sheets rather than
+    a solid cuboid makes the head axis read as "independent copies", which is
+    what it is.
+
+    Oblique projection by hand rather than mplot3d: with a fixed viewing angle
+    and no perspective, the geometry stays legible and every label can be placed
+    exactly where it belongs.
+    """
+    W, H = 5.4, 3.3          # front face: 128 features wide, 10 tokens tall
+    DX, DY = 0.40, 0.30      # per-sheet depth offset
+    n_drawn = 6
+    ORIGIN = (1.5, 2.2)
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(9.4, 6.2))
+        ax.grid(False)
+        ax.set_xlim(0, 13.2)
+        ax.set_ylim(1.0, 9.7)
+        ax.axis("off")
+
+        def sheet_rect(i):
+            x = ORIGIN[0] + i * DX
+            y = ORIGIN[1] + i * DY
+            return x, y
+
+        # Back to front, so nearer sheets overlap further ones.
+        for i in range(n_drawn - 1, -1, -1):
+            x, y = sheet_rect(i)
+            front = i == 0
+            ax.add_patch(
+                patches.Rectangle((x, y), W, H,
+                                  facecolor=theme.ramp[3] if front else theme.ramp[0],
+                                  edgecolor=theme.surface if front else theme.axis,
+                                  linewidth=1.8 if front else 1.0, zorder=10 - i)
+            )
+            if not front:
+                continue
+
+            # Rows = tokens. Draw the separators so the 10 is countable.
+            for r in range(1, 10):
+                yy = y + H * r / 10
+                ax.plot([x, x + W], [yy, yy], color=theme.surface, linewidth=0.8, zorder=11)
+
+            # One row highlighted: a single token's vector inside this head.
+            r = 6
+            ax.add_patch(
+                patches.Rectangle((x, y + H * r / 10), W, H / 10, facecolor=theme.ramp[6],
+                                  edgecolor=theme.surface, linewidth=1.0, zorder=12)
+            )
+            ax.text(x + W / 2, y + H * (r + 0.5) / 10, "128 numbers: one token's query, in this head",
+                    ha="center", va="center", fontsize=8.5, color=ink_for(theme.ramp[6]), zorder=13)
+
+        fx, fy = sheet_rect(0)
+        bx, by = sheet_rect(n_drawn - 1)
+
+        # -- axis callouts ---------------------------------------------------
+        ax.annotate("", xy=(fx + W, fy - 0.35), xytext=(fx, fy - 0.35),
+                    arrowprops=dict(arrowstyle="<|-|>", color=theme.muted, linewidth=1.2))
+        ax.text(fx + W / 2, fy - 0.55, "128  —  features within one head  (d_head)",
+                ha="center", va="top", fontsize=9.5, color=theme.secondary)
+        ax.text(fx + W / 2, fy - 0.95, "dot products contract this axis: it vanishes in Q Kt",
+                ha="center", va="top", fontsize=8.5, color=theme.muted, style="italic")
+
+        ax.annotate("", xy=(fx - 0.35, fy + H), xytext=(fx - 0.35, fy),
+                    arrowprops=dict(arrowstyle="<|-|>", color=theme.muted, linewidth=1.2))
+        ax.text(fx - 0.55, fy + H / 2, "10  —  tokens  (seq)", rotation=90,
+                ha="center", va="center", fontsize=9.5, color=theme.secondary)
+        ax.text(fx - 1.05, fy + H / 2, "attention mixes along this axis", rotation=90,
+                ha="center", va="center", fontsize=8.5, color=theme.muted, style="italic")
+
+        ax.annotate("", xy=(bx + W + 0.28, by + H + 0.21), xytext=(fx + W + 0.28, fy + H + 0.21),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.3))
+        ax.text(bx + W + 0.55, by + H + 0.28, "32  —  heads", ha="left", va="center",
+                fontsize=9.5, color=theme.secondary)
+        ax.text(bx + W + 0.55, by + H - 0.14,
+                "independent sheets;\nthey never interact\nuntil W_o",
+                ha="left", va="top", fontsize=8.5, color=theme.muted, style="italic")
+
+        ax.text(1.0, 8.15, "each sheet is one head's Q:  10 tokens x 128 features",
+                ha="left", va="bottom", fontsize=10, color=theme.secondary)
+        ax.text(1.0, 7.80, "6 of the 32 sheets are drawn", ha="left", va="bottom",
+                fontsize=8.5, color=theme.muted, style="italic")
+
+        ax.text(6.6, 9.35, "Reading a (32, 10, 128) tensor", ha="center", va="center",
+                fontsize=13, fontweight="bold", color=theme.ink)
+        ax.text(6.6, 8.95, "Q, K or V after the head split", ha="center", va="center",
+                fontsize=9.5, color=theme.muted)
+        return save_both(fig, SLUG, "tensor-3d", theme)
+
+
 def figure_attention_zoom(theme: Theme) -> Path:
     """Deep dive: the full data path inside one Multi-Head Attention box.
 
@@ -1040,6 +1135,7 @@ def make_figures(
     for theme in THEMES:
         for path in (
             figure_multihead(theme),
+            figure_tensor_3d(theme),
             figure_attention_zoom(theme),
             figure_head_patterns(head_weights, theme),
             figure_block(theme),
