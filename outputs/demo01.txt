@@ -38,7 +38,30 @@ device memory : 17.2 GB
   >> More heads costs nothing: the same parameters and the same FLOPs, carved into narrower slices. What you buy is several attention patterns at once instead of one averaged compromise.
 
 --------------------------------------------------------------------------
-1c. Where attention sits in the block
+1c. Every shape, end to end
+--------------------------------------------------------------------------
+  seq=10, d_model=4096, n_heads=32, d_head=128
+
+  tensor                             shape                          note
+  ------------------------------------------------------------------------
+  x   (the token vectors)       (10, 4096)             one row per token
+  W_q, W_k, W_v               (4096, 4096)     each reads all of d_model
+  Q, K, V  after projection     (10, 4096)              still full width
+  Q, K, V  split into heads  (32, 10, 128)               4096 = 32 x 128
+  one head's Q                   (10, 128)  what the formula operates on
+  scores = Q Kt / sqrt(d_k)   (32, 10, 10)    per head, quadratic in seq
+  weights  after softmax      (32, 10, 10)            each row sums to 1
+  weights @ V                (32, 10, 128)               per-head answer
+  concatenated heads            (10, 4096)            back to full width
+  output  after W_o             (10, 4096)       same shape as the input
+
+  input and output shapes match      yes
+  attention weights row sum          1.0000
+
+  >> Attention is shape-preserving end to end: a block takes (seq, d_model) and returns (seq, d_model). Only the score matrix is quadratic in seq, and only inside the module.
+
+--------------------------------------------------------------------------
+1d. Where attention sits in the block
 --------------------------------------------------------------------------
   block shape                  attention params  FFN params  FFN share
   ----------------------------------------------------------------------

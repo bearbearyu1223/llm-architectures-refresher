@@ -186,6 +186,66 @@ def head_split_arithmetic(rep: Report, device: torch.device) -> None:
     return w.cpu()
 
 
+def shape_walkthrough(rep: Report, device: torch.device) -> None:
+    """Run one real attention module at Llama-3-8B width and print every shape.
+
+    Shapes are where most confusion about attention lives, and a table of them is
+    easy to get subtly wrong when written by hand. So this runs the actual thing
+    — real projections, real reshape, real softmax — and reports what PyTorch
+    says at each step.
+
+    A 10-token prompt keeps the sequence dimension small enough to read while the
+    model dimensions stay honest.
+    """
+    torch.manual_seed(0)
+    seq, d_model, n_heads = 10, 4096, 32
+    d_head = d_model // n_heads
+
+    x = torch.randn(seq, d_model, device=device)
+    w_q, w_k, w_v, w_o = (
+        torch.randn(d_model, d_model, device=device) / math.sqrt(d_model) for _ in range(4)
+    )
+
+    rows = [["x   (the token vectors)", tuple(x.shape), "one row per token"]]
+    rows.append(["W_q, W_k, W_v", tuple(w_q.shape), "each reads all of d_model"])
+
+    q, k, v = x @ w_q, x @ w_k, x @ w_v
+    rows.append(["Q, K, V  after projection", tuple(q.shape), "still full width"])
+
+    # (seq, d_model) -> (n_heads, seq, d_head): the split, and nothing else.
+    qh, kh, vh = (t.view(seq, n_heads, d_head).transpose(0, 1) for t in (q, k, v))
+    rows.append(["Q, K, V  split into heads", tuple(qh.shape), f"{d_model} = {n_heads} x {d_head}"])
+    rows.append(["one head's Q", tuple(qh[0].shape), "what the formula operates on"])
+
+    scores = (qh @ kh.transpose(-2, -1)) / math.sqrt(d_head)
+    rows.append(["scores = Q Kt / sqrt(d_k)", tuple(scores.shape), "per head, quadratic in seq"])
+
+    mask = torch.ones(seq, seq, dtype=torch.bool, device=device).triu(1)
+    weights = torch.softmax(scores.masked_fill(mask, float("-inf")), dim=-1)
+    rows.append(["weights  after softmax", tuple(weights.shape), "each row sums to 1"])
+
+    ctx = weights @ vh
+    rows.append(["weights @ V", tuple(ctx.shape), "per-head answer"])
+
+    merged = ctx.transpose(0, 1).reshape(seq, d_model)
+    rows.append(["concatenated heads", tuple(merged.shape), "back to full width"])
+
+    out = merged @ w_o
+    rows.append(["output  after W_o", tuple(out.shape), "same shape as the input"])
+
+    rep.note(f"seq={seq}, d_model={d_model}, n_heads={n_heads}, d_head={d_head}")
+    rep.blank()
+    rep.table(["tensor", "shape", "note"], rows)
+    rep.blank()
+    rep.kv("input and output shapes match", tuple(x.shape) == tuple(out.shape))
+    rep.kv("attention weights row sum", weights.sum(-1).mean().item())
+    rep.takeaway(
+        "Attention is shape-preserving end to end: a block takes (seq, d_model) "
+        "and returns (seq, d_model). Only the score matrix is quadratic in seq, "
+        "and only inside the module."
+    )
+
+
 def figure_multihead(theme: Theme) -> Path:
     """Schematic: Q/K/V projected from the whole vector, then split across heads.
 
@@ -940,7 +1000,10 @@ def main() -> None:
     rep.section("1b. What a head is: splitting a fixed budget")
     head_weights = head_split_arithmetic(rep, device)
 
-    rep.section("1c. Where attention sits in the block")
+    rep.section("1c. Every shape, end to end")
+    shape_walkthrough(rep, device)
+
+    rep.section("1d. Where attention sits in the block")
     block_parameter_split(rep)
 
     rep.section("2. Why divide by sqrt(d_k)?")
