@@ -292,31 +292,47 @@ def figure_multihead(theme: Theme) -> Path:
     dimensions, and those columns read the entire input. Slicing the input itself
     would be a different, weaker architecture.
 
-    Drawn with 4 heads for legibility; real models use 32-64.
+    Llama-3-8B has 32 heads, which will not fit legibly. Rather than draw four
+    heads and label them as though they were all of them — which makes the figure
+    contradict its own "32 slices" annotation — the fourth column is an explicit
+    truncation gap: heads 0, 1, an elided block of 28, then head 31.
     """
-    n_heads = 4
     x0, x1 = 0.6, 9.4
-    seg = (x1 - x0) / n_heads
-    centers = [x0 + seg * (h + 0.5) for h in range(n_heads)]
-    shades = [theme.ramp[i] for i in (1, 2, 3, 4)]
+    # Column 2 is the elision, not a head.
+    cols = [
+        {"n": "0", "shade": theme.ramp[1], "gap": False},
+        {"n": "1", "shade": theme.ramp[2], "gap": False},
+        {"n": None, "shade": None, "gap": True},
+        {"n": "31", "shade": theme.ramp[4], "gap": False},
+    ]
+    seg = (x1 - x0) / len(cols)
+    centers = [x0 + seg * (i + 0.5) for i in range(len(cols))]
 
     with styled(theme):
         fig, ax = plt.subplots(figsize=(9.8, 8.8))
         ax.grid(False)
-        # Extra room on the right for the side notes.
         ax.set_xlim(0, 12.6)
         ax.set_ylim(1.5, 15.9)
         ax.axis("off")
 
         def sliced_bar(y, height, label_below=None):
-            """A vector partitioned into per-head slices."""
-            for h in range(n_heads):
-                ax.add_patch(
-                    patches.Rectangle((x0 + seg * h, y), seg, height,
-                                      facecolor=shades[h], edgecolor=theme.surface, linewidth=2.0)
-                )
-                ax.text(centers[h], y + height / 2, f"slice {h}", ha="center", va="center",
-                        fontsize=9, color=ink_for(shades[h]))
+            """A vector partitioned into per-head slices, with the gap column."""
+            for i, c in enumerate(cols):
+                left = x0 + seg * i
+                if c["gap"]:
+                    ax.add_patch(
+                        patches.Rectangle((left, y), seg, height, facecolor=theme.surface,
+                                          edgecolor=theme.axis, linewidth=1.4, linestyle="--")
+                    )
+                    ax.text(centers[i], y + height / 2, ". . .", ha="center", va="center",
+                            fontsize=13, color=theme.muted)
+                else:
+                    ax.add_patch(
+                        patches.Rectangle((left, y), seg, height, facecolor=c["shade"],
+                                          edgecolor=theme.surface, linewidth=2.0)
+                    )
+                    ax.text(centers[i], y + height / 2, f"slice {c['n']}", ha="center",
+                            va="center", fontsize=9, color=ink_for(c["shade"]))
             if label_below:
                 ax.text(5.0, y - 0.22, label_below, ha="center", va="top",
                         fontsize=9.5, color=theme.secondary)
@@ -334,19 +350,20 @@ def figure_multihead(theme: Theme) -> Path:
                         fontsize=8.5, color=tc)
 
         def fan(y0, y1):
-            """One stub to a bus, then a drop into each column."""
             bus = y0 - (y0 - y1) * 0.45
             ax.plot([5.0, 5.0], [y0, bus], color=theme.muted, linewidth=1.4, solid_capstyle="round")
             ax.plot([centers[0], centers[-1]], [bus, bus], color=theme.muted, linewidth=1.4,
                     solid_capstyle="round")
-            for c in centers:
-                ax.annotate("", xy=(c, y1), xytext=(c, bus),
-                            arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+            for i, c in enumerate(cols):
+                ax.annotate("", xy=(centers[i], y1), xytext=(centers[i], bus),
+                            arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4,
+                                            linestyle="--" if c["gap"] else "-"))
 
         def arrows(y0, y1):
-            for c in centers:
-                ax.annotate("", xy=(c, y1), xytext=(c, y0),
-                            arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.3))
+            for i, c in enumerate(cols):
+                ax.annotate("", xy=(centers[i], y1), xytext=(centers[i], y0),
+                            arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.3,
+                                            linestyle="--" if c["gap"] else "-"))
 
         def down(y0, y1):
             ax.annotate("", xy=(5.0, y1), xytext=(5.0, y0),
@@ -373,18 +390,32 @@ def figure_multihead(theme: Theme) -> Path:
         fan(10.6, 9.25)
 
         # 4. Per-head attention.
-        for h in range(n_heads):
+        for i, c in enumerate(cols):
+            left = centers[i] - seg / 2 + 0.12
+            if c["gap"]:
+                ax.add_patch(
+                    patches.FancyBboxPatch((left, 7.25), seg - 0.24, 2.0,
+                                           boxstyle="round,pad=0.06", facecolor="none",
+                                           edgecolor=theme.axis, linewidth=1.4, linestyle="--")
+                )
+                ax.text(centers[i], 8.55, ". . .", ha="center", va="center",
+                        fontsize=15, color=theme.muted)
+                ax.text(centers[i], 7.90, "heads 2 - 30", ha="center", va="center",
+                        fontsize=9, color=theme.muted, style="italic")
+                ax.text(centers[i], 7.58, "(28 more)", ha="center", va="center",
+                        fontsize=8.5, color=theme.muted, style="italic")
+                continue
+
             ax.add_patch(
-                patches.FancyBboxPatch((centers[h] - seg / 2 + 0.12, 7.25), seg - 0.24, 2.0,
-                                       boxstyle="round,pad=0.06", facecolor=shades[h],
-                                       edgecolor=theme.surface, linewidth=1.8)
+                patches.FancyBboxPatch((left, 7.25), seg - 0.24, 2.0, boxstyle="round,pad=0.06",
+                                       facecolor=c["shade"], edgecolor=theme.surface, linewidth=1.8)
             )
-            tc = ink_for(shades[h])
-            ax.text(centers[h], 8.80, f"head {h}", ha="center", va="center",
+            tc = ink_for(c["shade"])
+            ax.text(centers[i], 8.80, f"head {c['n']}", ha="center", va="center",
                     fontsize=10.5, fontweight="bold", color=tc)
-            ax.text(centers[h], 8.30, "its own slice", ha="center", va="center", fontsize=8.5, color=tc)
-            ax.text(centers[h], 7.93, "own scores", ha="center", va="center", fontsize=8.5, color=tc)
-            ax.text(centers[h], 7.56, "own softmax", ha="center", va="center", fontsize=8.5, color=tc)
+            ax.text(centers[i], 8.30, "its own slice", ha="center", va="center", fontsize=8.5, color=tc)
+            ax.text(centers[i], 7.93, "own scores", ha="center", va="center", fontsize=8.5, color=tc)
+            ax.text(centers[i], 7.56, "own softmax", ha="center", va="center", fontsize=8.5, color=tc)
 
         ax.text(9.7, 8.25, "each head attends over\nall tokens independently\n\n"
                            "the slices divide Q/K/V —\nnever the input vector,\nnever the sequence",
@@ -393,7 +424,7 @@ def figure_multihead(theme: Theme) -> Path:
         arrows(7.25, 5.95)
 
         # 5. Back together.
-        sliced_bar(5.2, 0.75, label_below="concatenate the slices back to d_model = 4096")
+        sliced_bar(5.2, 0.75, label_below="concatenate all 32 slices back to d_model = 4096")
         ax.annotate("", xy=(5.0, 4.15), xytext=(5.0, 4.62),
                     arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
 
@@ -404,8 +435,8 @@ def figure_multihead(theme: Theme) -> Path:
 
         ax.text(5.0, 15.6, "Multi-head attention: project first, then split",
                 ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
-        ax.text(5.0, 15.2, "drawn with 4 heads; Llama-3-8B uses 32", ha="center", va="center",
-                fontsize=9.5, color=theme.muted)
+        ax.text(5.0, 15.2, "Llama-3-8B has 32 heads — 3 are drawn, the rest elided",
+                ha="center", va="center", fontsize=9.5, color=theme.muted)
         return save_both(fig, SLUG, "multi-head", theme)
 
 
