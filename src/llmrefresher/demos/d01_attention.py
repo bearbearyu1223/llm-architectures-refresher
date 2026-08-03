@@ -336,19 +336,30 @@ def figure_attention_zoom(theme: Theme) -> Path:
         # Input -------------------------------------------------------------
         band(14.2, 0.75, "input:  one vector per token", pale)
         shape(14.58, "(seq, 4096)")
-        down(14.2, 13.75)
 
         # Q, K, V projections ------------------------------------------------
+        # The fan-out is a stub down to a horizontal bus, then one drop into each
+        # box. Drawing three arrows straight from the input to the box tops puts
+        # a horizontal line across the boxes, which reads as a strikethrough.
         cols = [(2.55, "W_q  ->  Q"), (5.7, "W_k  ->  K"), (8.85, "W_v  ->  V")]
+        BUS = 13.95
+
+        ax.plot([MID, MID], [14.2, BUS], color=theme.muted, linewidth=1.4, solid_capstyle="round")
+        ax.plot([cols[0][0], cols[-1][0]], [BUS, BUS], color=theme.muted, linewidth=1.4,
+                solid_capstyle="round")
+
         for cx, label in cols:
-            band(12.95, 0.8, label, mid, x0=cx - 1.35, x1=cx + 1.35, size=10)
-            ax.annotate("", xy=(cx, 12.95 + 0.8), xytext=(MID, 13.75),
-                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.2))
-            ax.annotate("", xy=(cx, 12.5), xytext=(cx, 12.95),
-                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.2))
-        shape(13.35, "3 x (seq, 4096)")
-        ax.text(MID, 12.48, "three learned projections of the same input",
-                ha="center", va="top", fontsize=8.5, color=theme.muted, style="italic")
+            band(12.6, 0.8, label, mid, x0=cx - 1.35, x1=cx + 1.35, size=10)
+            ax.annotate("", xy=(cx, 13.44), xytext=(cx, BUS),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+            ax.annotate("", xy=(cx, 12.2), xytext=(cx, 12.6),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+
+        shape(13.0, "3 x (seq, 4096)")
+        # Caption lives in the right margin: the space under the boxes belongs to
+        # the three converging arrows.
+        ax.text(SHAPE_X, 12.42, "three learned views\nof the same input",
+                ha="left", va="center", fontsize=8.5, color=theme.muted, style="italic")
 
         # Split into heads ---------------------------------------------------
         band(11.35, 0.8, "reshape into 32 heads", pale, sub="4096 = 32 x 128")
