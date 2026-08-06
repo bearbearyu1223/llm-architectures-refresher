@@ -1,6 +1,6 @@
-# LLM Architectures Refresher — runnable demos
+# LLM Architecture Refresh — runnable demos
 
-Companion code for the *LLM Architectures* blog series at
+Companion code for the *LLM Architecture Refresh* blog series at
 [bearbearyu1223.github.io](https://bearbearyu1223.github.io).
 
 Every post makes claims about how modern LLMs work. Every claim here has a

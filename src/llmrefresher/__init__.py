@@ -1,4 +1,4 @@
-"""Runnable demos for the LLM Architectures blog series.
+"""Runnable demos for the LLM Architecture Refresh blog series.
 
 Every demo is a standalone module under ``llmrefresher.demos`` that runs on both
 Apple Silicon (MPS) and Linux + NVIDIA (CUDA). Demos print to stdout in a stable,
