@@ -604,11 +604,148 @@ def why_the_ffn(rep: Report, device: torch.device) -> None:
     rep.kv("Llama-3-8B slots per layer (d_ff)", 14_336)
     rep.kv("x 32 layers = total slots", f"{14_336 * 32:,}")
 
+    # -- 4. what the FFN actually is: matrices, and why more than one --------
+    rep.blank()
+    rep.note("WHAT IT IS MADE OF — Llama-3-8B's SwiGLU FFN, per block:")
+    rep.blank()
+    D, DFF = 4096, 14_336
+    rep.table(
+        ["matrix", "shape", "params", "role"],
+        [
+            ["W_gate", (D, DFF), f"{D * DFF / 1e6:.1f}M", "opens or closes each slot"],
+            ["W_up", (D, DFF), f"{D * DFF / 1e6:.1f}M", "the content each slot offers"],
+            ["W_down", (DFF, D), f"{D * DFF / 1e6:.1f}M", "writes the result back"],
+            ["total", "", f"{3 * D * DFF / 1e6:.1f}M", "per block, x 32 blocks"],
+        ],
+    )
+    rep.blank()
+    rep.note(f"The vector goes {D} -> {DFF} -> {D}: widen, act, narrow.")
+
+    # Why it has to be more than one matrix: without a nonlinearity between
+    # them, the two collapse into a single d_model x d_model matrix and the
+    # whole layer is equivalent to one linear map. float64 so "exactly" is
+    # not doing any work.
+    torch.manual_seed(0)
+    sd, sdff = 64, 256
+    xs = torch.randn(5, sd, dtype=torch.float64)
+    wu = torch.randn(sd, sdff, dtype=torch.float64)
+    wd = torch.randn(sdff, sd, dtype=torch.float64)
+    collapsed = wu @ wd
+
+    rep.blank()
+    rep.note("WHY TWO MATRICES AND NOT ONE — drop the nonlinearity and see:")
+    rep.blank()
+    rep.kv("(x @ W_up) @ W_down  vs  x @ (W_up @ W_down)",
+           f"{((xs @ wu) @ wd - xs @ collapsed).abs().max():.2e}")
+    rep.kv("W_up @ W_down is a single matrix", tuple(collapsed.shape))
+    rep.blank()
+    rep.note("Identical. Two stacked matrices with nothing in between ARE one")
+    rep.note("matrix, so the widening would buy exactly nothing. The nonlinearity")
+    rep.note("is the only thing that stops them from being multiplied together.")
+
     rep.takeaway(
         "Attention decides *what to look at*; the FFN decides *what that means*. "
         "The FFN is the only nonlinearity acting on a token's own features, and "
         "its shape is a lookup table — which is why facts are stored there."
     )
+
+
+def figure_ffn(theme: Theme) -> Path:
+    """What a SwiGLU FFN is made of: three matrices and one elementwise gate.
+
+    Drawn as bars whose *width is proportional to the actual dimension*, so the
+    4096 -> 14336 -> 4096 widening is visible as widening rather than asserted in
+    a caption. The gate branch and the content branch run side by side and meet
+    at an elementwise multiply.
+    """
+    D, DFF = 4096, 14_336
+    FULL = 9.4                      # x-extent representing d_ff
+    NARROW = FULL * D / DFF         # d_model, to the same scale
+    CX = 6.3
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(9.6, 7.6))
+        ax.grid(False)
+        ax.set_xlim(0, 13.4)
+        ax.set_ylim(0.4, 11.6)
+        ax.axis("off")
+
+        def bar(y, width, label, color, h=0.72, cx=CX, size=9.5):
+            ax.add_patch(
+                patches.Rectangle((cx - width / 2, y), width, h, facecolor=color,
+                                  edgecolor=theme.surface, linewidth=1.6)
+            )
+            ax.text(cx, y + h / 2, label, ha="center", va="center",
+                    fontsize=size, color=ink_for(color))
+
+        def matbox(y, label, sub, cx=CX, w=3.4, color=None):
+            color = color or theme.ramp[5]
+            ax.add_patch(
+                patches.FancyBboxPatch((cx - w / 2, y), w, 0.9, boxstyle="round,pad=0.05",
+                                       facecolor=color, edgecolor=theme.surface, linewidth=1.6)
+            )
+            tc = ink_for(color)
+            ax.text(cx, y + 0.60, label, ha="center", va="center",
+                    fontsize=10, fontweight="bold", color=tc)
+            ax.text(cx, y + 0.28, sub, ha="center", va="center", fontsize=8, color=tc)
+
+        def arrow(x, y0, y1, style="-"):
+            ax.annotate("", xy=(x, y1), xytext=(x, y0),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted,
+                                        linewidth=1.3, linestyle=style))
+
+        LEFT, RIGHT = CX - 2.35, CX + 2.35
+
+        # in
+        bar(10.2, NARROW, "one token's vector", theme.ramp[0])
+        ax.text(CX + NARROW / 2 + 0.25, 10.56, f"d_model = {D}", ha="left", va="center",
+                fontsize=9, color=theme.secondary)
+
+        # split to the two branches
+        ax.plot([CX, CX], [10.2, 9.85], color=theme.muted, linewidth=1.3)
+        ax.plot([LEFT, RIGHT], [9.85, 9.85], color=theme.muted, linewidth=1.3)
+        arrow(LEFT, 9.85, 9.05)
+        arrow(RIGHT, 9.85, 9.05)
+
+        matbox(8.15, "W_gate", f"({D}, {DFF})", cx=LEFT)
+        matbox(8.15, "W_up", f"({D}, {DFF})", cx=RIGHT)
+
+        arrow(LEFT, 8.15, 7.55)
+        arrow(RIGHT, 8.15, 7.55)
+        bar(6.85, FULL / 2 - 0.15, "gate values", theme.ramp[2], cx=LEFT)
+        bar(6.85, FULL / 2 - 0.15, "content values", theme.ramp[2], cx=RIGHT)
+
+        arrow(LEFT, 6.85, 6.25)
+        matbox(5.35, "SiLU", "smooth 0-to-1 dimmer", cx=LEFT, color=theme.ramp[3])
+        ax.plot([RIGHT, RIGHT], [6.85, 5.05], color=theme.muted, linewidth=1.3)
+
+        # elementwise multiply
+        ax.plot([LEFT, LEFT], [5.35, 4.55], color=theme.muted, linewidth=1.3)
+        ax.plot([LEFT, RIGHT], [4.55, 4.55], color=theme.muted, linewidth=1.3)
+        ax.plot([RIGHT, RIGHT], [5.05, 4.55], color=theme.muted, linewidth=1.3)
+        ax.add_patch(patches.Circle((CX, 4.55), 0.30, facecolor=theme.surface,
+                                    edgecolor=theme.secondary, linewidth=1.6, zorder=4))
+        ax.text(CX, 4.55, "x", ha="center", va="center", fontsize=12,
+                color=theme.secondary, fontweight="bold", zorder=5)
+        # Clear of the horizontal join line, which runs LEFT..RIGHT at this y.
+        ax.text(RIGHT + 0.45, 4.55, "elementwise:\neach gate value\nscales its own slot",
+                ha="left", va="center", fontsize=8.5, color=theme.muted, style="italic")
+
+        arrow(CX, 4.25, 3.75)
+        bar(3.05, FULL, f"{DFF} slots, each now open or shut", theme.ramp[4])
+        ax.text(CX + FULL / 2 + 0.25, 3.41, f"d_ff = {DFF}", ha="left", va="center",
+                fontsize=9, color=theme.secondary)
+
+        arrow(CX, 3.05, 2.55)
+        matbox(1.65, "W_down", f"({DFF}, {D})")
+        arrow(CX, 1.65, 1.15)
+        bar(0.55, NARROW, "back to the residual stream", theme.ramp[0])
+
+        ax.text(CX, 11.35, "What an FFN is made of", ha="center", va="center",
+                fontsize=13, fontweight="bold", color=theme.ink)
+        ax.text(CX, 10.98, "SwiGLU, Llama-3-8B — three matrices and one gate",
+                ha="center", va="center", fontsize=9.5, color=theme.muted)
+        return save_both(fig, SLUG, "ffn-anatomy", theme)
 
 
 def figure_tensor_3d(theme: Theme) -> Path:
@@ -1328,6 +1465,7 @@ def make_figures(
     for theme in THEMES:
         for path in (
             figure_multihead(theme),
+            figure_ffn(theme),
             figure_tensor_3d(theme),
             figure_attention_zoom(theme),
             figure_head_patterns(head_weights, theme),

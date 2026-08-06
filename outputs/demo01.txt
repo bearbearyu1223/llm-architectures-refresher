@@ -157,6 +157,26 @@ device memory : 17.2 GB
   Llama-3-8B slots per layer (d_ff)  14336
   x 32 layers = total slots          458,752
 
+  WHAT IT IS MADE OF — Llama-3-8B's SwiGLU FFN, per block:
+
+  matrix          shape  params                          role
+  -------------------------------------------------------------
+  W_gate  (4096, 14336)   58.7M     opens or closes each slot
+  W_up    (4096, 14336)   58.7M  the content each slot offers
+  W_down  (14336, 4096)   58.7M        writes the result back
+  total                  176.2M        per block, x 32 blocks
+
+  The vector goes 4096 -> 14336 -> 4096: widen, act, narrow.
+
+  WHY TWO MATRICES AND NOT ONE — drop the nonlinearity and see:
+
+  (x @ W_up) @ W_down  vs  x @ (W_up @ W_down) 3.94e-13
+  W_up @ W_down is a single matrix   (64, 64)
+
+  Identical. Two stacked matrices with nothing in between ARE one
+  matrix, so the widening would buy exactly nothing. The nonlinearity
+  is the only thing that stops them from being multiplied together.
+
   >> Attention decides *what to look at*; the FFN decides *what that means*. The FFN is the only nonlinearity acting on a token's own features, and its shape is a lookup table — which is why facts are stored there.
 
 --------------------------------------------------------------------------
@@ -248,6 +268,7 @@ device memory : 17.2 GB
 5. Figures
 --------------------------------------------------------------------------
   wrote figures/01-attention-and-rope/multi-head-light.png
+  wrote figures/01-attention-and-rope/ffn-anatomy-light.png
   wrote figures/01-attention-and-rope/tensor-3d-light.png
   wrote figures/01-attention-and-rope/attention-zoom-light.png
   wrote figures/01-attention-and-rope/head-patterns-light.png
@@ -256,6 +277,7 @@ device memory : 17.2 GB
   wrote figures/01-attention-and-rope/causal-mask-light.png
   wrote figures/01-attention-and-rope/rope-relative-light.png
   wrote figures/01-attention-and-rope/multi-head-dark.png
+  wrote figures/01-attention-and-rope/ffn-anatomy-dark.png
   wrote figures/01-attention-and-rope/tensor-3d-dark.png
   wrote figures/01-attention-and-rope/attention-zoom-dark.png
   wrote figures/01-attention-and-rope/head-patterns-dark.png
