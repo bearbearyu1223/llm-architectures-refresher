@@ -48,6 +48,24 @@ device memory : 17.2 GB
   Halving d_head halves the per-head cost and doubles the head count.
   The product is always 2 x seq^2 x d_model = 8.59 G.
 
+  WHERE THE FLOPs GO — one attention layer, seq=1024:
+
+  step                                  shapes    FLOPs  share
+  --------------------------------------------------------------
+  W_q/W_k/W_v/W_o  4 x (1024,4096)@(4096,4096)  137.4 G    89%
+  Q @ K.T              (1024,4096)@(4096,1024)    8.6 G     6%
+  weights @ V          (1024,1024)@(1024,4096)    8.6 G     6%
+  total                                         154.6 G       
+
+  The quadratic term is the smallest here. It only takes over once
+  seq grows past d_model — which is exactly what post 3 is about.
+
+  projection params N                67.1M
+  2 x N x tokens                     137.4 G
+  equals the measured projection cost yes
+  Every weight is used in exactly one multiply-add per token, so a
+  forward pass costs about 2 FLOPs per parameter per token.
+
   params, 1 head vs 64 heads         67.1M vs 67.1M
   score FLOPs, 1 head vs 64 heads    8.59 G vs 8.59 G
   d_head is the d_k in 1/sqrt(d_k)   yes — per-head width, not d_model

@@ -201,6 +201,49 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.note("Halving d_head halves the per-head cost and doubles the head count.")
     rep.note(f"The product is always 2 x seq^2 x d_model = {2 * seq * seq * d_model / 1e9:.2f} G.")
 
+    # --- where the FLOPs actually go ---------------------------------------
+    #
+    # One matmul costs 2 x (output elements) x (contracted length). Applying
+    # that to every matmul in an attention layer shows the score matrix is a
+    # small share at this sequence length — the projections dominate until seq
+    # grows past d_model.
+    def matmul_flops(a: int, b: int, c: int) -> int:
+        """(a, b) @ (b, c): 2 FLOPs per multiply-add, a*c outputs, b long."""
+        return 2 * a * b * c
+
+    proj = 4 * matmul_flops(seq, d_model, d_model)
+    scores = matmul_flops(seq, d_model, seq)      # summed over heads
+    values = matmul_flops(seq, seq, d_model)
+    total = proj + scores + values
+
+    rep.blank()
+    rep.note(f"WHERE THE FLOPs GO — one attention layer, seq={seq}:")
+    rep.blank()
+    rep.table(
+        ["step", "shapes", "FLOPs", "share"],
+        [
+            ["W_q/W_k/W_v/W_o", f"4 x ({seq},{d_model})@({d_model},{d_model})",
+             f"{proj / 1e9:.1f} G", f"{proj / total:.0%}"],
+            ["Q @ K.T", f"({seq},{d_model})@({d_model},{seq})", f"{scores / 1e9:.1f} G",
+             f"{scores / total:.0%}"],
+            ["weights @ V", f"({seq},{seq})@({seq},{d_model})", f"{values / 1e9:.1f} G",
+             f"{values / total:.0%}"],
+            ["total", "", f"{total / 1e9:.1f} G", ""],
+        ],
+    )
+    rep.blank()
+    rep.note("The quadratic term is the smallest here. It only takes over once")
+    rep.note("seq grows past d_model — which is exactly what post 3 is about.")
+
+    # The 2N rule of thumb, checked rather than asserted.
+    n_params = 4 * one
+    rep.blank()
+    rep.kv("projection params N", f"{n_params / 1e6:.1f}M")
+    rep.kv("2 x N x tokens", f"{2 * n_params * seq / 1e9:.1f} G")
+    rep.kv("equals the measured projection cost", 2 * n_params * seq == proj)
+    rep.note("Every weight is used in exactly one multiply-add per token, so a")
+    rep.note("forward pass costs about 2 FLOPs per parameter per token.")
+
     rep.blank()
     rep.kv("params, 1 head vs 64 heads", f"{4 * one / 1e6:.1f}M vs {4 * one / 1e6:.1f}M")
     rep.kv("score FLOPs, 1 head vs 64 heads",
