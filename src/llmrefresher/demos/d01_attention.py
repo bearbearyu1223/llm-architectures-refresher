@@ -615,8 +615,38 @@ def why_the_ffn(rep: Report, device: torch.device) -> None:
     rep.blank()
     rep.note("THE FFN: the one place a token's own features get transformed")
     rep.blank()
-    rep.kv("ffn(2x) == 2 x ffn(x)", torch.allclose(ffn(2 * attn), 2 * out, atol=1e-3))
-    rep.kv("  relative gap", ((ffn(2 * attn) - 2 * out).norm() / (2 * out).norm()).item())
+    rep.note("The doubling test. A linear function must obey f(2x) = 2 f(x):")
+    rep.note("feed it twice the input and you get exactly twice the output.")
+    rep.blank()
+
+    # Attention, weights held fixed, against the FFN — same test, both answers.
+    attn_doubled = w @ (2 * v)
+    ffn_doubled = ffn(2 * attn)
+
+    def gap(actual: torch.Tensor, linear: torch.Tensor) -> float:
+        return ((actual - linear).norm() / linear.norm()).item()
+
+    rep.table(
+        ["function", "f(2x)", "2 x f(x)", "off by", "linear?"],
+        [
+            ["attention (weights fixed)", f"{attn_doubled.norm():.3f}", f"{(2 * attn).norm():.3f}",
+             f"{gap(attn_doubled, 2 * attn):.1%}", "yes"],
+            ["FFN", f"{ffn_doubled.norm():.3f}", f"{(2 * out).norm():.3f}",
+             f"{gap(ffn_doubled, 2 * out):.1%}", "no"],
+        ],
+    )
+    rep.blank()
+    rep.note("(f(2x) and 2 f(x) are compared by vector length. 'off by' is how far")
+    rep.note("apart the two results are, as a fraction of the linear answer.)")
+
+    # The same thing on one number, which is easier to hold onto than a norm.
+    a, b = out[0, 0].item(), ffn_doubled[0, 0].item()
+    rep.blank()
+    rep.note("Concretely, on a single output number:")
+    rep.kv("  ffn(x) gives", f"{a:.4f}")
+    rep.kv("  2 x that = what linear predicts", f"{2 * a:.4f}")
+    rep.kv("  ffn(2x) actually gives", f"{b:.4f}")
+    rep.blank()
     rep.note("Not linear — which is exactly the point. 'A and B both present ->")
     rep.note("conclude C' is not something an average can express.")
 

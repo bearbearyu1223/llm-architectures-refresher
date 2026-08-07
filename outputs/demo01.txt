@@ -152,8 +152,22 @@ device memory : 17.2 GB
 
   THE FFN: the one place a token's own features get transformed
 
-  ffn(2x) == 2 x ffn(x)              no
-    relative gap                     0.2095
+  The doubling test. A linear function must obey f(2x) = 2 f(x):
+  feed it twice the input and you get exactly twice the output.
+
+  function                    f(2x)  2 x f(x)  off by  linear?
+  --------------------------------------------------------------
+  attention (weights fixed)  23.542    23.542    0.0%      yes
+  FFN                        14.641    13.375   21.0%       no
+
+  (f(2x) and 2 f(x) are compared by vector length. 'off by' is how far
+  apart the two results are, as a fraction of the linear answer.)
+
+  Concretely, on a single output number:
+    ffn(x) gives                     -0.1197
+    2 x that = what linear predicts  -0.2394
+    ffn(2x) actually gives           -0.3333
+
   Not linear — which is exactly the point. 'A and B both present ->
   conclude C' is not something an average can express.
 
