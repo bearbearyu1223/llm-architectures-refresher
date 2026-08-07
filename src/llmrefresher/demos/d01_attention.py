@@ -327,7 +327,8 @@ def shape_walkthrough(rep: Report, device: torch.device) -> None:
     out = merged @ w_o
     rows.append(["output  after W_o", tuple(out.shape), "same shape as the input"])
 
-    rep.note(f"classic MHA — seq={seq}, d_model={d_model}, n_heads={n_heads}, d_head={d_head}")
+    rep.note("classic multi-head attention (MHA): one K and V head per query head")
+    rep.note(f"seq={seq}, d_model={d_model}, n_heads={n_heads}, d_head={d_head}")
     rep.blank()
     rep.table(["tensor", "shape", "note"], rows)
     rep.blank()

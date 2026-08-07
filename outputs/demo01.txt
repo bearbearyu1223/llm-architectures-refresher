@@ -84,7 +84,8 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 1c. Every shape, end to end
 --------------------------------------------------------------------------
-  classic MHA — seq=10, d_model=4096, n_heads=32, d_head=128
+  classic multi-head attention (MHA): one K and V head per query head
+  seq=10, d_model=4096, n_heads=32, d_head=128
 
   tensor                             shape                          note
   ------------------------------------------------------------------------
