@@ -962,7 +962,7 @@ def figure_attention_zoom(theme: Theme) -> Path:
 
         # Split into heads ---------------------------------------------------
         band(11.35, 0.8, "reshape into 32 heads", pale, sub="4096 = 32 x 128")
-        shape(11.75, "(seq, 32, 128)")
+        shape(11.75, "(32, seq, 128)")
         down(11.35, 10.9)
 
         # RoPE ---------------------------------------------------------------
@@ -977,27 +977,27 @@ def figure_attention_zoom(theme: Theme) -> Path:
                                    boxstyle="round,pad=0.1", facecolor="none",
                                    edgecolor=theme.axis, linewidth=1.3, linestyle="--", zorder=1)
         )
-        ax.text(LEFT - 0.78, 6.75, "repeated independently in all 32 heads", rotation=90,
+        ax.text(LEFT - 0.78, 6.75, "the leading 32 runs independently", rotation=90,
                 ha="center", va="center", fontsize=9, color=theme.muted)
 
         band(8.55, 0.85, "scores  =  Q Kt / sqrt(d_k)", deep,
              sub="every query against every key;  d_k = 128, not 4096")
-        shape(8.97, "(seq, seq)")
+        shape(8.97, "(32, seq, seq)")
         down(8.55, 8.15)
 
         band(7.25, 0.85, "causal mask", mid,
              sub="set every score above the diagonal to -inf")
-        shape(7.67, "(seq, seq)")
+        shape(7.67, "(32, seq, seq)")
         down(7.25, 6.85)
 
         band(5.95, 0.85, "softmax over each row", mid,
              sub="scores become weights that sum to 1")
-        shape(6.37, "(seq, seq)")
+        shape(6.37, "(32, seq, seq)")
         down(5.95, 5.55)
 
         band(4.35, 0.85, "weights  x  V", deep,
              sub="the weighted average each token takes away")
-        shape(4.77, "(seq, 32, 128)")
+        shape(4.77, "(32, seq, 128)")
 
         ax.annotate("", xy=(MID, 3.35), xytext=(MID, 3.9),
                     arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
