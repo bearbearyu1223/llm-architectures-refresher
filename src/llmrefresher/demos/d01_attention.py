@@ -972,6 +972,95 @@ def figure_ffn(theme: Theme) -> Path:
         return save_both(fig, SLUG, "ffn-anatomy", theme)
 
 
+def figure_stack_two_jobs(theme: Theme) -> Path:
+    """The same stack doing both jobs, so you can see where they differ.
+
+    The companion to the token-grid figure: that one shows *what* each position
+    produces, this one shows *where in the architecture* it happens. Both columns
+    run the identical forward path. Training adds a return trip that costs about
+    twice the forward pass; generation adds a loop back to the input.
+    """
+    W = 4.7
+    LEFT, RIGHT = 3.4, 11.0
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(11.2, 9.4))
+        ax.grid(False)
+        ax.set_xlim(0, 15.6)
+        ax.set_ylim(0.2, 12.2)
+        ax.axis("off")
+
+        def box(cx, y, h, label, color, sub=None, dashed=False, size=10):
+            ax.add_patch(patches.FancyBboxPatch(
+                (cx - W / 2, y), W, h, boxstyle="round,pad=0.05", facecolor=color,
+                edgecolor=theme.axis if dashed else theme.surface,
+                linewidth=1.4, linestyle="--" if dashed else "-"))
+            ink = theme.muted if dashed else ink_for(color)
+            ax.text(cx, y + h / 2 + (0.17 if sub else 0), label, ha="center", va="center",
+                    fontsize=size, fontweight="bold", color=ink)
+            if sub:
+                ax.text(cx, y + h / 2 - 0.25, sub, ha="center", va="center",
+                        fontsize=8.5, color=ink)
+
+        def down(cx, y0, y1):
+            ax.annotate("", xy=(cx, y1), xytext=(cx, y0),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.5))
+
+        pale, mid, deep = theme.ramp[0], theme.ramp[2], theme.ramp[5]
+
+        # the identical forward path, drawn once per column
+        for cx, title in ((LEFT, "TRAINING"), (RIGHT, "GENERATING")):
+            ax.text(cx, 10.85, title, ha="center", va="center",
+                    fontsize=12, fontweight="bold", color=theme.ink)
+            box(cx, 9.85, 0.66, "the tokens you have", pale, size=9.5)
+            down(cx, 9.85, 9.45)
+            box(cx, 8.75, 0.66, "embeddings", pale, size=9.5)
+            down(cx, 8.75, 8.35)
+            box(cx, 6.75, 1.55, "32 transformer blocks", deep,
+                sub="attention, then FFN — every position at once")
+            down(cx, 6.75, 6.35)
+            box(cx, 5.55, 0.66, "final norm", pale, size=9.5)
+            down(cx, 5.55, 5.15)
+            box(cx, 4.45, 0.66, "LM head", mid, size=9.5)
+            down(cx, 4.45, 4.05)
+            box(cx, 3.15, 0.8, "a score for every word",
+                mid, sub="one full set per position", size=9.5)
+
+        # --- training: grade everything, then walk the gradients back --------
+        down(LEFT, 3.15, 2.75)
+        box(LEFT, 1.95, 0.75, "compare with the real next tokens",
+            theme.ramp[1], sub="one number: how wrong the model was", size=9)
+        gx = LEFT - W / 2 - 0.55
+        ax.plot([LEFT - W / 2, gx, gx], [2.32, 2.32, 9.08], color=theme.series[1], linewidth=1.7)
+        ax.annotate("", xy=(LEFT - W / 2, 9.08), xytext=(gx, 9.08),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.series[1], linewidth=1.7))
+        ax.text(gx - 0.3, 5.9, "gradients back down every layer\n"
+                               "about 2x the cost of the trip up",
+                rotation=90, ha="center", va="center", fontsize=8.5,
+                color=theme.series[1], style="italic")
+        ax.text(LEFT, 1.3, "every weight nudged, then the next batch",
+                ha="center", va="center", fontsize=9, color=theme.secondary)
+
+        # --- generating: keep one, append it, go again -----------------------
+        down(RIGHT, 3.15, 2.75)
+        box(RIGHT, 1.95, 0.75, "keep only the last position's scores",
+            theme.ramp[1], sub="pick a word from them", size=9)
+        lx = RIGHT + W / 2 + 0.55
+        ax.plot([RIGHT + W / 2, lx, lx], [2.32, 2.32, 10.18], color=theme.series[1], linewidth=1.7)
+        ax.annotate("", xy=(RIGHT + W / 2, 10.18), xytext=(lx, 10.18),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.series[1], linewidth=1.7))
+        ax.text(lx + 0.3, 6.3, "append it and run the whole\nthing again, one token longer",
+                rotation=270, ha="center", va="center", fontsize=8.5,
+                color=theme.series[1], style="italic")
+        ax.text(RIGHT, 1.3, "repeat until the answer is finished",
+                ha="center", va="center", fontsize=9, color=theme.secondary)
+
+        ax.plot([7.2, 7.2], [1.0, 11.2], color=theme.grid, linewidth=1.2)
+        ax.text(7.4, 11.75, "The stack is identical. Only what happens after it differs.",
+                ha="center", va="center", fontsize=12.5, fontweight="bold", color=theme.ink)
+        return save_both(fig, SLUG, "stack-two-jobs", theme)
+
+
 def figure_train_vs_infer(theme: Theme) -> Path:
     """How per-token machinery becomes learning, and becomes generation.
 
@@ -1840,6 +1929,7 @@ def make_figures(
         for path in (
             figure_multihead(theme),
             figure_ffn(theme),
+            figure_stack_two_jobs(theme),
             figure_train_vs_infer(theme),
             figure_tensor_3d(theme),
             figure_attention_zoom(theme),
