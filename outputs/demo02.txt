@@ -7,6 +7,29 @@ platform      : Darwin 24.6.0 (arm64)
 device memory : 17.2 GB
 
 --------------------------------------------------------------------------
+0. Why caching is valid at all
+--------------------------------------------------------------------------
+  Run the model on 4 tokens, then on those same 4 plus 2 more.
+  Compare what each run computed for the first 4 positions:
+
+  max difference in K                0.0000
+  max difference in V                0.0000
+  bitwise identical                  yes
+
+  Not close — identical. Appending tokens cannot reach backwards,
+  so every K and V computed for a token stays valid forever.
+
+  What the cache holds, per layer, for a 4-token prefix:
+
+  tensor  cached?                                                   why
+  -----------------------------------------------------------------------
+  K           yes                   every later query scores against it
+  V           yes                         every later query averages it
+  Q            no  position i's query is used at step i and never again
+
+  >> K and V are reused by every future token, and never change once written — so they are worth storing. Q is used once and discarded, which is why it is a KV cache and not a QKV cache.
+
+--------------------------------------------------------------------------
 1. The cache changes nothing about the output
 --------------------------------------------------------------------------
   generated shape                    (2, 40)
@@ -23,13 +46,13 @@ device memory : 17.2 GB
 
   tokens generated  cached (ms)  uncached (ms)  speedup
   -------------------------------------------------------
-  64                    54.3366        97.4107    1.79x
-  128                   94.8022       226.8279    2.39x
-  256                  151.1748       614.8851    4.07x
-  512                  285.3990      1930.5575    6.76x
+  64                    53.3285        97.1427    1.82x
+  128                   93.7048       225.7054    2.41x
+  256                  151.5950       618.8910    4.08x
+  512                  283.7927      1939.6274    6.83x
 
   8x more tokens costs (cached)      5.3x
-  8x more tokens costs (uncached)    19.8x
+  8x more tokens costs (uncached)    20.0x
   tokens processed at n=512 (cached) 576
   tokens processed at n=512 (uncached) 163584
   wasted work multiplier             284x
@@ -72,10 +95,10 @@ device memory : 17.2 GB
 
   phase    tokens/pass  ms/pass  ms/token    tokens/s
   -----------------------------------------------------
-  prefill          512  33.3497    0.0651  15352.4776
-  decode             1   5.4728    5.4728    182.7235
+  prefill          512  33.0826    0.0646  15476.4019
+  decode             1   5.3365    5.3365    187.3873
 
-  per-token cost, decode / prefill   84.0x
+  per-token cost, decode / prefill   82.6x
   Both passes read the same weights. Prefill amortizes that read over
   512 tokens; decode pays it for one.
 
@@ -91,25 +114,25 @@ device memory : 17.2 GB
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       4.0630           1.00x       246               1.0x
-  2       4.2936           1.06x       466               1.9x
-  4       4.7160           1.16x       848               3.4x
-  8       5.5821           1.37x      1433               5.8x
-  16      6.8356           1.68x      2341               9.5x
-  32      8.0027           1.97x      3999              16.2x
+  1       4.0849           1.00x       245               1.0x
+  2       4.3033           1.05x       465               1.9x
+  4       4.7283           1.16x       846               3.5x
+  8       5.7339           1.40x      1395               5.7x
+  16      6.8953           1.69x      2320               9.5x
+  32      8.4491           2.07x      3787              15.5x
 
   decode step with a 512-token prefix (KV traffic at batch 32: 0.250 GiB vs 0.23 GiB of weights):
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       5.3520           1.00x       187               1.0x
-  2       6.7004           1.25x       298               1.6x
-  4       9.0736           1.70x       441               2.4x
-  8      14.0928           2.63x       568               3.0x
-  16     22.4036           4.19x       714               3.8x
-  32     39.6401           7.41x       807               4.3x
+  1       5.3622           1.00x       186               1.0x
+  2       7.2415           1.35x       276               1.5x
+  4       9.0068           1.68x       444               2.4x
+  8      14.1475           2.64x       565               3.0x
+  16     23.0397           4.30x       694               3.7x
+  32     40.1435           7.49x       797               4.3x
 
-  throughput gain at batch 32, 32-tok prefix 16.2x
+  throughput gain at batch 32, 32-tok prefix 15.5x
   throughput gain at batch 32, 512-tok prefix 4.3x
 
   >> With a short prefix, 32x the work costs far less than 32x the time: the weight read was the bottleneck and the extra sequences rode along free. With a long prefix the gain shrinks, because KV traffic scales with batch while weight traffic does not. That is the whole economics of serving.

@@ -46,6 +46,64 @@ def _gib(n_bytes: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+def why_caching_is_valid(rep: Report, device: torch.device) -> None:
+    """The premise behind the whole idea: K and V never change once computed.
+
+    Caching is only sound because a token's key and value are a function of that
+    token and its position, and causal masking means neither can be affected by
+    anything appended later. This checks that directly — run the model on a
+    4-token prefix, then on the same tokens plus two more, and compare the K/V
+    the two runs stored for the first four positions.
+
+    It also shows what is *not* cached. Q for position i is consumed at step i
+    and never referenced again, which is why the thing is called a KV cache and
+    not a QKV cache.
+    """
+    torch.manual_seed(0)
+    cfg = ToyConfig(vocab_size=512, d_model=128, n_layers=2, n_heads=4, n_kv_heads=4,
+                    d_ff=256, max_seq_len=64)
+    model = ToyLM(cfg).to(device).eval()
+    dtype = model.embed.weight.dtype
+    tokens = torch.randint(0, cfg.vocab_size, (1, 6), device=device)
+
+    with torch.no_grad():
+        short = KVCache(cfg, 1, device, dtype)
+        model(tokens[:, :4], start=0, cache=short)     # the first four tokens
+
+        long = KVCache(cfg, 1, device, dtype)
+        model(tokens[:, :6], start=0, cache=long)      # the same four, plus two more
+
+    k_diff = (short.k[:, :, :, :4] - long.k[:, :, :, :4]).abs().max().item()
+    v_diff = (short.v[:, :, :, :4] - long.v[:, :, :, :4]).abs().max().item()
+
+    rep.note("Run the model on 4 tokens, then on those same 4 plus 2 more.")
+    rep.note("Compare what each run computed for the first 4 positions:")
+    rep.blank()
+    rep.kv("max difference in K", k_diff)
+    rep.kv("max difference in V", v_diff)
+    rep.kv("bitwise identical", bool(torch.equal(short.k[:, :, :, :4], long.k[:, :, :, :4])))
+    rep.blank()
+    rep.note("Not close — identical. Appending tokens cannot reach backwards,")
+    rep.note("so every K and V computed for a token stays valid forever.")
+
+    rep.blank()
+    rep.note("What the cache holds, per layer, for a 4-token prefix:")
+    rep.blank()
+    rep.table(
+        ["tensor", "cached?", "why"],
+        [
+            ["K", "yes", "every later query scores against it"],
+            ["V", "yes", "every later query averages it"],
+            ["Q", "no", "position i's query is used at step i and never again"],
+        ],
+    )
+    rep.takeaway(
+        "K and V are reused by every future token, and never change once written "
+        "— so they are worth storing. Q is used once and discarded, which is why "
+        "it is a KV cache and not a QKV cache."
+    )
+
+
 def cache_is_exact(rep: Report, device: torch.device) -> None:
     """Same tokens, cache or no cache. Anything else would be a bug."""
     torch.manual_seed(0)
@@ -385,6 +443,9 @@ def main() -> None:
     device = get_device()
     rep = Report("02", "The KV cache, and why decode is memory-bandwidth-bound")
     rep.header()
+
+    rep.section("0. Why caching is valid at all")
+    why_caching_is_valid(rep, device)
 
     rep.section("1. The cache changes nothing about the output")
     cache_is_exact(rep, device)
