@@ -66,6 +66,20 @@ device memory : 17.2 GB
   Every weight is used in exactly one multiply-add per token, so a
   forward pass costs about 2 FLOPs per parameter per token.
 
+  The one cost the head count does move — the score matrix is
+  (n_heads, seq, seq), so its size scales with the head count even
+  though its FLOPs do not:
+
+  n_heads  d_head  score FLOPs  score matrix (fp32)
+  ---------------------------------------------------
+  1          4096       8.59 G                4 MiB
+  8           512       8.59 G               32 MiB
+  32          128       8.59 G              128 MiB
+  64           64       8.59 G              256 MiB
+
+  Same arithmetic, 64x the activation memory. Flash Attention (post 3)
+  removes this by never writing the score matrix down.
+
   params, 1 head vs 64 heads         67.1M vs 67.1M
   score FLOPs, 1 head vs 64 heads    8.59 G vs 8.59 G
   d_head is the d_k in 1/sqrt(d_k)   yes — per-head width, not d_model

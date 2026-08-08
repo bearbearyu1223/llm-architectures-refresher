@@ -244,6 +244,27 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.note("Every weight is used in exactly one multiply-add per token, so a")
     rep.note("forward pass costs about 2 FLOPs per parameter per token.")
 
+    # The one thing the head count DOES change. scores is (n_heads, seq, seq),
+    # so its memory is proportional to the head count even though its FLOPs are
+    # not — narrower heads make each dot product cheaper, not each score matrix
+    # smaller. Post 3 is about never materialising this tensor at all.
+    rep.blank()
+    rep.note("The one cost the head count does move — the score matrix is")
+    rep.note("(n_heads, seq, seq), so its size scales with the head count even")
+    rep.note("though its FLOPs do not:")
+    rep.blank()
+    rep.table(
+        ["n_heads", "d_head", "score FLOPs", "score matrix (fp32)"],
+        [
+            [h, d_model // h, f"{2 * seq * seq * d_model / 1e9:.2f} G",
+             f"{h * seq * seq * 4 / 1024**2:.0f} MiB"]
+            for h in counts
+        ],
+    )
+    rep.blank()
+    rep.note("Same arithmetic, 64x the activation memory. Flash Attention (post 3)")
+    rep.note("removes this by never writing the score matrix down.")
+
     rep.blank()
     rep.kv("params, 1 head vs 64 heads", f"{4 * one / 1e6:.1f}M vs {4 * one / 1e6:.1f}M")
     rep.kv("score FLOPs, 1 head vs 64 heads",
