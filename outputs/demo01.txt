@@ -342,19 +342,28 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 3. Causal masking
 --------------------------------------------------------------------------
-  Feed the model a 5-token sequence, then change ONLY position 3's
-  input token and run it again. Which predictions move?
+  Run the model on a 5-token sequence, then change ONE input token
+  and run it again. Every position outputs a score for each word in
+  the vocabulary; the question is whose scores move.
 
-  position  max change in its prediction  moved?
-  ------------------------------------------------
-  1                             0.00e+00      no
-  2                             0.00e+00      no
-  3                             2.29e+00     yes
-  4                             3.14e-01     yes
-  5                             1.76e-01     yes
+  first run,  token ids              [5, 9, 12, 3, 7]
+  second run, token ids              [5, 9, 41, 3, 7]
+
+  position  its input token  max change in its scores  moved?
+  -------------------------------------------------------------
+  1                       5                  0.00e+00      no
+  2                       9                  0.00e+00      no
+  3                12 -> 41                  2.29e+00     yes
+  4                       3                  3.14e-01     yes
+  5                       7                  1.76e-01     yes
 
   Positions 1 and 2 are untouched — not close, identical. They were
   computed from tokens 1-2 and cannot see position 3 at all.
+
+  Positions 4 and 5 are the interesting ones: their OWN inputs never
+  changed, but their scores did, because they attend back to position
+  3. The effect fades with distance — one altered token among four
+  matters less than one among three.
 
   >> A position's prediction is a function of the input tokens up to it, and nothing else. The predictions never feed each other inside a pass — they are all produced together at the end.
 

@@ -1613,17 +1613,28 @@ def positions_are_independent(rep: Report, device: torch.device) -> None:
     with torch.no_grad():
         la, lb = model(a), model(b)
 
-    rep.note("Feed the model a 5-token sequence, then change ONLY position 3's")
-    rep.note("input token and run it again. Which predictions move?")
+    rep.note("Run the model on a 5-token sequence, then change ONE input token")
+    rep.note("and run it again. Every position outputs a score for each word in")
+    rep.note("the vocabulary; the question is whose scores move.")
+    rep.blank()
+    rep.kv("first run,  token ids", a[0].tolist())
+    rep.kv("second run, token ids", b[0].tolist())
     rep.blank()
     rep.table(
-        ["position", "max change in its prediction", "moved?"],
-        [[i + 1, f"{(la[0, i] - lb[0, i]).abs().max().item():.2e}",
+        ["position", "its input token", "max change in its scores", "moved?"],
+        [[i + 1,
+          f"{a[0, i].item()}" if a[0, i] == b[0, i] else f"{a[0, i].item()} -> {b[0, i].item()}",
+          f"{(la[0, i] - lb[0, i]).abs().max().item():.2e}",
           "no" if torch.equal(la[0, i], lb[0, i]) else "yes"] for i in range(5)],
     )
     rep.blank()
     rep.note("Positions 1 and 2 are untouched — not close, identical. They were")
     rep.note("computed from tokens 1-2 and cannot see position 3 at all.")
+    rep.blank()
+    rep.note("Positions 4 and 5 are the interesting ones: their OWN inputs never")
+    rep.note("changed, but their scores did, because they attend back to position")
+    rep.note("3. The effect fades with distance — one altered token among four")
+    rep.note("matters less than one among three.")
     rep.takeaway(
         "A position's prediction is a function of the input tokens up to it, and "
         "nothing else. The predictions never feed each other inside a pass — they "
