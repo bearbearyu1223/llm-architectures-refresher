@@ -972,6 +972,105 @@ def figure_ffn(theme: Theme) -> Path:
         return save_both(fig, SLUG, "ffn-anatomy", theme)
 
 
+def figure_train_vs_infer(theme: Theme) -> Path:
+    """How per-token machinery becomes learning, and becomes generation.
+
+    Everything else in this post describes what happens to *one* token's vector.
+    This is the bridge: the same forward pass produces a next-token guess at
+    every position at once. Training grades all of them; generation keeps only
+    the last. The causal mask is what makes the first of those honest.
+    """
+    toks = ["The", "cat", "sat", "on", "the"]
+    nxt = ["cat", "sat", "on", "the", "mat"]
+    n = len(toks)
+    CELL, GAP = 1.28, 0.16
+    LEFT_X, RIGHT_X = 0.85, 9.95
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(11.4, 6.4))
+        ax.grid(False)
+        ax.set_xlim(0, 16.6)
+        ax.set_ylim(0.3, 8.0)
+        ax.axis("off")
+
+        def row(x0, y, labels, colors, inks=None):
+            for i, (lab, c) in enumerate(zip(labels, colors)):
+                x = x0 + i * (CELL + GAP)
+                ax.add_patch(patches.FancyBboxPatch((x, y), CELL, 0.68,
+                                                    boxstyle="round,pad=0.04", facecolor=c,
+                                                    edgecolor=theme.surface, linewidth=1.4))
+                ink = (inks[i] if inks else None) or ink_for(c)
+                ax.text(x + CELL / 2, y + 0.34, lab, ha="center", va="center",
+                        fontsize=9.5, color=ink)
+
+        def up_arrow(x0, i, y0, y1, faded=False):
+            x = x0 + i * (CELL + GAP) + CELL / 2
+            ax.annotate("", xy=(x, y1), xytext=(x, y0),
+                        arrowprops=dict(arrowstyle="-|>",
+                                        color=theme.grid if faded else theme.muted,
+                                        linewidth=1.0 if faded else 1.5))
+
+        pale, live, dead = theme.ramp[0], theme.ramp[4], theme.ramp[0]
+
+        ax.plot([9.15, 9.15], [1.9, 7.6], color=theme.grid, linewidth=1.2)
+
+        # ---------------- training ----------------
+        ax.text(LEFT_X + n * (CELL + GAP) / 2, 7.35, "TRAINING — one pass, every position learns",
+                ha="center", va="center", fontsize=11.5, fontweight="bold", color=theme.ink)
+        row(LEFT_X, 5.95, nxt, [theme.ramp[2]] * n)
+        ax.text(LEFT_X - 0.25, 6.29, "should\nhave said", ha="right", va="center",
+                fontsize=8.5, color=theme.secondary)
+        for i in range(n):
+            up_arrow(LEFT_X, i, 5.35, 5.9)
+        row(LEFT_X, 4.55, [f"guess {i+1}" for i in range(n)], [live] * n)
+        ax.text(LEFT_X - 0.25, 4.89, "model\nguessed", ha="right", va="center",
+                fontsize=8.5, color=theme.secondary)
+        for i in range(n):
+            up_arrow(LEFT_X, i, 3.95, 4.5)
+        row(LEFT_X, 3.15, toks, [pale] * n)
+        ax.text(LEFT_X - 0.25, 3.49, "input", ha="right", va="center",
+                fontsize=8.5, color=theme.secondary)
+        ax.text(LEFT_X + n * (CELL + GAP) / 2 - GAP / 2, 2.55,
+                "All 5 guesses are compared with all 5 answers, in one pass.\n"
+                "The causal mask is what keeps it honest: the position that\n"
+                "guesses \"sat\" cannot see \"sat\" in its own input.",
+                ha="center", va="top", fontsize=9, color=theme.secondary)
+
+        # ---------------- inference ----------------
+        m = 3
+        ax.text(RIGHT_X + m * (CELL + GAP) / 2, 7.35, "GENERATING — same pass, one guess kept",
+                ha="center", va="center", fontsize=11.5, fontweight="bold", color=theme.ink)
+        row(RIGHT_X, 4.55, ["discarded", "discarded", "\"on\""],
+            [dead, dead, live], inks=[theme.muted, theme.muted, None])
+        for i in range(m):
+            up_arrow(RIGHT_X, i, 3.95, 4.5, faded=i < m - 1)
+        row(RIGHT_X, 3.15, toks[:m], [pale] * m)
+
+        # the kept guess loops back onto the end of the input
+        x_last = RIGHT_X + (m - 1) * (CELL + GAP) + CELL / 2
+        x_app = RIGHT_X + m * (CELL + GAP) + CELL / 2
+        ax.plot([x_last, x_last + 1.55, x_last + 1.55], [4.4, 4.4, 3.83],
+                color=theme.series[1], linewidth=1.5)
+        ax.annotate("", xy=(x_app, 3.83), xytext=(x_last + 1.55, 3.83),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.series[1], linewidth=1.5))
+        ax.add_patch(patches.FancyBboxPatch((x_app - CELL / 2, 3.15), CELL, 0.68,
+                                            boxstyle="round,pad=0.04", facecolor="none",
+                                            edgecolor=theme.series[1], linewidth=1.4,
+                                            linestyle="--"))
+        ax.text(x_app, 3.49, "\"on\"", ha="center", va="center",
+                fontsize=9.5, color=theme.series[1])
+        ax.text(RIGHT_X + m * (CELL + GAP) / 2, 2.55,
+                "Every position still produces a guess — there is no way to\n"
+                "compute only the last one. All but the final guess are\n"
+                "discarded, and that one is appended and the pass repeats.",
+                ha="center", va="top", fontsize=9, color=theme.secondary)
+
+        ax.text(8.3, 0.72, "Same weights, same forward pass. The only difference is "
+                           "how many of its guesses you keep.",
+                ha="center", va="center", fontsize=10, color=theme.ink, style="italic")
+        return save_both(fig, SLUG, "train-vs-infer", theme)
+
+
 def figure_tensor_3d(theme: Theme) -> Path:
     """Draw (32, 10, 128) as a deck of sheets, and label what each axis does.
 
@@ -1698,6 +1797,7 @@ def make_figures(
         for path in (
             figure_multihead(theme),
             figure_ffn(theme),
+            figure_train_vs_infer(theme),
             figure_tensor_3d(theme),
             figure_attention_zoom(theme),
             figure_head_patterns(head_weights, theme),

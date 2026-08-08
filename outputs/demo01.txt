@@ -403,6 +403,7 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
   wrote figures/01-attention-and-rope/multi-head-light.png
   wrote figures/01-attention-and-rope/ffn-anatomy-light.png
+  wrote figures/01-attention-and-rope/train-vs-infer-light.png
   wrote figures/01-attention-and-rope/tensor-3d-light.png
   wrote figures/01-attention-and-rope/attention-zoom-light.png
   wrote figures/01-attention-and-rope/head-patterns-light.png
@@ -412,6 +413,7 @@ device memory : 17.2 GB
   wrote figures/01-attention-and-rope/rope-relative-light.png
   wrote figures/01-attention-and-rope/multi-head-dark.png
   wrote figures/01-attention-and-rope/ffn-anatomy-dark.png
+  wrote figures/01-attention-and-rope/train-vs-infer-dark.png
   wrote figures/01-attention-and-rope/tensor-3d-dark.png
   wrote figures/01-attention-and-rope/attention-zoom-dark.png
   wrote figures/01-attention-and-rope/head-patterns-dark.png
