@@ -73,18 +73,40 @@ def why_caching_is_valid(rep: Report, device: torch.device) -> None:
         long = KVCache(cfg, 1, device, dtype)
         model(tokens[:, :6], start=0, cache=long)      # the same four, plus two more
 
-    k_diff = (short.k[:, :, :, :4] - long.k[:, :, :, :4]).abs().max().item()
+    # The cache is (layers, batch, kv_heads, positions, head_dim). Slicing the
+    # 4th axis to :4 keeps every layer, batch, head and feature, for the first
+    # four token positions only — the span the two runs have in common.
+    a, b = short.k[:, :, :, :4], long.k[:, :, :, :4]
+    k_diff = (a - b).abs().max().item()
     v_diff = (short.v[:, :, :, :4] - long.v[:, :, :, :4]).abs().max().item()
 
-    rep.note("Run the model on 4 tokens, then on those same 4 plus 2 more.")
-    rep.note("Compare what each run computed for the first 4 positions:")
+    rep.note("Run the model on 4 tokens, then on those same 4 plus 2 more,")
+    rep.note("and compare what each run stored for the first 4 positions.")
     rep.blank()
-    rep.kv("max difference in K", k_diff)
-    rep.kv("max difference in V", v_diff)
-    rep.kv("bitwise identical", bool(torch.equal(short.k[:, :, :, :4], long.k[:, :, :, :4])))
+    rep.table(
+        ["", "shape", "meaning"],
+        [
+            ["cache.k", tuple(short.k.shape), "layers, batch, kv_heads, positions, head_dim"],
+            ["the slice", tuple(a.shape), "same, but only the first 4 positions"],
+        ],
+    )
     rep.blank()
-    rep.note("Not close — identical. Appending tokens cannot reach backwards,")
-    rep.note("so every K and V computed for a token stays valid forever.")
+    rep.kv("numbers being compared", f"{a.numel():,}")
+    rep.blank()
+    rep.note("Subtract one from the other, take absolute values, keep the largest.")
+    rep.note("If nothing moved, that largest value is 0:")
+    rep.blank()
+    rep.kv("max |K_short - K_long|", k_diff)
+    rep.kv("max |V_short - V_long|", v_diff)
+    rep.blank()
+    rep.note("0.0000 is a rounded display, so check exact equality too — this is")
+    rep.note("stronger, and rules out a tiny non-zero difference hiding in it:")
+    rep.blank()
+    rep.kv("torch.equal(K_short, K_long)", bool(torch.equal(a, b)))
+    rep.blank()
+    rep.note("Not close — identical, across all "
+             f"{a.numel():,} numbers. Appending tokens")
+    rep.note("cannot reach backwards, so a token's K and V stay valid forever.")
 
     rep.blank()
     rep.note("What the cache holds, per layer, for a 4-token prefix:")
