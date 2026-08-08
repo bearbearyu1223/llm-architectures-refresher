@@ -60,13 +60,13 @@ device memory : 17.2 GB
 
   tokens generated  cached (ms)  uncached (ms)  speedup
   -------------------------------------------------------
-  64                    57.8959        95.9993    1.66x
-  128                   99.4901       227.4998    2.29x
-  256                  146.6712       614.6764    4.19x
-  512                  294.4272      1932.3368    6.56x
+  64                    54.1564        96.5403    1.78x
+  128                   95.9430       225.3652    2.35x
+  256                  154.8032       619.2845    4.00x
+  512                  299.9258      1925.1874    6.42x
 
-  8x more tokens costs (cached)      5.1x
-  8x more tokens costs (uncached)    20.1x
+  8x more tokens costs (cached)      5.5x
+  8x more tokens costs (uncached)    19.9x
   tokens processed at n=512 (cached) 576
   tokens processed at n=512 (uncached) 163584
   wasted work multiplier             284x
@@ -108,6 +108,20 @@ device memory : 17.2 GB
   Llama-3-8B (GQA)         8  0.50 GiB  1.00 GiB   4.00 GiB  16.00 GiB
   as MQA                   1  0.06 GiB  0.12 GiB   0.50 GiB   2.00 GiB
 
+  So does caching cost memory? Yes — at 128k context:
+
+  approach             K/V memory held                           for how long
+  -----------------------------------------------------------------------------
+  with a cache               16.00 GiB  all 32 layers, the whole conversation
+  without a cache             0.50 GiB  one layer, freed as the pass moves on
+    + its activations         1.00 GiB                         also transient
+
+  memory held, cached vs not         10.7x more
+  The cache is a time-memory trade: you hold roughly an order of
+  magnitude more memory to avoid recomputing the prefix every step.
+  Everyone takes it, because the compute it saves is worse — see the
+  284x wasted-work multiplier measured above.
+
   and at 128k context, how the cache compares to the weights:
 
   model        batch    weights  KV cache @128k  cache/weights
@@ -131,10 +145,10 @@ device memory : 17.2 GB
 
   phase    tokens/pass  ms/pass  ms/token    tokens/s
   -----------------------------------------------------
-  prefill          512  33.2688    0.0650  15389.7983
-  decode             1   5.4720    5.4720    182.7499
+  prefill          512  33.5332    0.0655  15268.4654
+  decode             1   5.4028    5.4028    185.0895
 
-  per-token cost, decode / prefill   84.2x
+  per-token cost, decode / prefill   82.5x
   Both passes read the same weights. Prefill amortizes that read over
   512 tokens; decode pays it for one.
 
@@ -150,26 +164,26 @@ device memory : 17.2 GB
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       4.0214           1.00x       249               1.0x
-  2       4.2481           1.06x       471               1.9x
-  4       4.6748           1.16x       856               3.4x
-  8       5.7006           1.42x      1403               5.6x
-  16      6.6600           1.66x      2402               9.7x
-  32      7.9547           1.98x      4023              16.2x
+  1       4.2401           1.00x       236               1.0x
+  2       4.3338           1.02x       461               2.0x
+  4       4.8313           1.14x       828               3.5x
+  8       8.9653           2.11x       892               3.8x
+  16      6.8553           1.62x      2334               9.9x
+  32      8.6313           2.04x      3707              15.7x
 
   decode step with a 512-token prefix (KV traffic at batch 32: 0.250 GiB vs 0.23 GiB of weights):
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       5.3105           1.00x       188               1.0x
-  2       6.7067           1.26x       298               1.6x
-  4       9.0066           1.70x       444               2.4x
-  8      14.1794           2.67x       564               3.0x
-  16     27.3030           5.14x       586               3.1x
-  32     45.7318           8.61x       700               3.7x
+  1       5.4267           1.00x       184               1.0x
+  2       7.1690           1.32x       279               1.5x
+  4       9.0445           1.67x       442               2.4x
+  8      14.2474           2.63x       562               3.0x
+  16     22.3432           4.12x       716               3.9x
+  32     40.1474           7.40x       797               4.3x
 
-  throughput gain at batch 32, 32-tok prefix 16.2x
-  throughput gain at batch 32, 512-tok prefix 3.7x
+  throughput gain at batch 32, 32-tok prefix 15.7x
+  throughput gain at batch 32, 512-tok prefix 4.3x
 
   >> With a short prefix, 32x the work costs far less than 32x the time: the weight read was the bottleneck and the extra sequences rode along free. With a long prefix the gain shrinks, because KV traffic scales with batch while weight traffic does not. That is the whole economics of serving.
 

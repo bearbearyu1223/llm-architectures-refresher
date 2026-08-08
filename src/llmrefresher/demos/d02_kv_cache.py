@@ -265,6 +265,35 @@ def cache_arithmetic(rep: Report) -> dict[str, list]:
         ],
     )
 
+    # The cache is not free memory — it is bought memory. Without it you still
+    # compute the same K and V every step, but you discard them immediately, so
+    # they exist one layer at a time instead of all layers at once.
+    ctx = 131_072
+    cached_bytes = spec.kv_bytes(ctx, bytes_per_elem=bytes_per)
+    one_layer = 2 * spec.n_kv_heads * spec.head_dim * ctx * bytes_per
+    hidden = ctx * (spec.n_heads * spec.head_dim) * bytes_per
+    uncached_peak = one_layer + hidden
+
+    rep.blank()
+    rep.note(f"So does caching cost memory? Yes — at {ctx // 1024}k context:")
+    rep.blank()
+    rep.table(
+        ["approach", "K/V memory held", "for how long"],
+        [
+            ["with a cache", f"{_gib(cached_bytes):.2f} GiB",
+             f"all {spec.n_layers} layers, the whole conversation"],
+            ["without a cache", f"{_gib(one_layer):.2f} GiB",
+             "one layer, freed as the pass moves on"],
+            ["  + its activations", f"{_gib(hidden):.2f} GiB", "also transient"],
+        ],
+    )
+    rep.blank()
+    rep.kv("memory held, cached vs not", f"{cached_bytes / uncached_peak:.1f}x more")
+    rep.note("The cache is a time-memory trade: you hold roughly an order of")
+    rep.note("magnitude more memory to avoid recomputing the prefix every step.")
+    rep.note("Everyone takes it, because the compute it saves is worse — see the")
+    rep.note("284x wasted-work multiplier measured above.")
+
     rep.blank()
     rep.note("and at 128k context, how the cache compares to the weights:")
     rep.blank()
