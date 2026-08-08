@@ -209,7 +209,45 @@ def quadratic_growth(rep: Report, device: torch.device) -> list[dict[str, float]
 
 
 def cache_arithmetic(rep: Report) -> dict[str, list]:
-    """The formula, applied to real model shapes at real context lengths."""
+    """The formula, built up from one token rather than stated top-down."""
+    spec, bytes_per = LLAMA3_8B, 2  # fp16
+
+    # What is physically stored: for every token, at every layer, each KV head
+    # keeps one key vector and one value vector of head_dim numbers. Nothing
+    # else — no queries, no attention weights, no FFN activations.
+    per_head = 2 * spec.head_dim
+    per_layer = per_head * spec.n_kv_heads
+    per_token = per_layer * spec.n_layers
+    per_token_bytes = per_token * bytes_per
+
+    rep.note("What one token costs, in Llama-3-8B (fp16):")
+    rep.blank()
+    rep.table(
+        ["what", "count", "running total"],
+        [
+            ["one key vector", f"{spec.head_dim} numbers", f"{spec.head_dim:,}"],
+            ["+ one value vector", f"{spec.head_dim} numbers", f"{per_head:,}"],
+            [f"x {spec.n_kv_heads} KV heads", "", f"{per_layer:,}"],
+            [f"x {spec.n_layers} layers", "", f"{per_token:,} numbers"],
+            [f"x {bytes_per} bytes (fp16)", "", f"{per_token_bytes / 1024:.0f} KiB"],
+        ],
+    )
+    rep.blank()
+    rep.kv("so one token of context costs", f"{per_token_bytes / 1024:.0f} KiB")
+    rep.note("Every token you have read or written keeps that, for as long as the")
+    rep.note("conversation lives. Multiply by context length and by batch:")
+    rep.blank()
+    rep.table(
+        ["context", "x KiB/token", "cache (batch 1)"],
+        [
+            [f"{c:,} tokens", f"{per_token_bytes / 1024:.0f} KiB",
+             f"{_gib(per_token_bytes * c):.2f} GiB"]
+            for c in (8_192, 32_768, 131_072)
+        ],
+    )
+    rep.blank()
+    rep.note("Which is the whole formula, just written out in order:")
+    rep.blank()
     rep.note("KV bytes = 2 (K and V) x layers x kv_heads x head_dim x seq x batch x dtype")
     rep.blank()
 
