@@ -342,6 +342,22 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 3. Causal masking
 --------------------------------------------------------------------------
+  Feed the model a 5-token sequence, then change ONLY position 3's
+  input token and run it again. Which predictions move?
+
+  position  max change in its prediction  moved?
+  ------------------------------------------------
+  1                             0.00e+00      no
+  2                             0.00e+00      no
+  3                             2.29e+00     yes
+  4                             3.14e-01     yes
+  5                             1.76e-01     yes
+
+  Positions 1 and 2 are untouched — not close, identical. They were
+  computed from tokens 1-2 and cannot see position 3 at all.
+
+  >> A position's prediction is a function of the input tokens up to it, and nothing else. The predictions never feed each other inside a pass — they are all produced together at the end.
+
   the mask M, added to the scores before the softmax:
 
         key0     key1     key2     key3     key4     key5     

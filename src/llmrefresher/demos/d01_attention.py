@@ -1499,6 +1499,49 @@ def scaling_sweep(rep: Report, device: torch.device) -> list[dict[str, float]]:
 # ---------------------------------------------------------------------------
 
 
+def positions_are_independent(rep: Report, device: torch.device) -> None:
+    """Each position's prediction depends only on the input tokens up to it.
+
+    Two things people conflate. Within one forward pass the per-position guesses
+    are computed in parallel at the final layer and never reach each other —
+    position 2 is conditioned on position 1's *input token*, not on whatever
+    position 1 predicted. And nothing later can reach backwards.
+
+    The second half is checkable: change one input token and see which outputs
+    move.
+    """
+    from ..toy_model import ToyConfig, ToyLM
+
+    torch.manual_seed(0)
+    cfg = ToyConfig(vocab_size=64, d_model=64, n_layers=2, n_heads=4, n_kv_heads=4,
+                    d_ff=128, max_seq_len=16)
+    model = ToyLM(cfg).to(device).eval()
+
+    a = torch.tensor([[5, 9, 12, 3, 7]], device=device)
+    b = a.clone()
+    b[0, 2] = 41  # swap the token at position 3, leave everything else alone
+
+    with torch.no_grad():
+        la, lb = model(a), model(b)
+
+    rep.note("Feed the model a 5-token sequence, then change ONLY position 3's")
+    rep.note("input token and run it again. Which predictions move?")
+    rep.blank()
+    rep.table(
+        ["position", "max change in its prediction", "moved?"],
+        [[i + 1, f"{(la[0, i] - lb[0, i]).abs().max().item():.2e}",
+          "no" if torch.equal(la[0, i], lb[0, i]) else "yes"] for i in range(5)],
+    )
+    rep.blank()
+    rep.note("Positions 1 and 2 are untouched — not close, identical. They were")
+    rep.note("computed from tokens 1-2 and cannot see position 3 at all.")
+    rep.takeaway(
+        "A position's prediction is a function of the input tokens up to it, and "
+        "nothing else. The predictions never feed each other inside a pass — they "
+        "are all produced together at the end."
+    )
+
+
 def causal_mask_demo(rep: Report, device: torch.device) -> torch.Tensor:
     """Print the mask matrix itself, then the weights it produces.
 
@@ -1836,6 +1879,8 @@ def main() -> None:
     rows = scaling_sweep(rep, device)
 
     rep.section("3. Causal masking")
+    positions_are_independent(rep, device)
+    rep.blank()
     weights = causal_mask_demo(rep, device)
 
     rep.section("4. RoPE: absolute rotation, relative score")
