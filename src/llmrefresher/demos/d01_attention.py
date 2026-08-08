@@ -219,18 +219,27 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.blank()
     rep.note(f"WHERE THE FLOPs GO — one attention layer, seq={seq}:")
     rep.blank()
+    # Written per head, because that is what actually runs: 32 separate small
+    # matmuls, not one big one. The totals coincide either way, but the shapes
+    # do not — one (seq,d)@(d,seq) would yield a single (seq,seq) grid, and
+    # attention produces 32 of them.
+    nh, dh = 32, d_model // 32
     rep.table(
-        ["step", "shapes", "FLOPs", "share"],
+        ["step", "shapes (32 heads)", "FLOPs", "share"],
         [
             ["W_q/W_k/W_v/W_o", f"4 x ({seq},{d_model})@({d_model},{d_model})",
              f"{proj / 1e9:.1f} G", f"{proj / total:.0%}"],
-            ["Q @ K.T", f"({seq},{d_model})@({d_model},{seq})", f"{scores / 1e9:.1f} G",
+            ["Q @ K.T", f"{nh} x ({seq},{dh})@({dh},{seq})", f"{scores / 1e9:.1f} G",
              f"{scores / total:.0%}"],
-            ["weights @ V", f"({seq},{seq})@({seq},{d_model})", f"{values / 1e9:.1f} G",
+            ["weights @ V", f"{nh} x ({seq},{seq})@({seq},{dh})", f"{values / 1e9:.1f} G",
              f"{values / total:.0%}"],
             ["total", "", f"{total / 1e9:.1f} G", ""],
         ],
     )
+    rep.blank()
+    rep.note("The two attention rows are 32 small matmuls each, one per head —")
+    rep.note("summed, not averaged. GQA does not shrink them: its 8 KV heads are")
+    rep.note("broadcast back to 32 before the matmul, so it saves cache, not FLOPs.")
     rep.blank()
     rep.note("The quadratic term is the smallest here. It only takes over once")
     rep.note("seq grows past d_model — which is exactly what post 3 is about.")

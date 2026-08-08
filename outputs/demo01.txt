@@ -50,12 +50,16 @@ device memory : 17.2 GB
 
   WHERE THE FLOPs GO — one attention layer, seq=1024:
 
-  step                                  shapes    FLOPs  share
+  step                       shapes (32 heads)    FLOPs  share
   --------------------------------------------------------------
   W_q/W_k/W_v/W_o  4 x (1024,4096)@(4096,4096)  137.4 G    89%
-  Q @ K.T              (1024,4096)@(4096,1024)    8.6 G     6%
-  weights @ V          (1024,1024)@(1024,4096)    8.6 G     6%
+  Q @ K.T           32 x (1024,128)@(128,1024)    8.6 G     6%
+  weights @ V      32 x (1024,1024)@(1024,128)    8.6 G     6%
   total                                         154.6 G       
+
+  The two attention rows are 32 small matmuls each, one per head —
+  summed, not averaged. GQA does not shrink them: its 8 KV heads are
+  broadcast back to 32 before the matmul, so it saves cache, not FLOPs.
 
   The quadratic term is the smallest here. It only takes over once
   seq grows past d_model — which is exactly what post 3 is about.
