@@ -190,10 +190,20 @@ device memory : 17.2 GB
   activation a_i   (1,)  how strongly this token matched it
   W_down row i    (64,)      what slot i adds if it matched
 
-  ffn(x)[row 3] via matmul           (64,)
-  same, as sum_i a_i * W_down[i]     (64,)
-  max abs difference                 8.941e-08
-  slots with |a| > 0.1 (of 256)      168
+  Take one token's FFN output — token 3 — and get it two ways:
+
+  how                                   what is computed  result
+  ----------------------------------------------------------------
+  the matmul              (silu(x @ W_up) @ W_down)[row]   (64,)
+  by hand     sum over all 256 slots of  a_i * W_down[i]   (64,)
+
+  The first few numbers of each:
+
+    from the matmul                  -0.2740  +0.1003  +0.0076  -0.1433
+    from the slot-by-slot sum        -0.2740  +0.1003  +0.0076  -0.1433
+
+  largest disagreement, all 64       8.941e-08
+  slots that responded (|a| > 0.1, of 256) 168
 
   Random weights here, so many slots respond. Trained FFNs are far
   sparser — a given token lights up a small subset.
@@ -214,8 +224,15 @@ device memory : 17.2 GB
 
   WHY TWO MATRICES AND NOT ONE — drop the nonlinearity and see:
 
-  (x @ W_up) @ W_down  vs  x @ (W_up @ W_down) 3.94e-13
-  W_up @ W_down is a single matrix   (64, 64)
+  Multiply the two matrices together first, then apply the product —
+  if that gives the same answer, the pair was never doing more than
+  one matrix could:
+
+    two steps:  (x @ W_up) @ W_down  -11.776383  ...
+    one matrix: x @ (W_up @ W_down)  -11.776383  ...
+
+  largest disagreement               3.94e-13
+  shape of that single matrix        (64, 64)
 
   Identical. Two stacked matrices with nothing in between ARE one
   matrix, so the widening would buy exactly nothing. The nonlinearity
@@ -237,13 +254,13 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 2. Why divide by sqrt(d_k)?
 --------------------------------------------------------------------------
-  d_k   logit std  max w (raw)  H (raw)  max w (/sqrt)  H (/sqrt)
-  -----------------------------------------------------------------
-  4        1.9642       0.5222   1.2986         0.3401     1.7548
-  16       3.9493       0.7428   0.6825         0.3523     1.7350
-  64       7.9399       0.8738   0.3223         0.3506     1.7407
-  256     15.9159       0.9326   0.1691         0.3533     1.7318
-  1024    32.4533       0.9735   0.0674         0.3701     1.7103
+  d_k   logit std  max w unscaled  H unscaled  max w scaled  H scaled
+  ---------------------------------------------------------------------
+  4        1.9642          0.5222      1.2986        0.3401    1.7548
+  16       3.9493          0.7428      0.6825        0.3523    1.7350
+  64       7.9399          0.8738      0.3223        0.3506    1.7407
+  256     15.9159          0.9326      0.1691        0.3533    1.7318
+  1024    32.4533          0.9735      0.0674        0.3701    1.7103
 
   uniform-over-8 entropy would be ln(8) = 2.0794
 

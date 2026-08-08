@@ -686,10 +686,23 @@ def why_the_ffn(rep: Report, device: torch.device) -> None:
         ],
     )
     rep.blank()
-    rep.kv("ffn(x)[row 3] via matmul", tuple(out[row].shape))
-    rep.kv("same, as sum_i a_i * W_down[i]", tuple(by_hand.shape))
-    rep.kv("max abs difference", (out[row] - by_hand).abs().max().item())
-    rep.kv(f"slots with |a| > 0.1 (of {d_ff})", int((acts[row].abs() > 0.1).sum()))
+    rep.note(f"Take one token's FFN output — token {row} — and get it two ways:")
+    rep.blank()
+    rep.table(
+        ["how", "what is computed", "result"],
+        [
+            ["the matmul", "(silu(x @ W_up) @ W_down)[row]", tuple(out[row].shape)],
+            ["by hand", f"sum over all {d_ff} slots of  a_i * W_down[i]", tuple(by_hand.shape)],
+        ],
+    )
+    rep.blank()
+    rep.note("The first few numbers of each:")
+    rep.blank()
+    rep.kv("  from the matmul", "  ".join(f"{v:+.4f}" for v in out[row][:4].tolist()))
+    rep.kv("  from the slot-by-slot sum", "  ".join(f"{v:+.4f}" for v in by_hand[:4].tolist()))
+    rep.blank()
+    rep.kv(f"largest disagreement, all {d_model}", (out[row] - by_hand).abs().max().item())
+    rep.kv(f"slots that responded (|a| > 0.1, of {d_ff})", int((acts[row].abs() > 0.1).sum()))
     rep.blank()
     rep.note("Random weights here, so many slots respond. Trained FFNs are far")
     rep.note("sparser — a given token lights up a small subset.")
@@ -728,9 +741,15 @@ def why_the_ffn(rep: Report, device: torch.device) -> None:
     rep.blank()
     rep.note("WHY TWO MATRICES AND NOT ONE — drop the nonlinearity and see:")
     rep.blank()
-    rep.kv("(x @ W_up) @ W_down  vs  x @ (W_up @ W_down)",
-           f"{((xs @ wu) @ wd - xs @ collapsed).abs().max():.2e}")
-    rep.kv("W_up @ W_down is a single matrix", tuple(collapsed.shape))
+    rep.note("Multiply the two matrices together first, then apply the product —")
+    rep.note("if that gives the same answer, the pair was never doing more than")
+    rep.note("one matrix could:")
+    rep.blank()
+    rep.kv("  two steps:  (x @ W_up) @ W_down", f"{((xs @ wu) @ wd)[0, 0]:+.6f}  ...")
+    rep.kv("  one matrix: x @ (W_up @ W_down)", f"{(xs @ collapsed)[0, 0]:+.6f}  ...")
+    rep.blank()
+    rep.kv("largest disagreement", f"{((xs @ wu) @ wd - xs @ collapsed).abs().max():.2e}")
+    rep.kv("shape of that single matrix", tuple(collapsed.shape))
     rep.blank()
     rep.note("Identical. Two stacked matrices with nothing in between ARE one")
     rep.note("matrix, so the widening would buy exactly nothing. The nonlinearity")
@@ -1234,7 +1253,7 @@ def scaling_sweep(rep: Report, device: torch.device) -> list[dict[str, float]]:
         rows.append(stats)
 
     rep.table(
-        ["d_k", "logit std", "max w (raw)", "H (raw)", "max w (/sqrt)", "H (/sqrt)"],
+        ["d_k", "logit std", "max w unscaled", "H unscaled", "max w scaled", "H scaled"],
         [
             [
                 int(r["d_k"]),
