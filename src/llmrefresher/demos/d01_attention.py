@@ -356,14 +356,33 @@ def shape_walkthrough(rep: Report, device: torch.device) -> None:
     rep.note("and V's 128 features survive — one 128-number answer per query.")
 
     # Same thing spelled out as an explicit weighted sum of V's rows.
+    # Take one output row and compute it twice: once as the library does it,
+    # once as the definition says it should be. Any row works; head 0 and query
+    # position 3 are an arbitrary pick.
     head, query = 0, 3
+    from_matmul = ctx[head, query]
     by_hand = sum(weights[head, query, j] * vh[head, j] for j in range(seq))
+
     rep.blank()
-    rep.kv("out[h=0, q=3] via matmul", tuple(ctx[head, query].shape))
-    rep.kv("same, as sum_j w[3,j] * V[j]", tuple(by_hand.shape))
-    rep.kv("max abs difference", (ctx[head, query] - by_hand).abs().max().item())
-    rep.note("Each output row really is a weighted average of V's rows — the")
-    rep.note("weights pick how much of each token's value to take.")
+    rep.note(f"Take a single output row — head {head}, query position {query} — and get it")
+    rep.note("two ways. Both should be the same 128 numbers:")
+    rep.blank()
+    rep.table(
+        ["how", "what is computed", "result"],
+        [
+            ["the matmul", "(weights @ V)[h, q]", f"{tuple(from_matmul.shape)}"],
+            ["by hand", f"sum over all {seq} tokens of  w[q, j] * V[j]", f"{tuple(by_hand.shape)}"],
+        ],
+    )
+    rep.blank()
+    rep.note("The first few numbers of each, side by side:")
+    rep.blank()
+    rep.kv("  from the matmul", "  ".join(f"{v:+.4f}" for v in from_matmul[:4].tolist()))
+    rep.kv("  from the by-hand sum", "  ".join(f"{v:+.4f}" for v in by_hand[:4].tolist()))
+    rep.blank()
+    rep.kv("largest disagreement, all 128", (from_matmul - by_hand).abs().max().item())
+    rep.note("Float noise, not a real difference — the matmul IS the weighted sum,")
+    rep.note("written as one operation instead of a loop.")
     rep.takeaway(
         "Attention is shape-preserving end to end: a block takes (seq, d_model) "
         "and returns (seq, d_model). Only the score matrix is quadratic in seq, "

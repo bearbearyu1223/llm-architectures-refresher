@@ -113,11 +113,22 @@ device memory : 17.2 GB
   So 'weights @ V' is (10, 10) @ (10, 128): the 10 keys are summed over,
   and V's 128 features survive — one 128-number answer per query.
 
-  out[h=0, q=3] via matmul           (128,)
-  same, as sum_j w[3,j] * V[j]       (128,)
-  max abs difference                 1.788e-07
-  Each output row really is a weighted average of V's rows — the
-  weights pick how much of each token's value to take.
+  Take a single output row — head 0, query position 3 — and get it
+  two ways. Both should be the same 128 numbers:
+
+  how                                  what is computed  result
+  ---------------------------------------------------------------
+  the matmul                        (weights @ V)[h, q]  (128,)
+  by hand     sum over all 10 tokens of  w[q, j] * V[j]  (128,)
+
+  The first few numbers of each, side by side:
+
+    from the matmul                  +0.5989  -0.0095  -0.3333  -0.4037
+    from the by-hand sum             +0.5989  -0.0095  -0.3333  -0.4037
+
+  largest disagreement, all 128      1.788e-07
+  Float noise, not a real difference — the matmul IS the weighted sum,
+  written as one operation instead of a loop.
 
   >> Attention is shape-preserving end to end: a block takes (seq, d_model) and returns (seq, d_model). Only the score matrix is quadratic in seq, and only inside the module.
 
