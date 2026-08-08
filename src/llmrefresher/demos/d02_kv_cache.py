@@ -21,11 +21,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import torch
 
 from ..device import benchmark_ms, get_device, sync
-from ..plotting import THEMES, Theme, save_both, styled
+from ..plotting import THEMES, Theme, ink_for, save_both, styled
 from ..report import Report
 from ..toy_model import LLAMA3_8B, LLAMA3_70B, KVCache, ModelSpec, ToyConfig, ToyLM
 
@@ -368,6 +369,83 @@ def prefill_vs_decode(rep: Report, device: torch.device) -> dict[str, list]:
 # ---------------------------------------------------------------------------
 
 
+def figure_why_cache(theme: Theme) -> Path:
+    """Why K and V are cached and Q is not, as two grids side by side.
+
+    Rows are generation steps, columns are token positions. The shapes do the
+    arguing: Q fills only a diagonal — each query is used by the one step that
+    created it — while K and V fill a triangle, because every step needs the key
+    and value of every token before it. A diagonal has nothing to reuse; a
+    triangle is almost entirely reuse.
+    """
+    n = 5
+    CELL = 0.92
+    LEFT_X, RIGHT_X = 1.35, 8.05
+    TOP_Y = 6.10
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(11.0, 6.6))
+        ax.grid(False)
+        ax.set_xlim(0, 14.2)
+        ax.set_ylim(0.10, 9.40)
+        ax.axis("off")
+
+        def grid(x0, title, filled):
+            ax.text(x0 + n * CELL / 2, TOP_Y + CELL + 0.83, title, ha="center", va="center",
+                    fontsize=11.5, fontweight="bold", color=theme.ink)
+            for j in range(n):
+                ax.text(x0 + (j + 0.5) * CELL, TOP_Y + CELL + 0.28, f"tok {j + 1}",
+                        ha="center", va="center", fontsize=8.5, color=theme.muted)
+            for i in range(n):
+                y = TOP_Y - i * CELL
+                ax.text(x0 - 0.35, y + CELL / 2, f"step {i + 1}", ha="right", va="center",
+                        fontsize=8.5, color=theme.muted)
+                for j in range(n):
+                    kind = filled(i, j)
+                    x = x0 + j * CELL
+                    if kind is None:
+                        ax.add_patch(patches.Rectangle((x, y), CELL, CELL, facecolor="none",
+                                                       edgecolor=theme.grid, linewidth=1.0))
+                        continue
+                    label, color = kind
+                    ax.add_patch(patches.Rectangle((x, y), CELL, CELL, facecolor=color,
+                                                   edgecolor=theme.surface, linewidth=1.6))
+                    ax.text(x + CELL / 2, y + CELL / 2, label, ha="center", va="center",
+                            fontsize=8.5, color=ink_for(color))
+
+        # Left: the query. Only the step that creates it ever uses it.
+        grid(LEFT_X, "Q — the query",
+             lambda i, j: (f"Q{j + 1}", theme.ramp[4]) if i == j else None)
+
+        # Right: keys and values. Every step needs all of them.
+        grid(RIGHT_X, "K and V — keys and values",
+             lambda i, j: None if j > i
+             else ((f"new", theme.ramp[5]) if i == j else ("reuse", theme.ramp[1])))
+
+        base = TOP_Y - (n - 1) * CELL
+        ax.text(LEFT_X + n * CELL / 2, base - 0.55,
+                "a diagonal: each query is used by exactly one step,\nthen never again — nothing to cache",
+                ha="center", va="top", fontsize=9.5, color=theme.secondary)
+        ax.text(RIGHT_X + n * CELL / 2, base - 0.55,
+                "a triangle: 5 keys computed once each,\nbut read 15 times between them — cache them",
+                ha="center", va="top", fontsize=9.5, color=theme.secondary)
+
+        # Legend for the two cell kinds on the right.
+        for dx, color, label in ((0.0, theme.ramp[5], "computed this step"),
+                                 (3.6, theme.ramp[1], "read back from cache")):
+            x = RIGHT_X + dx
+            ax.add_patch(patches.Rectangle((x, base - 1.95), 0.42, 0.42, facecolor=color,
+                                           edgecolor=theme.surface, linewidth=1.2))
+            ax.text(x + 0.58, base - 1.74, label, ha="left", va="center",
+                    fontsize=8.5, color=theme.muted)
+
+        ax.text(7.1, 8.95, "Why the cache holds K and V, but not Q",
+                ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
+        ax.text(7.1, 8.52, "rows are generation steps; columns are token positions",
+                ha="center", va="center", fontsize=9.5, color=theme.muted)
+        return save_both(fig, SLUG, "why-cache", theme)
+
+
 def figure_quadratic(rows: list[dict[str, float]], theme: Theme) -> Path:
     n = [r["n_new"] for r in rows]
     with styled(theme):
@@ -454,7 +532,8 @@ def figure_batch_sweep(data: dict[str, list], theme: Theme) -> Path:
 
 def make_figures(rep: Report, quad: list[dict[str, float]], perf: dict[str, list]) -> None:
     for theme in THEMES:
-        for path in (figure_quadratic(quad, theme), figure_cache_size(theme), figure_batch_sweep(perf, theme)):
+        for path in (figure_why_cache(theme), figure_quadratic(quad, theme),
+                     figure_cache_size(theme), figure_batch_sweep(perf, theme)):
             rep.note(f"wrote {path.relative_to(path.parents[2])}")
 
 

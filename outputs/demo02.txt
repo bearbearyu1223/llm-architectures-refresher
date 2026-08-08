@@ -60,13 +60,13 @@ device memory : 17.2 GB
 
   tokens generated  cached (ms)  uncached (ms)  speedup
   -------------------------------------------------------
-  64                    53.5056        96.9950    1.81x
-  128                  104.7261       234.5578    2.24x
-  256                  161.3880       612.8305    3.80x
-  512                  321.1970      1931.1970    6.01x
+  64                    53.8251        98.3863    1.83x
+  128                  100.8182       225.6408    2.24x
+  256                  151.7084       607.2361    4.00x
+  512                  323.3597      1916.4707    5.93x
 
   8x more tokens costs (cached)      6.0x
-  8x more tokens costs (uncached)    19.9x
+  8x more tokens costs (uncached)    19.5x
   tokens processed at n=512 (cached) 576
   tokens processed at n=512 (uncached) 163584
   wasted work multiplier             284x
@@ -109,10 +109,10 @@ device memory : 17.2 GB
 
   phase    tokens/pass  ms/pass  ms/token    tokens/s
   -----------------------------------------------------
-  prefill          512  33.1161    0.0647  15460.7652
-  decode             1   5.3152    5.3152    188.1379
+  prefill          512  33.5880    0.0656  15243.5394
+  decode             1   5.8281    5.8281    171.5830
 
-  per-token cost, decode / prefill   82.2x
+  per-token cost, decode / prefill   88.8x
   Both passes read the same weights. Prefill amortizes that read over
   512 tokens; decode pays it for one.
 
@@ -128,35 +128,37 @@ device memory : 17.2 GB
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       4.0314           1.00x       248               1.0x
-  2       4.2453           1.05x       471               1.9x
-  4       4.7030           1.17x       851               3.4x
-  8       5.7270           1.42x      1397               5.6x
-  16      6.7147           1.67x      2383               9.6x
-  32      8.5788           2.13x      3730              15.0x
+  1       4.0718           1.00x       246               1.0x
+  2       4.3083           1.06x       464               1.9x
+  4       4.7570           1.17x       841               3.4x
+  8       5.8162           1.43x      1375               5.6x
+  16      6.9345           1.70x      2307               9.4x
+  32      8.0070           1.97x      3997              16.3x
 
   decode step with a 512-token prefix (KV traffic at batch 32: 0.250 GiB vs 0.23 GiB of weights):
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       5.3715           1.00x       186               1.0x
-  2       7.2009           1.34x       278               1.5x
-  4       9.6516           1.80x       414               2.2x
-  8      14.1325           2.63x       566               3.0x
-  16     22.3732           4.17x       715               3.8x
-  32     39.7077           7.39x       806               4.3x
+  1       5.3699           1.00x       186               1.0x
+  2       7.1702           1.34x       279               1.5x
+  4       9.0610           1.69x       441               2.4x
+  8      14.3192           2.67x       559               3.0x
+  16     23.9001           4.45x       669               3.6x
+  32     41.2712           7.69x       775               4.2x
 
-  throughput gain at batch 32, 32-tok prefix 15.0x
-  throughput gain at batch 32, 512-tok prefix 4.3x
+  throughput gain at batch 32, 32-tok prefix 16.3x
+  throughput gain at batch 32, 512-tok prefix 4.2x
 
   >> With a short prefix, 32x the work costs far less than 32x the time: the weight read was the bottleneck and the extra sequences rode along free. With a long prefix the gain shrinks, because KV traffic scales with batch while weight traffic does not. That is the whole economics of serving.
 
 --------------------------------------------------------------------------
 5. Figures
 --------------------------------------------------------------------------
+  wrote figures/02-kv-cache/why-cache-light.png
   wrote figures/02-kv-cache/cache-vs-nocache-light.png
   wrote figures/02-kv-cache/cache-size-light.png
   wrote figures/02-kv-cache/batch-sweep-light.png
+  wrote figures/02-kv-cache/why-cache-dark.png
   wrote figures/02-kv-cache/cache-vs-nocache-dark.png
   wrote figures/02-kv-cache/cache-size-dark.png
   wrote figures/02-kv-cache/batch-sweep-dark.png
