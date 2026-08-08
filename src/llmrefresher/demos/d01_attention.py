@@ -1211,8 +1211,12 @@ def figure_head_patterns(weights: torch.Tensor, theme: Theme) -> Path:
         for h, ax in enumerate(axes):
             ax.grid(False)
             ax.imshow(np.ma.masked_array(w[h], mask=blocked), cmap=cmap, vmin=0, vmax=0.6)
+            # Entropy of the bottom row, in nats: how spread out that query's
+            # attention is. 0 means all of it landed on one token; ln(seq) means
+            # it was spread evenly over everything visible.
             entropy = float(-(w[h][-1] * np.log(np.clip(w[h][-1], 1e-12, None))).sum())
-            ax.set_title(f"head {h}   (H = {entropy:.2f})", fontsize=10, color=theme.ink)
+            ax.set_title(f"head {h}", fontsize=10.5, fontweight="bold", color=theme.ink)
+            ax.set_xlabel(f"spread {entropy:.2f}", fontsize=9, color=theme.secondary)
             ax.set_xticks([])
             ax.set_yticks([])
             for spine in ax.spines.values():
@@ -1221,9 +1225,13 @@ def figure_head_patterns(weights: torch.Tensor, theme: Theme) -> Path:
                 ax.set_ylabel("query position", fontsize=9, color=theme.secondary)
 
         fig.suptitle("Same input, four heads, four different attention patterns",
-                     fontsize=13, fontweight="bold", color=theme.ink, y=1.06)
-        fig.text(0.5, -0.04, "key position  ->        (random weights: this shows heads are not "
-                             "redundant, not that they specialize)",
+                     fontsize=13, fontweight="bold", color=theme.ink, y=1.16)
+        fig.text(0.5, 1.02, f'"spread" is entropy in nats: 0 = all the weight on one token, '
+                            f'{math.log(seq):.2f} = shared evenly across all {seq}',
+                 ha="center", fontsize=9, color=theme.muted, transform=fig.transFigure)
+        fig.text(0.5, -0.08, "rows are query positions, columns are keys        "
+                             "(random weights: this shows heads are not redundant, "
+                             "not that they specialize)",
                  ha="center", fontsize=8.5, color=theme.muted, style="italic")
         return save_both(fig, SLUG, "head-patterns", theme)
 
