@@ -289,10 +289,29 @@ def cache_arithmetic(rep: Report) -> dict[str, list]:
     )
     rep.blank()
     rep.kv("memory held, cached vs not", f"{cached_bytes / uncached_peak:.1f}x more")
-    rep.note("The cache is a time-memory trade: you hold roughly an order of")
-    rep.note("magnitude more memory to avoid recomputing the prefix every step.")
-    rep.note("Everyone takes it, because the compute it saves is worse — see the")
-    rep.note("284x wasted-work multiplier measured above.")
+
+    # And what that memory buys, at shapes a real deployment actually sees.
+    # A model's cost is roughly proportional to how many tokens it pushes through
+    # itself; cached, that is prompt + reply once, uncached it is the whole
+    # prefix again on every single step.
+    rep.blank()
+    rep.note("And what that memory buys. A request costs roughly in proportion to")
+    rep.note("how many tokens the model pushes through itself:")
+    rep.blank()
+    rep.table(
+        ["prompt", "reply", "cached", "uncached", "compute saved"],
+        [
+            [f"{p:,}", f"{n:,}", f"{p + n:,}",
+             f"{sum(p + i for i in range(n)):,}",
+             f"{sum(p + i for i in range(n)) / (p + n):.0f}x"]
+            for p, n in ((512, 256), (2_048, 512), (8_192, 1_024), (32_768, 2_048))
+        ],
+    )
+    rep.blank()
+    rep.note("So the trade is roughly 10x the memory for 200-2000x the compute,")
+    rep.note("and the saving grows with context while the memory cost grows only")
+    rep.note("linearly. That is why no serving stack ships without a KV cache —")
+    rep.note("it is not a tuning option, it is what makes hosting viable.")
 
     rep.blank()
     rep.note("and at 128k context, how the cache compares to the weights:")

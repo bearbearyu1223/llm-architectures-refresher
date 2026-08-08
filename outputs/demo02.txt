@@ -60,13 +60,13 @@ device memory : 17.2 GB
 
   tokens generated  cached (ms)  uncached (ms)  speedup
   -------------------------------------------------------
-  64                    54.1564        96.5403    1.78x
-  128                   95.9430       225.3652    2.35x
-  256                  154.8032       619.2845    4.00x
-  512                  299.9258      1925.1874    6.42x
+  64                    54.8871       103.8737    1.89x
+  128                   94.5282       234.0838    2.48x
+  256                  171.5285       620.7546    3.62x
+  512                  306.6524      1956.7814    6.38x
 
-  8x more tokens costs (cached)      5.5x
-  8x more tokens costs (uncached)    19.9x
+  8x more tokens costs (cached)      5.6x
+  8x more tokens costs (uncached)    18.8x
   tokens processed at n=512 (cached) 576
   tokens processed at n=512 (uncached) 163584
   wasted work multiplier             284x
@@ -117,10 +117,21 @@ device memory : 17.2 GB
     + its activations         1.00 GiB                         also transient
 
   memory held, cached vs not         10.7x more
-  The cache is a time-memory trade: you hold roughly an order of
-  magnitude more memory to avoid recomputing the prefix every step.
-  Everyone takes it, because the compute it saves is worse — see the
-  284x wasted-work multiplier measured above.
+
+  And what that memory buys. A request costs roughly in proportion to
+  how many tokens the model pushes through itself:
+
+  prompt  reply  cached    uncached  compute saved
+  --------------------------------------------------
+  512       256     768     163,712           213x
+  2,048     512   2,560   1,179,392           461x
+  8,192   1,024   9,216   8,912,384           967x
+  32,768  2,048  34,816  69,204,992          1988x
+
+  So the trade is roughly 10x the memory for 200-2000x the compute,
+  and the saving grows with context while the memory cost grows only
+  linearly. That is why no serving stack ships without a KV cache —
+  it is not a tuning option, it is what makes hosting viable.
 
   and at 128k context, how the cache compares to the weights:
 
@@ -145,10 +156,10 @@ device memory : 17.2 GB
 
   phase    tokens/pass  ms/pass  ms/token    tokens/s
   -----------------------------------------------------
-  prefill          512  33.5332    0.0655  15268.4654
-  decode             1   5.4028    5.4028    185.0895
+  prefill          512  33.8788    0.0662  15112.7181
+  decode             1   5.7932    5.7932    172.6159
 
-  per-token cost, decode / prefill   82.5x
+  per-token cost, decode / prefill   87.6x
   Both passes read the same weights. Prefill amortizes that read over
   512 tokens; decode pays it for one.
 
@@ -164,26 +175,26 @@ device memory : 17.2 GB
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       4.2401           1.00x       236               1.0x
-  2       4.3338           1.02x       461               2.0x
-  4       4.8313           1.14x       828               3.5x
-  8       8.9653           2.11x       892               3.8x
-  16      6.8553           1.62x      2334               9.9x
-  32      8.6313           2.04x      3707              15.7x
+  1       4.3755           1.00x       229               1.0x
+  2       4.6257           1.06x       432               1.9x
+  4       4.9239           1.13x       812               3.6x
+  8       6.1775           1.41x      1295               5.7x
+  16      6.7945           1.55x      2355              10.3x
+  32      8.3636           1.91x      3826              16.7x
 
   decode step with a 512-token prefix (KV traffic at batch 32: 0.250 GiB vs 0.23 GiB of weights):
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       5.4267           1.00x       184               1.0x
-  2       7.1690           1.32x       279               1.5x
-  4       9.0445           1.67x       442               2.4x
-  8      14.2474           2.63x       562               3.0x
-  16     22.3432           4.12x       716               3.9x
-  32     40.1474           7.40x       797               4.3x
+  1       5.8571           1.00x       171               1.0x
+  2       7.2173           1.23x       277               1.6x
+  4       9.7919           1.67x       409               2.4x
+  8      15.4096           2.63x       519               3.0x
+  16     23.0585           3.94x       694               4.1x
+  32     40.9820           7.00x       781               4.6x
 
-  throughput gain at batch 32, 32-tok prefix 15.7x
-  throughput gain at batch 32, 512-tok prefix 4.3x
+  throughput gain at batch 32, 32-tok prefix 16.7x
+  throughput gain at batch 32, 512-tok prefix 4.6x
 
   >> With a short prefix, 32x the work costs far less than 32x the time: the weight read was the bottleneck and the extra sequences rode along free. With a long prefix the gain shrinks, because KV traffic scales with batch while weight traffic does not. That is the whole economics of serving.
 
