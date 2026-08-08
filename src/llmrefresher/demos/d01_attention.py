@@ -274,6 +274,46 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.note("Same arithmetic, 64x the activation memory. Flash Attention (post 3)")
     rep.note("removes this by never writing the score matrix down.")
 
+    # --- what any of this means on real hardware ---------------------------
+    #
+    # The same layer costs very different amounts depending on whether you are
+    # training it or serving it, and the two differ far more in memory than in
+    # arithmetic. Numbers are for the whole 8B model, not one layer.
+    N = 8.03e9
+    rep.blank()
+    rep.note("TRAINING vs INFERENCE — whole model, Llama-3-8B:")
+    rep.blank()
+    rep.note("Compute. A backward pass costs about twice a forward one, because")
+    rep.note("each weight needs a gradient for its input and one for itself:")
+    rep.blank()
+    rep.table(
+        ["per token", "FLOPs", "why"],
+        [
+            ["inference", f"2N = {2 * N / 1e9:.1f} G", "one forward pass"],
+            ["training", f"6N = {6 * N / 1e9:.1f} G", "forward, then backward at ~2x"],
+        ],
+    )
+    rep.blank()
+    rep.note("Memory. This is where they really diverge — training has to keep")
+    rep.note("the optimizer's state alongside the weights:")
+    rep.blank()
+    running = 0
+    rows = []
+    for label, b in (("fp16 weights", 2), ("fp32 master copy", 4), ("fp32 gradients", 4),
+                     ("Adam moment m", 4), ("Adam moment v", 4)):
+        running += b
+        rows.append([label, f"{b} B/param", f"{N * b / 1024**3:.0f} GiB",
+                     f"{N * running / 1024**3:.0f} GiB"])
+    rep.table(["what", "cost", "size", "running total"], rows)
+    rep.blank()
+    rep.kv("inference needs", f"~2 B/param  = {2 * N / 1024**3:.0f} GiB")
+    rep.kv("training needs", f"~18 B/param = {18 * N / 1024**3:.0f} GiB, before activations")
+    rep.blank()
+    rep.note("So training costs 3x the arithmetic but 9x the memory. Which is why")
+    rep.note("a model you can serve on one accelerator can still need a cluster")
+    rep.note("to train — and why inference work is usually about moving bytes")
+    rep.note("rather than doing math.")
+
     rep.blank()
     rep.kv("params, 1 head vs 64 heads", f"{4 * one / 1e6:.1f}M vs {4 * one / 1e6:.1f}M")
     rep.kv("score FLOPs, 1 head vs 64 heads",

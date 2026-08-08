@@ -84,6 +84,35 @@ device memory : 17.2 GB
   Same arithmetic, 64x the activation memory. Flash Attention (post 3)
   removes this by never writing the score matrix down.
 
+  TRAINING vs INFERENCE — whole model, Llama-3-8B:
+
+  Compute. A backward pass costs about twice a forward one, because
+  each weight needs a gradient for its input and one for itself:
+
+  per token        FLOPs                            why
+  -------------------------------------------------------
+  inference  2N = 16.1 G               one forward pass
+  training   6N = 48.2 G  forward, then backward at ~2x
+
+  Memory. This is where they really diverge — training has to keep
+  the optimizer's state alongside the weights:
+
+  what                   cost    size  running total
+  ----------------------------------------------------
+  fp16 weights      2 B/param  15 GiB         15 GiB
+  fp32 master copy  4 B/param  30 GiB         45 GiB
+  fp32 gradients    4 B/param  30 GiB         75 GiB
+  Adam moment m     4 B/param  30 GiB        105 GiB
+  Adam moment v     4 B/param  30 GiB        135 GiB
+
+  inference needs                    ~2 B/param  = 15 GiB
+  training needs                     ~18 B/param = 135 GiB, before activations
+
+  So training costs 3x the arithmetic but 9x the memory. Which is why
+  a model you can serve on one accelerator can still need a cluster
+  to train — and why inference work is usually about moving bytes
+  rather than doing math.
+
   params, 1 head vs 64 heads         67.1M vs 67.1M
   score FLOPs, 1 head vs 64 heads    8.59 G vs 8.59 G
   d_head is the d_k in 1/sqrt(d_k)   yes — per-head width, not d_model
