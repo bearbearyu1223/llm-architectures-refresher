@@ -314,6 +314,48 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.note("to train — and why inference work is usually about moving bytes")
     rep.note("rather than doing math.")
 
+    # --- against actual silicon --------------------------------------------
+    #
+    # Spec-sheet peaks for dense BF16 tensor-core math. Real kernels reach a
+    # fraction of these, but the ratio between compute and bandwidth is what
+    # matters here and it survives the discount.
+    gpus = (("A100 80GB", 80e9, 2.039e12, 312e12), ("H100 80GB", 80e9, 3.35e12, 990e12))
+    w_bytes = 2 * N
+    per_token_kv = 2 * 32 * 8 * 128 * 2  # Llama-3-8B, fp16: 128 KiB
+
+    rep.blank()
+    rep.note("Against real silicon — spec-sheet peaks, dense BF16:")
+    rep.blank()
+    rep.table(
+        ["GPU", "memory", "bandwidth", "BF16 compute"],
+        [[n, f"{m / 1e9:.0f} GB", f"{bw / 1e12:.2f} TB/s", f"{fl / 1e12:.0f} TFLOP/s"]
+         for n, m, bw, fl in gpus],
+    )
+    rep.blank()
+    rep.kv("Llama-3-8B weights, fp16", f"{w_bytes / 1e9:.1f} GB")
+    rep.kv("  fits on one 80 GB card?", "yes, with ~64 GB to spare")
+    rep.kv("  that spare is worth", f"~{(80e9 - w_bytes) / per_token_kv / 1000:.0f}k tokens of KV cache")
+    rep.kv("training state (18 B/param)", f"{18 * N / 1e9:.0f} GB")
+    rep.kv("  fits on one 80 GB card?", "no — needs several, before activations")
+
+    rep.blank()
+    rep.note("And the number that decides how fast you can generate. One decode")
+    rep.note("step reads every weight once, so time it two ways:")
+    rep.blank()
+    rep.table(
+        ["GPU", "if compute-bound", "if bandwidth-bound", "gap"],
+        [[n,
+          f"{1 / ((2 * N) / fl):,.0f} tok/s",
+          f"{1 / (w_bytes / bw):,.0f} tok/s",
+          f"{(w_bytes / bw) / ((2 * N) / fl):.0f}x"]
+         for n, m, bw, fl in gpus],
+    )
+    rep.blank()
+    rep.note("Bandwidth wins by two orders of magnitude — the chip finishes the")
+    rep.note("arithmetic and then waits. Note it gets WORSE on the newer card:")
+    rep.note("H100 has 3.2x the compute of an A100 but only 1.6x the bandwidth,")
+    rep.note("so the gap roughly doubles. Post 2 is about living with this.")
+
     rep.blank()
     rep.kv("params, 1 head vs 64 heads", f"{4 * one / 1e6:.1f}M vs {4 * one / 1e6:.1f}M")
     rep.kv("score FLOPs, 1 head vs 64 heads",

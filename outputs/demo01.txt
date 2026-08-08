@@ -113,6 +113,32 @@ device memory : 17.2 GB
   to train — and why inference work is usually about moving bytes
   rather than doing math.
 
+  Against real silicon — spec-sheet peaks, dense BF16:
+
+  GPU        memory  bandwidth  BF16 compute
+  --------------------------------------------
+  A100 80GB   80 GB  2.04 TB/s   312 TFLOP/s
+  H100 80GB   80 GB  3.35 TB/s   990 TFLOP/s
+
+  Llama-3-8B weights, fp16           16.1 GB
+    fits on one 80 GB card?          yes, with ~64 GB to spare
+    that spare is worth              ~488k tokens of KV cache
+  training state (18 B/param)        145 GB
+    fits on one 80 GB card?          no — needs several, before activations
+
+  And the number that decides how fast you can generate. One decode
+  step reads every weight once, so time it two ways:
+
+  GPU        if compute-bound  if bandwidth-bound   gap
+  -------------------------------------------------------
+  A100 80GB      19,427 tok/s           127 tok/s  153x
+  H100 80GB      61,644 tok/s           209 tok/s  296x
+
+  Bandwidth wins by two orders of magnitude — the chip finishes the
+  arithmetic and then waits. Note it gets WORSE on the newer card:
+  H100 has 3.2x the compute of an A100 but only 1.6x the bandwidth,
+  so the gap roughly doubles. Post 2 is about living with this.
+
   params, 1 head vs 64 heads         67.1M vs 67.1M
   score FLOPs, 1 head vs 64 heads    8.59 G vs 8.59 G
   d_head is the d_k in 1/sqrt(d_k)   yes — per-head width, not d_model
