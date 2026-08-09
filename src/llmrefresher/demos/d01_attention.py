@@ -972,6 +972,99 @@ def figure_ffn(theme: Theme) -> Path:
         return save_both(fig, SLUG, "ffn-anatomy", theme)
 
 
+def figure_word_table(theme: Theme) -> Path:
+    """The embedding table and the LM head as two ends of one table of words.
+
+    Both are (V, d_model). Saying they are "the same shape" is true and lands
+    flat; what makes it click is that they are the same *operation* run in
+    opposite directions — going in you fetch one row by index, coming out you
+    compare your vector against every row. That is also why tying them works.
+    """
+    rows = ["the", "cat", "mat", "floor", "zebra"]
+    HIT = 1  # "cat"
+    RW, RH, GAP = 3.5, 0.52, 0.20
+    TX, TOP = 6.1, 6.55
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(12.4, 6.6))
+        ax.grid(False)
+        ax.set_xlim(0, 15.8)
+        ax.set_ylim(1.15, 8.6)
+        ax.axis("off")
+
+        # the shared table of words
+        ax.text(TX + RW / 2, TOP + 1.15, "the model's table of words",
+                ha="center", va="center", fontsize=11, fontweight="bold", color=theme.ink)
+        ax.text(TX + RW / 2, TOP + 0.78, "128,256 rows, one per token\neach row 4,096 numbers wide",
+                ha="center", va="center", fontsize=8.5, color=theme.muted)
+        ys = []
+        for i, w in enumerate(rows):
+            y = TOP - i * (RH + GAP)
+            ys.append(y)
+            hit = i == HIT
+            ax.add_patch(patches.Rectangle((TX, y), RW, RH,
+                                           facecolor=theme.ramp[4] if hit else theme.ramp[1],
+                                           edgecolor=theme.surface, linewidth=1.4))
+            ax.text(TX - 0.18, y + RH / 2, w, ha="right", va="center",
+                    fontsize=9, color=theme.ink if hit else theme.secondary,
+                    fontweight="bold" if hit else "normal")
+        y_dots = TOP - len(rows) * (RH + GAP)
+        ax.text(TX + RW / 2, y_dots + RH / 2, ". . .  128,251 more rows",
+                ha="center", va="center", fontsize=8.5, color=theme.muted, style="italic")
+
+        y_hit = ys[HIT] + RH / 2
+
+        # ---- going in ----------------------------------------------------
+        ax.text(2.5, TOP + 1.15, "GOING IN", ha="center", va="center",
+                fontsize=11, fontweight="bold", color=theme.ink)
+        ax.text(2.5, TOP + 0.78, "the embedding table", ha="center", va="center",
+                fontsize=9, color=theme.muted)
+        ax.add_patch(patches.FancyBboxPatch((1.05, y_hit - 0.33), 2.9, 0.66,
+                                            boxstyle="round,pad=0.05", facecolor=theme.ramp[0],
+                                            edgecolor=theme.surface, linewidth=1.4))
+        ax.text(2.5, y_hit, 'token "cat"', ha="center", va="center",
+                fontsize=9.5, color=ink_for(theme.ramp[0]))
+        ax.annotate("", xy=(TX - 0.75, y_hit), xytext=(3.95, y_hit),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.series[1], linewidth=1.8))
+        ax.text(2.5, y_hit - 0.62, "fetch that one row.\nThose 4,096 numbers\nare the token's vector.",
+                ha="center", va="top", fontsize=8.5, color=theme.secondary)
+
+        # ---- coming out ----------------------------------------------------
+        # The vector is the *input* here, so every arrowhead points into the
+        # table. Scores are what falls out; the next figure takes them further.
+        BUS = TX + RW + 1.25
+        y_mid = (ys[0] + RH + ys[-1]) / 2
+        ax.text(13.0, TOP + 1.15, "COMING OUT", ha="center", va="center",
+                fontsize=11, fontweight="bold", color=theme.ink)
+        ax.text(13.0, TOP + 0.78, "the LM head", ha="center", va="center",
+                fontsize=9, color=theme.muted)
+        ax.add_patch(patches.FancyBboxPatch((11.55, y_mid - 0.4), 3.05, 0.8,
+                                            boxstyle="round,pad=0.05", facecolor=theme.ramp[3],
+                                            edgecolor=theme.surface, linewidth=1.4))
+        ax.text(13.07, y_mid, "a vector from\nthe last block", ha="center", va="center",
+                fontsize=8.5, color=ink_for(theme.ramp[3]))
+        ax.annotate("", xy=(BUS, y_mid), xytext=(11.5, y_mid),
+                    arrowprops=dict(arrowstyle="-", color=theme.series[1], linewidth=1.8))
+        ax.plot([BUS, BUS], [ys[-1] + RH / 2, ys[0] + RH / 2],
+                color=theme.series[1], linewidth=1.8)
+        for y in ys:
+            ax.annotate("", xy=(TX + RW + 0.12, y + RH / 2), xytext=(BUS, y + RH / 2),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.series[1], linewidth=1.3))
+        ax.text(13.0, y_mid - 0.72,
+                "compare it against\nevery row — the match\nscore for a row is that\n"
+                "word's logit.",
+                ha="center", va="top", fontsize=8.5, color=theme.secondary)
+
+        ax.text(7.9, 2.05,
+                "Same table, opposite directions: going in you look one row up by its number,\n"
+                "coming out you ask which row your vector looks most like.",
+                ha="center", va="center", fontsize=10.5, color=theme.ink)
+        ax.text(7.9, 1.5, "525M parameters each — and some models use literally the same "
+                          "table for both, saving one copy.",
+                ha="center", va="center", fontsize=9, color=theme.muted, style="italic")
+        return save_both(fig, SLUG, "word-table", theme)
+
+
 def figure_lm_head(theme: Theme) -> Path:
     """How the last block's output becomes an actual next word.
 
@@ -2021,6 +2114,7 @@ def make_figures(
         for path in (
             figure_multihead(theme),
             figure_ffn(theme),
+            figure_word_table(theme),
             figure_lm_head(theme),
             figure_stack_two_jobs(theme),
             figure_train_vs_infer(theme),
