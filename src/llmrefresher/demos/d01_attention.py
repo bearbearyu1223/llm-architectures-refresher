@@ -717,6 +717,7 @@ def why_the_ffn(rep: Report, device: torch.device) -> None:
     q = torch.randn(seq, d_model, device=device)
     k = torch.randn(seq, d_model, device=device)
     v = torch.randn(seq, d_model, device=device)
+    # single head here, so d_k == d_model; in a real block the scale is sqrt(d_head).
     w = torch.softmax(q @ k.T / math.sqrt(d_model), dim=-1)
     attn = w @ v
 
