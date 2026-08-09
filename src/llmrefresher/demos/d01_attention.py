@@ -303,17 +303,17 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.blank()
     running = 0
     rows = []
-    for label, b in (("fp16 weights", 2), ("fp32 master copy", 4), ("fp32 gradients", 4),
+    for label, b in (("bf16 weights", 2), ("bf16 gradients", 2), ("fp32 master copy", 4),
                      ("Adam moment m", 4), ("Adam moment v", 4)):
         running += b
-        rows.append([label, f"{b} B/param", f"{N * b / 1e9:.0f} GB",
-                     f"{N * running / 1e9:.0f} GB"])
+        rows.append([label, f"{b} B/param", f"{N * b / 1e9:.1f} GB",
+                     f"{N * running / 1e9:.1f} GB"])
     rep.table(["what", "cost", "size", "running total"], rows)
     rep.blank()
-    rep.kv("inference needs", f"~2 B/param  = {2 * N / 1e9:.0f} GB")
-    rep.kv("training needs", f"~18 B/param = {18 * N / 1e9:.0f} GB, before activations")
+    rep.kv("inference needs", f"~2 B/param  = {2 * N / 1e9:.1f} GB")
+    rep.kv("training needs", f"~16 B/param = {16 * N / 1e9:.0f} GB, before activations")
     rep.blank()
-    rep.note("So training costs 3x the arithmetic but 9x the memory. Which is why")
+    rep.note("So training costs 3x the arithmetic but 8x the memory. Which is why")
     rep.note("a model you can serve on one accelerator can still need a cluster")
     rep.note("to train — and why inference work is usually about moving bytes")
     rep.note("rather than doing math.")
@@ -336,11 +336,42 @@ def head_split_arithmetic(rep: Report, device: torch.device):
          for n, m, bw, fl in gpus],
     )
     rep.blank()
-    rep.kv("Llama-3-8B weights, fp16", f"{w_bytes / 1e9:.1f} GB")
-    rep.kv("  fits on one 80 GB card?", "yes, with ~64 GB to spare")
-    rep.kv("  that spare is worth", f"~{(80e9 - w_bytes) / per_token_kv / 1000:.0f}k tokens of KV cache")
-    rep.kv("training state (18 B/param)", f"{18 * N / 1e9:.0f} GB")
-    rep.kv("  fits on one 80 GB card?", "no — needs several, before activations")
+    # Weights are only the floor. What you can actually serve is decided by the
+    # KV cache, and GQA is the reason it is affordable: 8 kv heads, not 32.
+    rep.blank()
+    rep.note("SERVING — weights are the floor, KV cache is the ceiling:")
+    rep.blank()
+    rep.table(
+        ["stored as", "bytes/param", "weights"],
+        [[n, f"{b:g}", f"{N * b / 1e9:.1f} GB"]
+         for n, b in (("fp32", 4), ("bf16/fp16", 2), ("int8", 1), ("int4", 0.5))],
+    )
+    rep.blank()
+    mha_kv = 2 * 32 * 32 * 128 * 2          # the same cache without GQA
+    rep.kv("KV cache per token (GQA, 8 kv)", f"{per_token_kv / 1024:.0f} KiB")
+    rep.kv("  had it been MHA (32 kv)", f"{mha_kv / 1024:.0f} KiB — 4x worse")
+    rep.kv("KV per full 8k sequence", f"{per_token_kv * 8192 / 1024**3:.2f} GiB")
+    rep.blank()
+    # ~77 GB is what remains of a nominal 80 GB after CUDA context, cuBLAS
+    # workspaces and allocator fragmentation; leave ~3 GB for activations.
+    usable, act = 77e9, 3e9
+    kv_budget = usable - w_bytes - act
+    rep.kv("card, nominal / usable", f"80 GB / ~{usable / 1e9:.0f} GB")
+    rep.kv("  minus weights, workspace", f"{kv_budget / 1e9:.0f} GB left for KV")
+    rep.kv("  which buys", f"~{kv_budget / per_token_kv / 1000:.0f}k tokens of cache")
+    rep.blank()
+    rep.table(
+        ["context length", "concurrent sequences"],
+        [[f"{c // 1024}k", f"~{kv_budget / per_token_kv / c:.0f}"]
+         for c in (8192, 32768, 131072)],
+    )
+    rep.blank()
+    rep.note("TRAINING — the same card, the same model:")
+    rep.blank()
+    rep.kv("training state (16 B/param)", f"{16 * N / 1e9:.0f} GB")
+    rep.kv("  against usable", f"{usable / 1e9:.0f} GB — over by {(16 * N - usable) / 1e9:.0f} GB")
+    rep.kv("  activations, ckpt b=1 s=4096", f"{2 * 4096 * 4096 * 32 / 1e9:.1f} GB")
+    rep.kv("  logits, fp32 at seq 4096", f"{4096 * 128256 * 4 / 1e9:.1f} GB per sequence")
 
     rep.blank()
     rep.note("And the number that decides how fast you can generate. At batch 1")

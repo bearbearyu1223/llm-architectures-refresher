@@ -101,18 +101,18 @@ device memory : 17.2 GB
   Memory. This is where they really diverge — training has to keep
   the optimizer's state alongside the weights:
 
-  what                   cost   size  running total
-  ---------------------------------------------------
-  fp16 weights      2 B/param  16 GB          16 GB
-  fp32 master copy  4 B/param  32 GB          48 GB
-  fp32 gradients    4 B/param  32 GB          80 GB
-  Adam moment m     4 B/param  32 GB         112 GB
-  Adam moment v     4 B/param  32 GB         145 GB
+  what                   cost     size  running total
+  -----------------------------------------------------
+  bf16 weights      2 B/param  16.1 GB        16.1 GB
+  bf16 gradients    2 B/param  16.1 GB        32.1 GB
+  fp32 master copy  4 B/param  32.1 GB        64.2 GB
+  Adam moment m     4 B/param  32.1 GB        96.4 GB
+  Adam moment v     4 B/param  32.1 GB       128.5 GB
 
-  inference needs                    ~2 B/param  = 16 GB
-  training needs                     ~18 B/param = 145 GB, before activations
+  inference needs                    ~2 B/param  = 16.1 GB
+  training needs                     ~16 B/param = 128 GB, before activations
 
-  So training costs 3x the arithmetic but 9x the memory. Which is why
+  So training costs 3x the arithmetic but 8x the memory. Which is why
   a model you can serve on one accelerator can still need a cluster
   to train — and why inference work is usually about moving bytes
   rather than doing math.
@@ -124,11 +124,36 @@ device memory : 17.2 GB
   A100 80GB   80 GB  2.04 TB/s   312 TFLOP/s
   H100 80GB   80 GB  3.35 TB/s   990 TFLOP/s
 
-  Llama-3-8B weights, fp16           16.1 GB
-    fits on one 80 GB card?          yes, with ~64 GB to spare
-    that spare is worth              ~488k tokens of KV cache
-  training state (18 B/param)        145 GB
-    fits on one 80 GB card?          no — needs several, before activations
+
+  SERVING — weights are the floor, KV cache is the ceiling:
+
+  stored as  bytes/param  weights
+  ---------------------------------
+  fp32                 4  32.1 GB
+  bf16/fp16            2  16.1 GB
+  int8                 1   8.0 GB
+  int4               0.5   4.0 GB
+
+  KV cache per token (GQA, 8 kv)     128 KiB
+    had it been MHA (32 kv)          512 KiB — 4x worse
+  KV per full 8k sequence            1.00 GiB
+
+  card, nominal / usable             80 GB / ~77 GB
+    minus weights, workspace         58 GB left for KV
+    which buys                       ~442k tokens of cache
+
+  context length  concurrent sequences
+  --------------------------------------
+  8k                               ~54
+  32k                              ~13
+  128k                              ~3
+
+  TRAINING — the same card, the same model:
+
+  training state (16 B/param)        128 GB
+    against usable                   77 GB — over by 51 GB
+    activations, ckpt b=1 s=4096     1.1 GB
+    logits, fp32 at seq 4096         2.1 GB per sequence
 
   And the number that decides how fast you can generate. At batch 1
   a decode step reads every weight once, so time it two ways:
