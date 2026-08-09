@@ -972,6 +972,87 @@ def figure_ffn(theme: Theme) -> Path:
         return save_both(fig, SLUG, "ffn-anatomy", theme)
 
 
+def figure_lm_head(theme: Theme) -> Path:
+    """How the last block's output becomes an actual next word.
+
+    The LM head appears in three other figures as a box and is never opened.
+    This opens it: one matrix takes a token's 4096 numbers to one score per
+    vocabulary entry, softmax turns those into probabilities, and a word is
+    drawn from them.
+    """
+    words = [("mat", 8.4), ("floor", 7.2), ("table", 6.9), ("cat", 4.1), ("zebra", -1.0)]
+    exps = [math.exp(s) for _, s in words]
+    total = sum(exps)
+    probs = [e / total for e in exps]
+
+    CX, W = 5.4, 6.6
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(10.6, 8.6))
+        ax.grid(False)
+        ax.set_xlim(0, 14.2)
+        ax.set_ylim(0.3, 11.1)
+        ax.axis("off")
+
+        def band(y, h, label, color, sub=None, w=W, size=10):
+            ax.add_patch(patches.FancyBboxPatch((CX - w / 2, y), w, h, boxstyle="round,pad=0.05",
+                                                facecolor=color, edgecolor=theme.surface, linewidth=1.5))
+            tc = ink_for(color)
+            ax.text(CX, y + h / 2 + (0.17 if sub else 0), label, ha="center", va="center",
+                    fontsize=size, fontweight="bold", color=tc)
+            if sub:
+                ax.text(CX, y + h / 2 - 0.25, sub, ha="center", va="center", fontsize=8.5, color=tc)
+
+        def down(y0, y1, note=None):
+            ax.annotate("", xy=(CX, y1), xytext=(CX, y0),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.5))
+            if note:
+                ax.text(CX + 0.28, (y0 + y1) / 2, note, ha="left", va="center",
+                        fontsize=9, color=theme.secondary, style="italic")
+
+        def word_rows(y, vals, fmt, color):
+            """Five example vocabulary entries, drawn as labelled bars."""
+            top = max(vals)
+            for i, ((word, _), v) in enumerate(zip(words, vals)):
+                yy = y - i * 0.46
+                ax.text(CX - W / 2 - 0.15, yy, word, ha="right", va="center",
+                        fontsize=9, color=theme.secondary)
+                width = max(0.06, (v / top) * (W - 1.9))
+                ax.add_patch(patches.Rectangle((CX - W / 2 + 0.1, yy - 0.16), width, 0.32,
+                                               facecolor=color, edgecolor="none"))
+                ax.text(CX - W / 2 + 0.1 + width + 0.14, yy, fmt(v), ha="left", va="center",
+                        fontsize=8.5, color=theme.muted)
+
+        band(9.55, 0.7, "one token's vector, after the last block", theme.ramp[0], size=9.5)
+        ax.text(CX + W / 2 + 0.25, 9.9, "4,096 numbers", ha="left", va="center",
+                fontsize=9, color=theme.secondary)
+        down(9.55, 9.05)
+
+        band(8.15, 0.9, "the LM head — one matrix", theme.ramp[5],
+             sub="4,096 x 128,256, about 525M parameters")
+        down(8.15, 7.65)
+
+        ax.text(CX, 7.35, "a score for every word in the vocabulary",
+                ha="center", va="center", fontsize=10, fontweight="bold", color=theme.ink)
+        ax.text(CX, 7.02, "128,256 of them, for this one token", ha="center", va="center",
+                fontsize=8.5, color=theme.muted)
+        word_rows(6.55, [s for _, s in words], lambda v: f"{v:+.1f}", theme.ramp[3])
+        ax.text(CX, 4.28, "…and 128,251 more", ha="center", va="center",
+                fontsize=8.5, color=theme.muted, style="italic")
+
+        down(4.0, 3.5, "softmax — turn scores into shares of 100%")
+
+        ax.text(CX, 3.2, "a probability for every word", ha="center", va="center",
+                fontsize=10, fontweight="bold", color=theme.ink)
+        word_rows(2.75, probs, lambda v: f"{v:.1%}", theme.ramp[4])
+        down(0.95, 0.5)
+        ax.text(CX, 0.35, 'pick one — usually "mat", but not always',
+                ha="center", va="center", fontsize=9.5, color=theme.secondary)
+
+        ax.text(CX, 10.8, "From a vector to an actual next word",
+                ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
+        return save_both(fig, SLUG, "lm-head", theme)
+
+
 def figure_stack_two_jobs(theme: Theme) -> Path:
     """The same stack doing both jobs, so you can see where they differ.
 
@@ -1940,6 +2021,7 @@ def make_figures(
         for path in (
             figure_multihead(theme),
             figure_ffn(theme),
+            figure_lm_head(theme),
             figure_stack_two_jobs(theme),
             figure_train_vs_infer(theme),
             figure_tensor_3d(theme),
