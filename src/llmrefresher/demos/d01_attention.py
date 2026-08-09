@@ -1589,7 +1589,7 @@ def figure_head_patterns(weights: torch.Tensor, theme: Theme) -> Path:
 
         fig.suptitle("Same input, four heads, four different attention patterns",
                      fontsize=13, fontweight="bold", color=theme.ink, y=1.16)
-        fig.text(0.5, 1.02, f'"spread" is entropy in nats: 0 = all the weight on one token, '
+        fig.text(0.5, 1.02, f'"spread" scores the bottom row: 0 = all the weight on one token, '
                             f'{math.log(seq):.2f} = shared evenly across all {seq}',
                  ha="center", fontsize=9, color=theme.muted, transform=fig.transFigure)
         fig.text(0.5, -0.08, "rows are query positions, columns are keys        "
@@ -1698,7 +1698,7 @@ def figure_block(theme: Theme) -> Path:
 
         ax.text(TRUNK, 12.55, "Where attention sits in a decoder block",
                 ha="center", va="center", fontsize=13, fontweight="bold", color=theme.ink)
-        ax.text(TRUNK, 12.10, "pre-norm: the norm is inside the residual branch",
+        ax.text(TRUNK, 12.10, "each part edits the flow; the side arrows carry it past",
                 ha="center", va="center", fontsize=9.5, color=theme.muted)
         return save_both(fig, SLUG, "block-anatomy", theme)
 
