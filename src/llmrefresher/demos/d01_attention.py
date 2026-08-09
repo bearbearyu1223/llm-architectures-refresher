@@ -283,8 +283,12 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.blank()
     rep.note("TRAINING vs INFERENCE — whole model, Llama-3-8B:")
     rep.blank()
-    rep.note("Compute. A backward pass costs about twice a forward one, because")
-    rep.note("each weight needs a gradient for its input and one for itself:")
+    rep.kv("N, whole-model parameters", f"{N / 1e9:.2f}B")
+    rep.note("(not the 67.1M above — that was one layer's four projections)")
+    rep.blank()
+    rep.note("Compute. Going back, each layer forms two products where going in")
+    rep.note("it formed one — dW = X.T @ dY, and dX = dY @ W.T for the layer")
+    rep.note("behind it — so the backward pass costs about twice the forward:")
     rep.blank()
     rep.table(
         ["per token", "FLOPs", "why"],
@@ -302,12 +306,12 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     for label, b in (("fp16 weights", 2), ("fp32 master copy", 4), ("fp32 gradients", 4),
                      ("Adam moment m", 4), ("Adam moment v", 4)):
         running += b
-        rows.append([label, f"{b} B/param", f"{N * b / 1024**3:.0f} GiB",
-                     f"{N * running / 1024**3:.0f} GiB"])
+        rows.append([label, f"{b} B/param", f"{N * b / 1e9:.0f} GB",
+                     f"{N * running / 1e9:.0f} GB"])
     rep.table(["what", "cost", "size", "running total"], rows)
     rep.blank()
-    rep.kv("inference needs", f"~2 B/param  = {2 * N / 1024**3:.0f} GiB")
-    rep.kv("training needs", f"~18 B/param = {18 * N / 1024**3:.0f} GiB, before activations")
+    rep.kv("inference needs", f"~2 B/param  = {2 * N / 1e9:.0f} GB")
+    rep.kv("training needs", f"~18 B/param = {18 * N / 1e9:.0f} GB, before activations")
     rep.blank()
     rep.note("So training costs 3x the arithmetic but 9x the memory. Which is why")
     rep.note("a model you can serve on one accelerator can still need a cluster")
@@ -339,8 +343,8 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.kv("  fits on one 80 GB card?", "no — needs several, before activations")
 
     rep.blank()
-    rep.note("And the number that decides how fast you can generate. One decode")
-    rep.note("step reads every weight once, so time it two ways:")
+    rep.note("And the number that decides how fast you can generate. At batch 1")
+    rep.note("a decode step reads every weight once, so time it two ways:")
     rep.blank()
     rep.table(
         ["GPU", "if compute-bound", "if bandwidth-bound", "gap"],
