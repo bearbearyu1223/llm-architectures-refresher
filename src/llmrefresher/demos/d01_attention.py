@@ -36,6 +36,19 @@ from ..report import Report
 # ---------------------------------------------------------------------------
 
 
+def _bytes_binary(n: float) -> str:
+    """Format a byte count in binary units, picking the unit that reads best.
+
+    The score matrix spans MiB to TiB across the sequence lengths this demo
+    sweeps, so a fixed unit would print either 0.0001 or 2097152.
+    """
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit in ("B", "KiB") else f"{n:.3g} {unit}"
+        n /= 1024
+    return f"{n:.3g} TiB"
+
+
 def scaled_dot_product_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -273,6 +286,21 @@ def head_split_arithmetic(rep: Report, device: torch.device):
     rep.blank()
     rep.note("Same arithmetic, 64x the activation memory. Flash Attention (post 3)")
     rep.note("removes this by never writing the score matrix down.")
+
+    # And the same tensor against sequence length, which is where it stops being
+    # a curiosity: it is quadratic in seq, so the 128 MiB above becomes 2 TiB per
+    # layer at a 128k context. This is the number post 3 exists to remove.
+    rep.blank()
+    rep.note("The same tensor swept over sequence length instead, at 32 heads.")
+    rep.note("Quadratic in seq, so it grows 4x every time the context doubles:")
+    rep.blank()
+    rep.table(
+        ["seq", "score matrix (fp32)", "vs 8B weights in bf16"],
+        [
+            [f"{s:,}", _bytes_binary(32 * s * s * 4), f"{32 * s * s * 4 / (2 * 8.03e9):.2f}x"]
+            for s in (1_024, 8_192, 32_768, 131_072)
+        ],
+    )
 
     # --- what any of this means on real hardware ---------------------------
     #
