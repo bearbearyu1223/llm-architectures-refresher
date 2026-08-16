@@ -10,7 +10,10 @@ Claims from the post, each with a receipt:
    is six orders of magnitude larger.
 3. The naive path materializes an n x n score matrix in HBM; the tiled path
    never does. Measured allocation grows quadratically vs linearly.
-4. Causal masking lets a tiled implementation skip whole blocks above the
+4. The win is memory traffic, not arithmetic: with causal masking off, the two
+   paths do byte-identical FLOP counts, and the tiled one moves none of the
+   quadratic score traffic.
+5. Causal masking lets a tiled implementation skip whole blocks above the
    diagonal — work the naive path computes and then throws away.
 
 A note on speed: the Python tiled loop here is *slower* than naive attention.
@@ -89,6 +92,9 @@ def check_online_softmax(rep: Report, device: torch.device) -> None:
     x = torch.randn(4, 2048, device=device) * 8  # wide spread: stresses stability
     reference = torch.softmax(x, dim=-1)
 
+    rep.kv("logit row range (max - min)", f"{(x.max(-1).values - x.min(-1).values).max().item():.1f}")
+    rep.blank()
+
     rows = []
     for block in (64, 128, 512, 2048):
         got = online_softmax(x, block)
@@ -96,11 +102,44 @@ def check_online_softmax(rep: Report, device: torch.device) -> None:
 
     rep.table(["block size", "max |online - torch|", "rows sum to"], rows)
     rep.blank()
-    rep.note("logits were scaled by 8, so the row range spans ~80 — an unstable")
-    rep.note("implementation would return inf or nan here, not 1e-9.")
+
+    # Why the max subtraction is in there at all. It is tempting to claim the
+    # naive exp(x)/sum(exp(x)) blows up on these logits — it does not, in fp32.
+    # exp overflows fp32 only past x ~ 88.7, and a row max near 33 is nowhere
+    # close. In fp16 the threshold is x ~ 11.1, and the same logits overflow
+    # immediately. So the honest statement is that stability is a *precision*
+    # question, and inference runs in the precision where it bites.
+    rep.note("Why subtract the max at all? Compare against the naive")
+    rep.note("exp(x)/sum(exp(x)), at the two precisions inference actually uses:")
+    rep.blank()
+    stability = []
+    for label, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+        xd = x.to(dtype)
+        e = torch.exp(xd)
+        naive = e / e.sum(-1, keepdim=True)
+        overflow_at = float(torch.log(torch.tensor(torch.finfo(dtype).max)))
+        bad = int(torch.isinf(e).sum() + torch.isnan(naive).sum())
+        err = (naive.float() - reference).abs().max().item()
+        stability.append([
+            label,
+            f"{overflow_at:.1f}",
+            f"{xd.max().item():.1f}",
+            "yes" if bad else "no",
+            f"{bad:,}",
+            "nan" if torch.isnan(naive).any() else f"{err:.3e}",
+        ])
+    rep.table(
+        ["dtype", "exp overflows past", "actual row max", "overflowed?", "bad values", "naive error"],
+        stability,
+    )
+    rep.blank()
+    rep.note("So in fp32 the unstable version happens to survive these logits. In")
+    rep.note("fp16 it does not, and the online version — which subtracts a running")
+    rep.note("max before every exp — is correct in both.")
     rep.takeaway(
         "Block size changes the memory schedule, not the answer. The running "
-        "rescale makes partial softmaxes composable."
+        "rescale makes partial softmaxes composable, and the running max is what "
+        "keeps them representable once the precision drops."
     )
 
 
@@ -134,7 +173,7 @@ def flash_attention(
     scale = 1.0 / math.sqrt(dim)
 
     out = torch.zeros_like(q)
-    counters = {"blocks_computed": 0, "blocks_skipped": 0, "max_tile_elems": 0}
+    counters = {"blocks_computed": 0, "blocks_skipped": 0, "max_tile_elems": 0, "matmul_flops": 0}
 
     for i in range(0, seq_q, block_q):
         qi = q[:, :, i : i + block_q]
@@ -156,6 +195,12 @@ def flash_attention(
             scores = (qi @ kj.transpose(-2, -1)) * scale
             counters["blocks_computed"] += 1
             counters["max_tile_elems"] = max(counters["max_tile_elems"], scores.numel())
+            # Two matmuls per tile — Q@K^T and P@V — each 2*rows*cols*dim FLOPs
+            # (one multiply and one add per element of the accumulation). Count
+            # them as they happen, so the FLOP total is tallied rather than
+            # asserted; the naive path's count is the same expression with the
+            # tile replaced by the whole matrix.
+            counters["matmul_flops"] += 2 * (2 * batch * heads * rows * kj.shape[2] * dim)
 
             if causal:
                 q_pos = torch.arange(i, i + rows, device=q.device)[:, None]
@@ -316,6 +361,68 @@ def memory_scaling(rep: Report, device: torch.device) -> list[dict[str, float]]:
     return rows
 
 
+def flops_vs_bytes(rep: Report, device: torch.device) -> None:
+    """The post's subtitle claim: the win is memory traffic, not arithmetic.
+
+    Everything else in this demo measures one side or the other — §3 measures
+    allocation, §5 measures wall-clock — but the claim is a *comparison*, and it
+    deserves the two quantities in one table. So count both.
+
+    FLOPs are tallied inside ``flash_attention`` as the tiles are computed, not
+    derived afterwards. Score-matrix traffic is analytic, and follows the three
+    steps the post lists for the naive path: write S, read S back and write P,
+    read P back. Four passes over an ``n x n`` matrix per head. The tiled path
+    makes zero of them, because the tile never leaves the accumulator.
+
+    Non-causal first, where the two paths do provably identical arithmetic and
+    the only difference left is the traffic. Causal after, where tile-skipping
+    means the tiled path does strictly *less* of both.
+    """
+    torch.manual_seed(0)
+    batch, heads, dim = 1, 8, 64
+    block = 128
+
+    for causal in (False, True):
+        rows = []
+        for seq in (512, 1024, 2048, 4096):
+            q, k, v = (torch.randn(batch, heads, seq, dim, device=device) for _ in range(3))
+            _, c = flash_attention(q, k, v, block_q=block, block_k=block, causal=causal)
+
+            # Naive: the same two matmuls, over the whole n x n matrix.
+            naive_flops = 2 * (2 * batch * heads * seq * seq * dim)
+            # Score bytes crossing HBM: write S, read S, write P, read P.
+            naive_score_bytes = 4 * batch * heads * seq * seq * 4
+
+            rows.append([
+                seq,
+                f"{naive_flops / 1e9:.1f} G",
+                f"{c['matmul_flops'] / 1e9:.1f} G",
+                f"{c['matmul_flops'] / naive_flops:.2f}x",
+                f"{_mib(naive_score_bytes):.0f} MiB",
+                "0 MiB",
+            ])
+            del q, k, v
+
+        rep.note(f"causal={causal}: arithmetic done, against score bytes moved")
+        rep.blank()
+        rep.table(
+            ["seq", "naive FLOPs", "tiled FLOPs", "ratio", "naive score traffic", "tiled"],
+            rows,
+        )
+        rep.blank()
+
+    rep.note("Non-causal, the FLOP columns are equal to the digit: the tiled path")
+    rep.note("does not save a single multiply. What it removes is the entire score")
+    rep.note("traffic column — quadratic in sequence length, and gone. Causal masking")
+    rep.note("then removes about half the arithmetic too, but that is a bonus from")
+    rep.note("tiling, not the mechanism.")
+    rep.takeaway(
+        "Same arithmetic, zero score-matrix traffic. That is the whole trade, and "
+        "it is why the win grows with sequence length: FLOPs and traffic both "
+        "scale as n^2, but only one of them is still being paid."
+    )
+
+
 def causal_skipping(rep: Report, device: torch.device) -> None:
     """Half the tiles are entirely masked. A tiled loop can skip them outright."""
     torch.manual_seed(0)
@@ -467,22 +574,25 @@ def main() -> None:
     rep = Report("03", "Flash Attention: exact, not approximate")
     rep.header()
 
-    rep.section("1. Online softmax: partial softmaxes that compose")
+    rep.section("1. Online softmax: partial softmaxes that compose     [post §2-3]")
     check_online_softmax(rep, device)
 
-    rep.section("2. Tiled attention reproduces the reference exactly")
+    rep.section("2. Tiled attention reproduces the reference exactly   [post §4-5]")
     check_exactness(rep, device)
 
-    rep.section("3. The memory that is never allocated")
+    rep.section("3. The memory that is never allocated                   [post §6]")
     mem_rows = memory_scaling(rep, device)
 
-    rep.section("4. Causal masking lets whole tiles be skipped")
+    rep.section("4. Same arithmetic, different bytes                      [post §8]")
+    flops_vs_bytes(rep, device)
+
+    rep.section("5. Causal masking lets whole tiles be skipped            [post §7]")
     causal_skipping(rep, device)
 
-    rep.section("5. Where the speed actually comes from")
+    rep.section("6. Where the speed actually comes from                   [post §8]")
     time_rows = timing(rep, device)
 
-    rep.section("6. Figures")
+    rep.section("7. Figures")
     make_figures(rep, mem_rows, time_rows)
 
 

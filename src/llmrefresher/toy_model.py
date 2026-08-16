@@ -165,8 +165,17 @@ class Attention(nn.Module):
             # positional information is baked in and never recomputed.
             k, v = cache.append(self.layer_idx, k, v, start)
 
-        # GQA: each KV head is shared by n_rep query heads. This is a view-level
-        # broadcast, so the cache stays small — that is the entire point.
+        # GQA: each KV head is shared by n_rep query heads. The expansion happens
+        # *after* the cache read, which is the entire point — the cache holds
+        # n_kv_heads, the attention runs over n_heads.
+        #
+        # Note that repeat_interleave materializes the expanded tensor rather
+        # than viewing it; `expand` would be a view, but the `reshape` needed to
+        # fold the group axis back in would copy anyway. Production kernels take
+        # the shared K/V directly (PyTorch exposes this as SDPA's `enable_gqa`)
+        # and never build the wide tensor. Demo 02 measures the consequence: a
+        # decode step gets slightly *slower* as n_kv_heads falls, because the
+        # copy grows even as the cache shrinks.
         if self.n_rep > 1:
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)

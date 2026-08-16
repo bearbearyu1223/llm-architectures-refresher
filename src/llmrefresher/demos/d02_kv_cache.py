@@ -10,9 +10,14 @@ Claims from the post, each with a receipt:
    weight matmuls.
 3. The cache is not a rounding error. At long context it exceeds the weights,
    which is why GQA exists and why it is the binding constraint on serving.
-4. Prefill is compute-bound and decode is memory-bandwidth-bound. Growing the
-   batch raises throughput while per-step latency barely moves — the signature
-   of a memory-bound kernel, and the reason batching works at all.
+4. Sharing K/V heads is a storage decision, not a compute one: MHA, GQA and MQA
+   differ by 12x in cache held and barely at all in time per decode step.
+5. Prefill is compute-bound and decode is memory-bandwidth-bound. The threshold
+   they sit either side of is the roofline ridge point — peak FLOP/s over
+   bandwidth — which is where "~100-300 FLOP/byte" comes from.
+6. Batching raises throughput almost for free, until it doesn't: weight traffic
+   is flat in batch and KV traffic is linear in it, so past a crossover the term
+   batching cannot amortize becomes the majority of memory traffic.
 
 Run: ``uv run demo02``
 """
@@ -42,8 +47,23 @@ def _gib(n_bytes: float) -> float:
     return n_bytes / GIB
 
 
+# Datasheet peak numbers, not measurements on this machine: dense fp16/bf16
+# tensor-core throughput and HBM bandwidth, as the vendor quotes them. Their
+# ratio is the "ridge point" of the roofline — the arithmetic intensity below
+# which a kernel is bandwidth-bound no matter how well it is written. The post
+# claims accelerators need "roughly 100-300 FLOP/byte"; this is where that
+# range comes from rather than being asserted.
+ACCELERATORS = (
+    # name,            dense fp16 TFLOP/s,  HBM GB/s
+    ("A100 40GB SXM", 312.0, 1_555.0),
+    ("A100 80GB SXM", 312.0, 2_039.0),
+    ("H100 SXM", 989.0, 3_350.0),
+    ("H200 SXM", 989.0, 4_800.0),
+)
+
+
 # ---------------------------------------------------------------------------
-# 1. The cache is exact
+# Why a cache exists, and why it is exact
 # ---------------------------------------------------------------------------
 
 
@@ -192,7 +212,7 @@ def cache_is_exact(rep: Report, device: torch.device) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. O(n^2) vs O(n)
+# Without a cache, generation is quadratic
 # ---------------------------------------------------------------------------
 
 
@@ -248,7 +268,7 @@ def quadratic_growth(rep: Report, device: torch.device) -> list[dict[str, float]
 
 
 # ---------------------------------------------------------------------------
-# 3. How big the cache actually gets
+# How big the cache actually gets
 # ---------------------------------------------------------------------------
 
 
@@ -380,12 +400,87 @@ def cache_arithmetic(rep: Report) -> dict[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Prefill vs decode
+# GQA and MQA: what sharing K/V heads actually buys
 # ---------------------------------------------------------------------------
 
 
-def prefill_vs_decode(rep: Report, device: torch.device) -> dict[str, list]:
-    """Measure both phases, then show the batch sweep that proves the diagnosis."""
+def gqa_mqa_tradeoff(rep: Report, device: torch.device) -> None:
+    """Store fewer K/V heads, compute against the same number of query heads.
+
+    The post shows the two-line ``repeat_interleave`` broadcast and asserts that
+    it shrinks the cache without shrinking the computation. That is a claim with
+    two halves and both are measurable, so measure them: build the same model at
+    three K/V-head counts, and report what each holds in cache against what each
+    costs per decode step.
+
+    The point is the *asymmetry*. Cache scales with ``n_kv_heads`` exactly, so
+    MQA holds a twelfth of what MHA holds. Per-step time barely moves, because
+    the expansion happens after the cache read and the attention arithmetic is
+    over the full 12 query heads either way. Sharing is a storage decision, not
+    a compute one.
+    """
+    prefix = 512
+    base = dict(vocab_size=8_000, d_model=768, n_layers=8, n_heads=12, d_ff=2_048, max_seq_len=1_024)
+
+    rep.note(f"Same model at three K/V-head counts. {base['n_heads']} query heads throughout;")
+    rep.note(f"cache measured after a {prefix}-token prefill, batch 1, fp32.")
+    rep.blank()
+
+    rows = []
+    for label, n_kv in (("MHA", 12), ("GQA", 4), ("MQA", 1)):
+        torch.manual_seed(0)
+        cfg = ToyConfig(**base, n_kv_heads=n_kv)
+        model = ToyLM(cfg).to(device).eval()
+        dtype = model.embed.weight.dtype
+
+        with torch.no_grad():
+            cache = KVCache(cfg, 1, device, dtype)
+            warm = torch.randint(0, cfg.vocab_size, (1, prefix), device=device)
+            model(warm, start=0, cache=cache)
+            step = torch.randint(0, cfg.vocab_size, (1, 1), device=device)
+            ms = benchmark_ms(lambda: model(step, start=prefix, cache=cache), device=device, warmup=5, repeats=20)
+
+        # What is actually held for `prefix` tokens — not the pre-allocated
+        # max_seq_len reservation, which would measure the allocator instead.
+        held = 2 * cfg.n_layers * n_kv * cfg.head_dim * prefix * 4
+        rows.append({"label": label, "n_kv": n_kv, "held": held, "ms": ms, "params": model.n_params,
+                     "q_heads": cfg.n_heads})
+
+    mha = rows[0]
+    rep.table(
+        ["variant", "kv heads", "q per kv", "params", "cache @512", "vs MHA", "ms/decode step"],
+        [
+            [r["label"], r["n_kv"], r["q_heads"] // r["n_kv"], f"{r['params'] / 1e6:.1f}M",
+             f"{r['held'] / 1024**2:.1f} MiB",
+             "—" if r is mha else f"{mha['held'] / r['held']:.0f}x smaller", r["ms"]]
+            for r in rows
+        ],
+    )
+    rep.blank()
+    rep.kv("cache, MHA -> MQA", f"{mha['held'] / rows[-1]['held']:.0f}x smaller")
+    rep.kv("decode step, MHA -> MQA", f"{rows[-1]['ms'] / mha['ms']:.2f}x the time")
+    rep.blank()
+    rep.note("Note the direction of that second number. Fewer K/V heads means")
+    rep.note("fewer parameters, yet the step gets slightly *slower* — because")
+    rep.note("this implementation expands with repeat_interleave, which allocates")
+    rep.note("the wide tensor it needs, and the smaller n_kv_heads is the more")
+    rep.note("there is to expand. Production kernels take the shared K/V directly")
+    rep.note("and never build it (PyTorch exposes this as SDPA's enable_gqa).")
+    rep.takeaway(
+        "Cache size tracks n_kv_heads exactly — 12x less storage from MHA to MQA. "
+        "Per-step time does not follow it: the expansion happens after the cache "
+        "read, so you store 4 heads and still compute against 12. Sharing K/V "
+        "heads is a memory decision that the compute side barely notices."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prefill vs decode
+# ---------------------------------------------------------------------------
+
+
+def prefill_vs_decode(rep: Report, device: torch.device) -> dict[str, object]:
+    """Measure both phases and place them against the hardware's ridge point."""
     torch.manual_seed(0)
     cfg = ToyConfig(vocab_size=8_000, d_model=768, n_layers=8, n_heads=12, n_kv_heads=4, d_ff=2_048, max_seq_len=2_048)
     model = ToyLM(cfg).to(device).eval()
@@ -438,13 +533,72 @@ def prefill_vs_decode(rep: Report, device: torch.device) -> dict[str, list]:
             ],
         ],
     )
-    rep.note("Modern accelerators need ~100-300 FLOP/byte to saturate their ALUs.")
+    # Where does "~100-300 FLOP/byte" come from? It is not a rule of thumb, it
+    # is the roofline ridge point: peak arithmetic throughput divided by memory
+    # bandwidth. Below it a kernel cannot saturate the ALUs however well it is
+    # written, because the bytes cannot arrive fast enough. Datasheet numbers,
+    # not measurements on this laptop — labelled as such.
+    prefill_ai = 2 * prompt_len * params / weight_bytes
+    decode_ai = 2 * params / weight_bytes
 
-    # The batch sweep. Run it at two prefix lengths, because batching amortizes
-    # the *weight* read but not the *KV cache* read: weights are shared across
-    # the batch, the cache is per-sequence. With a short prefix, weight traffic
-    # dominates and batching is nearly free. With a long one, KV traffic grows
-    # with batch and the free lunch ends. Serving systems live on this curve.
+    rep.blank()
+    rep.note("That 100-300 figure is the roofline ridge point — peak dense fp16")
+    rep.note("throughput divided by HBM bandwidth. Vendor datasheet numbers:")
+    rep.blank()
+    ridges = [(name, tflops, bw, tflops * 1_000 / bw) for name, tflops, bw in ACCELERATORS]
+    rep.table(
+        ["accelerator", "dense fp16", "HBM bandwidth", "ridge point"],
+        [[name, f"{tflops:.0f} TFLOP/s", f"{bw:,.0f} GB/s", f"{ridge:.0f} FLOP/byte"]
+         for name, tflops, bw, ridge in ridges],
+    )
+    rep.blank()
+    lo, hi = min(r[3] for r in ridges), max(r[3] for r in ridges)
+    rep.kv("ridge point, across these four", f"{lo:.0f}-{hi:.0f} FLOP/byte")
+    rep.blank()
+    rep.note("So place both phases against the narrowest of those ridges:")
+    rep.blank()
+    rep.table(
+        ["phase", "FLOP/byte", f"vs ridge ({lo:.0f})", "verdict"],
+        [
+            ["prefill", f"{prefill_ai:.1f}", f"{prefill_ai / lo:.2f}x", "at or above — compute-bound"],
+            ["decode", f"{decode_ai:.1f}", f"{decode_ai / lo:.4f}x", "far below — bandwidth-bound"],
+        ],
+    )
+    rep.blank()
+    rep.kv("decode is short of the ridge by", f"{lo / decode_ai:.0f}x")
+    rep.takeaway(
+        "Decode sits two to three orders of magnitude under the ridge point, so "
+        "the ALUs idle waiting on memory no matter what kernel you write. That "
+        "is not an implementation problem — it is the shape of the workload."
+    )
+    return {
+        "prefill_ms": prefill_ms,
+        "decode_ms": decode_ms,
+        "prompt_len": prompt_len,
+        "cfg": cfg,
+        "model": model,
+        "weight_bytes": weight_bytes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The batch sweep, and where it stops working
+# ---------------------------------------------------------------------------
+
+
+def batch_sweep(rep: Report, device: torch.device, ctx: dict[str, object]) -> dict[str, list]:
+    """Batching amortizes the weight read but not the KV cache read.
+
+    Run the sweep at two prefix lengths. Weights are shared across the batch;
+    the cache is per-sequence. With a short prefix weight traffic dominates and
+    batching is nearly free. With a long one KV traffic grows with batch until
+    it overtakes the weights, and the free lunch ends. Serving systems live on
+    this curve, so the crossover gets its own table rather than a parenthesis.
+    """
+    cfg: ToyConfig = ctx["cfg"]  # type: ignore[assignment]
+    model: ToyLM = ctx["model"]  # type: ignore[assignment]
+    weight_bytes: float = ctx["weight_bytes"]  # type: ignore[assignment]
+
     batches = (1, 2, 4, 8, 16, 32)
     sweeps: dict[int, list[dict[str, float]]] = {}
     with torch.no_grad():
@@ -455,7 +609,12 @@ def prefill_vs_decode(rep: Report, device: torch.device) -> dict[str, list]:
                 warm = torch.randint(0, cfg.vocab_size, (batch, prefix), device=device)
                 model(warm, start=0, cache=c)
                 step = torch.randint(0, cfg.vocab_size, (batch, 1), device=device)
-                ms = benchmark_ms(lambda: model(step, start=prefix, cache=c), device=device, warmup=5, repeats=20)
+                # Generous warmup and sample count: this sweep is the headline
+                # measurement of the post, and at batch 1 a single scheduling
+                # hiccup on a laptop is large enough to make the latency column
+                # non-monotone, which reads as a broken argument rather than as
+                # noise. benchmark_ms already takes the median.
+                ms = benchmark_ms(lambda: model(step, start=prefix, cache=c), device=device, warmup=10, repeats=40)
                 kv_bytes = 2 * cfg.n_layers * cfg.n_kv_heads * cfg.head_dim * prefix * batch * 4
                 rows.append({"batch": batch, "ms": ms, "tok_s": batch / (ms / 1000), "kv_bytes": kv_bytes})
             sweeps[prefix] = rows
@@ -480,22 +639,43 @@ def prefill_vs_decode(rep: Report, device: torch.device) -> dict[str, list]:
     rep.blank()
     rep.kv("throughput gain at batch 32, 32-tok prefix", f"{short[-1]['tok_s'] / short[0]['tok_s']:.1f}x")
     rep.kv("throughput gain at batch 32, 512-tok prefix", f"{long[-1]['tok_s'] / long[0]['tok_s']:.1f}x")
+
+    # Why the second sweep flattens. Weight traffic is flat in batch; KV traffic
+    # is linear in it. Print the two side by side so the crossover is a row you
+    # can point at rather than a sentence asserting it.
+    rep.blank()
+    rep.note("Why: weight traffic is flat in batch, KV traffic is linear in it.")
+    rep.note("Per decode step, with the 512-token prefix:")
+    rep.blank()
+    rep.table(
+        ["batch", "weight bytes", "KV bytes", "total", "KV share", "bound by"],
+        [
+            [r["batch"], f"{_gib(weight_bytes):.3f} GiB", f"{_gib(r['kv_bytes']):.3f} GiB",
+             f"{_gib(weight_bytes + r['kv_bytes']):.3f} GiB",
+             f"{r['kv_bytes'] / (weight_bytes + r['kv_bytes']):.0%}",
+             "weights" if r["kv_bytes"] < weight_bytes else "KV cache"]
+            for r in long
+        ],
+    )
+    rep.blank()
+    # Batch at which per-sequence KV traffic equals the shared weight read.
+    for prefix in (32, 512):
+        per_seq = 2 * cfg.n_layers * cfg.n_kv_heads * cfg.head_dim * prefix * 4
+        rep.kv(f"KV overtakes weights at batch ({prefix}-tok prefix)", f"{weight_bytes / per_seq:.0f}")
+    rep.blank()
+    rep.note("That crossover is the whole story of the second sweep: past it,")
+    rep.note("the term batching cannot amortize is the majority of the traffic.")
     rep.takeaway(
         "With a short prefix, 32x the work costs far less than 32x the time: the "
         "weight read was the bottleneck and the extra sequences rode along free. "
         "With a long prefix the gain shrinks, because KV traffic scales with batch "
         "while weight traffic does not. That is the whole economics of serving."
     )
-    return {
-        "sweeps": {str(k): v for k, v in sweeps.items()},
-        "prefill_ms": prefill_ms,
-        "decode_ms": decode_ms,
-        "prompt_len": prompt_len,
-    }
+    return {"sweeps": {str(k): v for k, v in sweeps.items()}}
 
 
 # ---------------------------------------------------------------------------
-# 5. Figures
+# Figures
 # ---------------------------------------------------------------------------
 
 
@@ -675,25 +855,31 @@ def main() -> None:
     rep = Report("02", "The KV cache, and why decode is memory-bandwidth-bound")
     rep.header()
 
-    rep.section("0. What each generation step needs")
+    rep.section("1. What each generation step needs                    [post §1]")
     what_each_step_needs(rep)
 
-    rep.section("0b. Why caching is valid at all")
+    rep.section("2. Why caching is valid at all                        [post §1]")
     why_caching_is_valid(rep, device)
 
-    rep.section("1. The cache changes nothing about the output")
+    rep.section("3. The cache changes nothing about the output         [post §2]")
     cache_is_exact(rep, device)
 
-    rep.section("2. Without a cache, generation is quadratic")
+    rep.section("4. Without a cache, generation is quadratic           [post §3]")
     quad = quadratic_growth(rep, device)
 
-    rep.section("3. How big the cache actually gets")
+    rep.section("5. How big the cache actually gets                    [post §4]")
     cache_arithmetic(rep)
 
-    rep.section("4. Prefill vs decode")
-    perf = prefill_vs_decode(rep, device)
+    rep.section("6. Shrinking it: GQA, MQA, and what you give up       [post §5]")
+    gqa_mqa_tradeoff(rep, device)
 
-    rep.section("5. Figures")
+    rep.section("7. Prefill vs decode, against the ridge point         [post §6]")
+    ctx = prefill_vs_decode(rep, device)
+
+    rep.section("8. The batch sweep, and where it stops working        [post §7]")
+    perf = batch_sweep(rep, device, ctx)
+
+    rep.section("9. Figures")
     make_figures(rep, quad, perf)
 
 
