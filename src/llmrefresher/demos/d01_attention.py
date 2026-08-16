@@ -1092,13 +1092,106 @@ def figure_word_table(theme: Theme) -> Path:
                 ha="center", va="top", fontsize=8.5, color=theme.secondary)
 
         ax.text(7.9, 2.05,
-                "Same table, opposite directions: going in you look one row up by its number,\n"
+                "Same shape, opposite directions: going in you look one row up by its number,\n"
                 "coming out you ask which row your vector looks most like.",
                 ha="center", va="center", fontsize=10.5, color=theme.ink)
-        ax.text(7.9, 1.5, "525M parameters each — and some models use literally the same "
-                          "table for both, saving one copy.",
+        ax.text(7.9, 1.5, "Two matrices of this shape, 525M parameters each — some models tie "
+                          "them into literally one table, saving a copy.",
                 ha="center", va="center", fontsize=9, color=theme.muted, style="italic")
         return save_both(fig, SLUG, "word-table", theme)
+
+
+def figure_position_injection(theme: Theme) -> Path:
+    """Where position enters the pipeline: 2017's addition vs RoPE's rotation.
+
+    Both schemes inject position into the same five-stage path, and the entire
+    difference is which rung the orange arrow lands on. Adding it to the token
+    vector (2017) puts position upstream of the projections, so whether the
+    score tracks distance is left to training. Rotating Q and K (RoPE) puts it
+    downstream, where it lands in the dot product itself and the dependence on
+    m - n is forced by geometry rather than learned.
+
+    Drawn as one shared pipeline in two columns so the eye compares the entry
+    point, not the boxes.
+    """
+    LX, RX, BW, BH = 4.0, 10.6, 4.5, 0.78
+    ROWS = (7.0, 5.6, 4.2, 2.8, 1.4)  # x, +pos, project, rotate, score
+    ACCENT = theme.series[1]
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(13.0, 7.6))
+        ax.grid(False)
+        ax.set_xlim(0, 14.6)
+        ax.set_ylim(-0.75, 8.9)
+        ax.axis("off")
+
+        def box(cx, y, label, sub=None, fill=None):
+            fill = fill or theme.ramp[1]
+            ax.add_patch(patches.FancyBboxPatch(
+                (cx - BW / 2, y - BH / 2), BW, BH, boxstyle="round,pad=0.04",
+                facecolor=fill, edgecolor=theme.surface, linewidth=1.5))
+            tc = ink_for(fill)
+            ax.text(cx, y + (0.14 if sub else 0), label, ha="center", va="center",
+                    fontsize=10, fontweight="bold", color=tc)
+            if sub:
+                ax.text(cx, y - 0.19, sub, ha="center", va="center", fontsize=8, color=tc)
+
+        def flow(cx, y_from, y_to):
+            ax.annotate("", xy=(cx, y_to + BH / 2), xytext=(cx, y_from - BH / 2),
+                        arrowprops=dict(arrowstyle="-|>", color=theme.axis, linewidth=1.6))
+
+        def passthrough(cx, y):
+            """This scheme does nothing at this rung — draw the line straight past."""
+            ax.plot([cx, cx], [y + 0.42, y - 0.42], color=theme.axis, linewidth=1.6)
+            ax.text(cx + 0.30, y, "(nothing here)", ha="left", va="center",
+                    fontsize=8, color=theme.muted, style="italic")
+
+        def inject(cx, y, glyph, label, side):
+            """The one rung where this scheme applies position."""
+            ax.add_patch(patches.Circle((cx, y), 0.30, facecolor=ACCENT,
+                                        edgecolor=theme.surface, linewidth=1.5, zorder=3))
+            ax.text(cx, y, glyph, ha="center", va="center", fontsize=13,
+                    fontweight="bold", color=ink_for(ACCENT), zorder=4)
+            x_from = cx - 2.55 if side == "left" else cx + 2.55
+            ax.annotate("", xy=(cx - 0.34 if side == "left" else cx + 0.34, y),
+                        xytext=(x_from, y),
+                        arrowprops=dict(arrowstyle="-|>", color=ACCENT, linewidth=1.8))
+            ax.text(x_from, y + 0.42, label, ha="left" if side == "left" else "right",
+                    va="bottom", fontsize=8.5, color=theme.secondary, linespacing=1.35)
+
+        for cx, title, sub in ((LX, "2017: add it to the vector", "Attention Is All You Need, §3.5"),
+                               (RX, "RoPE: rotate after projecting", "RoFormer, 2021")):
+            ax.text(cx, 8.45, title, ha="center", va="center",
+                    fontsize=12, fontweight="bold", color=theme.ink)
+            ax.text(cx, 8.08, sub, ha="center", va="center",
+                    fontsize=8.5, color=theme.muted, style="italic")
+
+        for cx in (LX, RX):
+            box(cx, ROWS[0], "two tokens' vectors",
+                "the query's, at position $m$   ·   the key's, at position $n$")
+            box(cx, ROWS[2], "$W_q,\\; W_k \\;\\to\\; q,\\; k$", "the projections")
+            box(cx, ROWS[4], "score  $q \\cdot k$", "what attention uses",
+                fill=theme.ramp[3])
+            for a, b in zip(ROWS, ROWS[1:]):
+                flow(cx, a, b)
+
+        inject(LX, ROWS[1], "$+$", "add the position vector\nfor $m$, and the one for $n$", "left")
+        passthrough(LX, ROWS[3])
+        passthrough(RX, ROWS[1])
+        inject(RX, ROWS[3], "$R$", "rotate $q$ by $m\\theta$,\nand $k$ by $n\\theta$", "right")
+
+        ax.plot([7.3, 7.3], [-0.55, 8.6], color=theme.grid, linewidth=1.2, linestyle=(0, (4, 4)))
+
+        ax.text(LX, 0.10, "Position arrives before the projections, mixed into the\n"
+                          "meaning. Whether the score ends up tracking distance\n"
+                          "is left for training to sort out.",
+                ha="center", va="top", fontsize=9, color=theme.secondary, linespacing=1.5)
+        ax.text(RX, 0.10, "Position arrives after them, so it lands in the dot product\n"
+                          "itself. Depending only on $m-n$ is then forced by geometry —\n"
+                          "no parameters, nothing to learn.",
+                ha="center", va="top", fontsize=9, color=theme.secondary, linespacing=1.5)
+
+        return save_both(fig, SLUG, "position-injection", theme)
 
 
 def figure_lm_head(theme: Theme) -> Path:
@@ -1979,9 +2072,9 @@ def rope_demo(rep: Report, device: torch.device) -> dict[str, list]:
         ["query pos m", "key pos n", "offset m-n", "q_m . k_n"],
         [[m, n, m - n, s] for (m, n), s in zip(pairs, scores)],
     )
-    spread = max(scores) - min(scores)
+    score_range = max(scores) - min(scores)
     rep.blank()
-    rep.kv("spread across absolute positions", spread)
+    rep.kv("range across absolute positions", score_range)
 
     rep.blank()
     rep.note("now vary the offset instead, holding the query at position 0:")
@@ -2151,6 +2244,7 @@ def make_figures(
             figure_multihead(theme),
             figure_ffn(theme),
             figure_word_table(theme),
+            figure_position_injection(theme),
             figure_lm_head(theme),
             figure_stack_two_jobs(theme),
             figure_train_vs_infer(theme),
