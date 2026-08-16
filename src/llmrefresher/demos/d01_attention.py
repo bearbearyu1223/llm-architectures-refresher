@@ -1859,6 +1859,124 @@ def figure_block(theme: Theme) -> Path:
         return save_both(fig, SLUG, "block-anatomy", theme)
 
 
+def softmax_gap_sweep(rep: Report) -> None:
+    """What a softmax does to two keys, as the gap between their logits grows.
+
+    The smallest case that shows anything: two logits, 0 and g. The weight on
+    the larger one is 1 / (1 + exp(-g)), so the gap alone decides whether the
+    result is a blend or a winner-take-all. Everything in the sqrt(d_k)
+    argument reduces to this table plus a claim about how big g gets.
+    """
+    rep.note("Two keys, logits 0 and g. Only the gap matters:")
+    rep.blank()
+    rows = []
+    for g in (1, 2, 4, 8, 16):
+        hi = 1.0 / (1.0 + math.exp(-g))
+        rows.append([g, f"{1 - hi:.7f}", f"{hi:.7f}"])
+    rep.table(["gap g", "weight on lower", "weight on higher"], rows)
+    rep.blank()
+
+    # Only differences matter: adding a constant to both logits cancels.
+    shifted = torch.softmax(torch.tensor([100.0, 104.0]), dim=-1)
+    plain = torch.softmax(torch.tensor([0.0, 4.0]), dim=-1)
+    rep.kv("softmax([0, 4])", f"{plain[0]:.7f}, {plain[1]:.7f}")
+    rep.kv("softmax([100, 104])", f"{shifted[0]:.7f}, {shifted[1]:.7f}")
+    rep.kv("identical", "yes" if torch.allclose(plain, shifted) else "NO")
+    rep.takeaway(
+        "Gaps near 1 give a real blend; past about 8 the larger key takes "
+        "everything. Adding a constant to both changes nothing."
+    )
+
+
+def precision_table(rep: Report) -> None:
+    """The bytes rule applied to one block's four projections.
+
+    bytes = count x bytes-per-number. The count is fixed by the architecture;
+    the multiplier is a deployment choice, which is why the post counts numbers
+    rather than bytes everywhere else.
+    """
+    d_model = 4096
+    count = 4 * d_model * d_model
+    rep.kv("numbers in W_q, W_k, W_v, W_o", f"{count:,}")
+    rep.blank()
+    # sign / exponent / fraction, which is what separates bf16 from fp16 at the
+    # same width: bf16 keeps fp32's 8 exponent bits and spends fraction instead.
+    formats = (("fp32", 1, 8, 23), ("bf16", 1, 8, 7), ("fp16", 1, 5, 10), ("fp8", 1, 4, 3))
+    rep.table(
+        ["stored as", "sign/exp/frac", "bits", "bytes each", "total bytes", "weighs"],
+        [
+            [name, f"{s}/{e}/{f}", s + e + f, (s + e + f) // 8,
+             f"{count * (s + e + f) // 8:,}",
+             _bytes_binary(count * (s + e + f) // 8)]
+            for name, s, e, f in formats
+        ],
+    )
+    rep.takeaway(
+        "Same architecture, a quarter of the memory, decided long after the "
+        "model was designed."
+    )
+
+
+def rope_frequency_table(rep: Report, head_dim: int = 128, base: float = 10_000.0) -> None:
+    """How fast each of RoPE's planes turns, and how long until it repeats.
+
+    A plane turning at theta radians per position comes full circle every
+    2*pi/theta positions. The fastest plane wraps every few tokens, the slowest
+    has barely moved by the end of a long context -- which is why several
+    planes at different rates pin an offset down that one rate could not.
+    """
+    rep.note(f"head_dim={head_dim}, base={base:,.0f}: {head_dim // 2} planes,")
+    rep.note("each turning at its own rate. theta_i = base ** (-i / head_dim):")
+    rep.blank()
+    rep.table(
+        ["plane i", "theta_i", "full circle every"],
+        [
+            [i, f"{base ** (-i / head_dim):.6g}",
+             f"{2 * math.pi / (base ** (-i / head_dim)):,.0f} positions"]
+            for i in (0, 32, 64, 96, head_dim - 2)
+        ],
+    )
+    rep.takeaway(
+        "Fast planes resolve neighbours and wrap constantly; slow planes carry "
+        "long-range position. Context extension rescales this column."
+    )
+
+
+def embedding_tie_arithmetic(rep: Report) -> None:
+    """Whether a model ties its embedding table and LM head, read off its size.
+
+    Both are (n_vocab, d_model). Keeping them separate or sharing one set of
+    weights is a design choice, and for Llama-3-8B the advertised parameter
+    count is enough to tell which was made.
+    """
+    d_model, n_vocab, d_ff, n_kv, d_head, layers = 4096, 128_256, 14_336, 8, 128, 32
+    table = n_vocab * d_model
+    attn = 2 * d_model * d_model + 2 * d_model * (n_kv * d_head)
+    ffn = 3 * d_model * d_ff
+    blocks = layers * (attn + ffn)
+
+    rep.kv("one table (n_vocab x d_model)", f"{table / 1e6:.1f}M")
+    rep.kv("one block (attention + FFN)", f"{(attn + ffn) / 1e6:.1f}M")
+    rep.kv(f"{layers} blocks", f"{blocks / 1e9:.3f}B")
+    rep.blank()
+    rep.table(
+        ["arrangement", "tables", "total parameters"],
+        [
+            ["untied (separate matrices)", 2, f"{(blocks + 2 * table + d_model) / 1e9:.3f}B"],
+            ["tied (one shared matrix)", 1, f"{(blocks + table + d_model) / 1e9:.3f}B"],
+        ],
+    )
+    rep.blank()
+    rep.kv("Llama-3-8B is advertised as", "8.03B")
+    rep.kv("so it keeps them", "separate")
+    rep.blank()
+    rep.kv("the two tables as a share of 8.03B",
+           f"{2 * table / (blocks + 2 * table + d_model):.1%}")
+    rep.takeaway(
+        "13% of the model sits in two lookup tables; the 32 blocks hold the rest."
+    )
+
+
 def scaling_sweep(rep: Report, device: torch.device) -> list[dict[str, float]]:
     """Show softmax saturating as ``d_k`` grows, unless you divide by sqrt(d_k).
 
@@ -2310,7 +2428,15 @@ def main() -> None:
     rep.section("1e. Where attention sits in the block")
     block_parameter_split(rep)
 
+    rep.section("1f. What those numbers weigh, at each precision")
+    precision_table(rep)
+
+    rep.section("1g. The embedding table and the LM head")
+    embedding_tie_arithmetic(rep)
+
     rep.section("2. Why divide by sqrt(d_k)?")
+    softmax_gap_sweep(rep)
+    rep.blank()
     rows = scaling_sweep(rep, device)
 
     rep.section("3. Causal masking")
@@ -2319,6 +2445,8 @@ def main() -> None:
     weights = causal_mask_demo(rep, device)
 
     rep.section("4. RoPE: absolute rotation, relative score")
+    rope_frequency_table(rep)
+    rep.blank()
     rope_data = rope_demo(rep, device)
 
     rep.section("5. Figures")
