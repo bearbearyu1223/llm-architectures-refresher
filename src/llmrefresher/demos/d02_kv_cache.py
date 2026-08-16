@@ -47,6 +47,50 @@ def _gib(n_bytes: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+def what_each_step_needs(rep: Report) -> None:
+    """Three generation steps, and the Q/K/V each one requires.
+
+    This is the observation the whole cache falls out of, so it is worth
+    printing rather than asserting: read down the K and V columns and the same
+    tensors appear step after step, while Q never repeats. Counting the two
+    separately is the argument for caching one and not the other.
+
+    Token strings only — no model runs here. What matters is which positions
+    each step reaches for, and that is fixed by causal masking alone.
+    """
+    words = ["The", "cat", "sat", "on", "the", "mat"]
+    rep.note("Generating from a 3-token prompt. At each step the model needs the")
+    rep.note("new token's query, and the key and value of every token so far:")
+    rep.blank()
+    rows = []
+    for step in range(3):
+        n = 3 + step                      # tokens present before this step
+        rows.append([
+            step + 1,
+            "[" + " ".join(words[:n]) + "]",
+            f"Q{n}",
+            f"K1..K{n}",
+            f"V1..V{n}",
+            f'"{words[n]}"',
+        ])
+    rep.table(["step", "sequence so far", "needs", "and", "and", "predicts"], rows)
+    rep.blank()
+
+    # Count the reads. Q is read once per step (a diagonal); each K and V is
+    # read again by every later step (a triangle). That gap is the whole case.
+    steps = 3
+    q_reads = steps
+    kv_reads = sum(3 + s for s in range(steps))
+    rep.kv("Q vectors read, over 3 steps", q_reads)
+    rep.kv("K vectors read, over 3 steps", kv_reads)
+    rep.kv("of which are recomputations", kv_reads - (3 + steps - 1))
+    rep.takeaway(
+        "Every step recomputes keys and values the previous step already had. "
+        "Q is used once and never again — which is why the thing is a KV cache "
+        "and not a QKV cache."
+    )
+
+
 def why_caching_is_valid(rep: Report, device: torch.device) -> None:
     """The premise behind the whole idea: K and V never change once computed.
 
@@ -631,7 +675,10 @@ def main() -> None:
     rep = Report("02", "The KV cache, and why decode is memory-bandwidth-bound")
     rep.header()
 
-    rep.section("0. Why caching is valid at all")
+    rep.section("0. What each generation step needs")
+    what_each_step_needs(rep)
+
+    rep.section("0b. Why caching is valid at all")
     why_caching_is_valid(rep, device)
 
     rep.section("1. The cache changes nothing about the output")
