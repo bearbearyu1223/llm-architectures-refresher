@@ -302,123 +302,9 @@ def head_split_arithmetic(rep: Report, device: torch.device):
         ],
     )
 
-    # --- what any of this means on real hardware ---------------------------
-    #
-    # The same layer costs very different amounts depending on whether you are
-    # training it or serving it, and the two differ far more in memory than in
-    # arithmetic. Numbers are for the whole 8B model, not one layer.
-    N = 8.03e9
     rep.blank()
-    rep.note("TRAINING vs INFERENCE — whole model, Llama-3-8B:")
-    rep.blank()
-    rep.kv("N, whole-model parameters", f"{N / 1e9:.2f}B")
-    rep.note("(not the 67.1M above — that was one layer's four projections)")
-    rep.blank()
-    rep.note("Compute. Going back, each layer forms two products where going in")
-    rep.note("it formed one — dW = X.T @ dY, and dX = dY @ W.T for the layer")
-    rep.note("behind it — so the backward pass costs about twice the forward:")
-    rep.blank()
-    rep.table(
-        ["per token", "FLOPs", "why"],
-        [
-            ["inference", f"2N = {2 * N / 1e9:.1f} G", "one forward pass"],
-            ["training", f"6N = {6 * N / 1e9:.1f} G", "forward, then backward at ~2x"],
-        ],
-    )
-    rep.blank()
-    rep.note("Memory. This is where they really diverge — training has to keep")
-    rep.note("the optimizer's state alongside the weights:")
-    rep.blank()
-    running = 0
-    rows = []
-    for label, b in (("bf16 weights", 2), ("bf16 gradients", 2), ("fp32 master copy", 4),
-                     ("Adam moment m", 4), ("Adam moment v", 4)):
-        running += b
-        rows.append([label, f"{b} B/param", f"{N * b / 1e9:.1f} GB",
-                     f"{N * running / 1e9:.1f} GB"])
-    rep.table(["what", "cost", "size", "running total"], rows)
-    rep.blank()
-    rep.kv("inference needs", f"~2 B/param  = {2 * N / 1e9:.1f} GB")
-    rep.kv("training needs", f"~16 B/param = {16 * N / 1e9:.0f} GB, before activations")
-    rep.blank()
-    rep.note("So training costs 3x the arithmetic but 8x the memory. Which is why")
-    rep.note("a model you can serve on one accelerator can still need a cluster")
-    rep.note("to train — and why inference work is usually about moving bytes")
-    rep.note("rather than doing math.")
-
-    # --- against actual silicon --------------------------------------------
-    #
-    # Spec-sheet peaks for dense BF16 tensor-core math. Real kernels reach a
-    # fraction of these, but the ratio between compute and bandwidth is what
-    # matters here and it survives the discount.
-    gpus = (("A100 80GB", 80e9, 2.039e12, 312e12), ("H100 80GB", 80e9, 3.35e12, 990e12))
-    w_bytes = 2 * N
-    per_token_kv = 2 * 32 * 8 * 128 * 2  # Llama-3-8B, fp16: 128 KiB
-
-    rep.blank()
-    rep.note("Against real silicon — spec-sheet peaks, dense BF16:")
-    rep.blank()
-    rep.table(
-        ["GPU", "memory", "bandwidth", "BF16 compute"],
-        [[n, f"{m / 1e9:.0f} GB", f"{bw / 1e12:.2f} TB/s", f"{fl / 1e12:.0f} TFLOP/s"]
-         for n, m, bw, fl in gpus],
-    )
-    rep.blank()
-    # Weights are only the floor. What you can actually serve is decided by the
-    # KV cache, and GQA is the reason it is affordable: 8 kv heads, not 32.
-    rep.blank()
-    rep.note("SERVING — weights are the floor, KV cache is the ceiling:")
-    rep.blank()
-    rep.table(
-        ["stored as", "bytes/param", "weights"],
-        [[n, f"{b:g}", f"{N * b / 1e9:.1f} GB"]
-         for n, b in (("fp32", 4), ("bf16/fp16", 2), ("int8", 1), ("int4", 0.5))],
-    )
-    rep.blank()
-    mha_kv = 2 * 32 * 32 * 128 * 2          # the same cache without GQA
-    rep.kv("KV cache per token (GQA, 8 kv)", f"{per_token_kv / 1024:.0f} KiB")
-    rep.kv("  had it been MHA (32 kv)", f"{mha_kv / 1024:.0f} KiB — 4x worse")
-    rep.kv("KV per full 8k sequence", f"{per_token_kv * 8192 / 1024**3:.2f} GiB")
-    rep.blank()
-    # ~77 GB is what remains of a nominal 80 GB after CUDA context, cuBLAS
-    # workspaces and allocator fragmentation; leave ~3 GB for activations.
-    usable, act = 77e9, 3e9
-    kv_budget = usable - w_bytes - act
-    rep.kv("card, nominal / usable", f"80 GB / ~{usable / 1e9:.0f} GB")
-    rep.kv("  minus weights, workspace", f"{kv_budget / 1e9:.0f} GB left for KV")
-    rep.kv("  which buys", f"~{kv_budget / per_token_kv / 1000:.0f}k tokens of cache")
-    rep.blank()
-    rep.table(
-        ["context length", "concurrent sequences"],
-        [[f"{c // 1024}k", f"~{kv_budget / per_token_kv / c:.0f}"]
-         for c in (8192, 32768, 131072)],
-    )
-    rep.blank()
-    rep.note("TRAINING — the same card, the same model:")
-    rep.blank()
-    rep.kv("training state (16 B/param)", f"{16 * N / 1e9:.0f} GB")
-    rep.kv("  against usable", f"{usable / 1e9:.0f} GB — over by {(16 * N - usable) / 1e9:.0f} GB")
-    rep.kv("  activations, ckpt b=1 s=4096", f"{2 * 4096 * 4096 * 32 / 1e9:.1f} GB")
-    rep.kv("  logits, fp32 at seq 4096", f"{4096 * 128256 * 4 / 1e9:.1f} GB per sequence")
-
-    rep.blank()
-    rep.note("And the number that decides how fast you can generate. At batch 1")
-    rep.note("a decode step reads every weight once, so time it two ways:")
-    rep.blank()
-    rep.table(
-        ["GPU", "if compute-bound", "if bandwidth-bound", "gap"],
-        [[n,
-          f"{1 / ((2 * N) / fl):,.0f} tok/s",
-          f"{1 / (w_bytes / bw):,.0f} tok/s",
-          f"{(w_bytes / bw) / ((2 * N) / fl):.0f}x"]
-         for n, m, bw, fl in gpus],
-    )
-    rep.blank()
-    rep.note("Bandwidth wins by two orders of magnitude — the chip finishes the")
-    rep.note("arithmetic and then waits. Note it gets WORSE on the newer card:")
-    rep.note("H100 has 3.2x the compute of an A100 but only 1.6x the bandwidth,")
-    rep.note("so the gap roughly doubles. Post 2 is about living with this.")
-
+    rep.note("THE HEAD COUNT, SUMMARISED — the two costs it does not move,")
+    rep.note("and the symbol it does decide:")
     rep.blank()
     rep.kv("params, 1 head vs 64 heads", f"{4 * one / 1e6:.1f}M vs {4 * one / 1e6:.1f}M")
     rep.kv("score FLOPs, 1 head vs 64 heads",
@@ -1949,6 +1835,11 @@ def embedding_tie_arithmetic(rep: Report) -> None:
     weights is a design choice, and for Llama-3-8B the advertised parameter
     count is enough to tell which was made.
     """
+    rep.note("At the bottom of that stack sits the LM head: one matrix taking a")
+    rep.note("token's 4096 numbers to a score per vocabulary entry. It is the same")
+    rep.note("shape as the embedding table at the top, which raises the question of")
+    rep.note("whether a model stores one matrix or two. Its own size answers it:")
+    rep.blank()
     d_model, n_vocab, d_ff, n_kv, d_head, layers = 4096, 128_256, 14_336, 8, 128, 32
     table = n_vocab * d_model
     attn = 2 * d_model * d_model + 2 * d_model * (n_kv * d_head)
@@ -2112,10 +2003,10 @@ def causal_mask_demo(rep: Report, device: torch.device) -> torch.Tensor:
 
     rep.note("the mask M, added to the scores before the softmax:")
     rep.blank()
-    print("        " + "".join(f"key{j:<6}" for j in range(seq)))
+    print(("        " + "".join(f"key{j:<6}" for j in range(seq))).rstrip())
     for i in range(seq):
         cells = "".join(f"{'0' if mask[i, j] == 0 else '-inf':<9}" for j in range(seq))
-        print(f"  q{i}    {cells}")
+        print(f"  q{i}    {cells}".rstrip())
     rep.blank()
     rep.note("0 = allowed, -inf = forbidden. exp(-inf) = 0, so those weights")
     rep.note("become exactly zero and the rest renormalize to sum to 1.")
@@ -2126,10 +2017,10 @@ def causal_mask_demo(rep: Report, device: torch.device) -> torch.Tensor:
 
     rep.note("attention weights, row i = query at position i:")
     rep.blank()
-    print("        " + "".join(f"key{j:<5}" for j in range(seq)))
+    print(("        " + "".join(f"key{j:<5}" for j in range(seq))).rstrip())
     for i in range(seq):
         cells = "".join(f"{w[i, j]:<9.3f}" for j in range(seq))
-        print(f"  q{i}    {cells}")
+        print(f"  q{i}    {cells}".rstrip())
 
     rep.blank()
     rep.kv("mass on future positions", w.triu(1).sum().item())
@@ -2413,45 +2304,173 @@ def main() -> None:
     rep = Report("01", "Attention from scratch, and RoPE's relative-position trick")
     rep.header()
 
-    rep.section("1. Our 5-line attention vs PyTorch's fused kernel")
+    # Section order follows the post, so a reader can run this alongside it.
+    # The numbers in brackets are the post's own section numbers.
+    rep.section("1. Our 5-line attention vs PyTorch's fused kernel   [post §10]")
     check_against_pytorch(rep, device)
 
-    rep.section("1b. What a head is: splitting a fixed budget")
+    rep.section("2. What a head is, and what attention costs        [post §4-5]")
     head_weights = head_split_arithmetic(rep, device)
 
-    rep.section("1c. Every shape, end to end")
-    shape_walkthrough(rep, device)
-
-    rep.section("1d. Why the FFN exists")
-    why_the_ffn(rep, device)
-
-    rep.section("1e. Where attention sits in the block")
-    block_parameter_split(rep)
-
-    rep.section("1f. What those numbers weigh, at each precision")
+    rep.section("3. What those numbers weigh, at each precision       [post §5]")
     precision_table(rep)
 
-    rep.section("1g. The embedding table and the LM head")
-    embedding_tie_arithmetic(rep)
+    rep.section("4. What the whole model costs to run                 [post §6]")
+    whole_model_costs(rep)
 
-    rep.section("2. Why divide by sqrt(d_k)?")
+    rep.section("5. Every shape, end to end                           [post §7]")
+    shape_walkthrough(rep, device)
+
+    rep.section("6. Where attention sits in the block                 [post §8]")
+    block_parameter_split(rep)
+
+    rep.section("7. Why the FFN exists                                [post §9]")
+    why_the_ffn(rep, device)
+
+    rep.section("8. Why divide by sqrt(d_k)?                         [post §11]")
     softmax_gap_sweep(rep)
     rep.blank()
     rows = scaling_sweep(rep, device)
 
-    rep.section("3. Causal masking")
-    positions_are_independent(rep, device)
-    rep.blank()
+    rep.section("9. Causal masking                                   [post §12]")
     weights = causal_mask_demo(rep, device)
 
-    rep.section("4. RoPE: absolute rotation, relative score")
+    rep.section("10. Training vs generating, and the LM head         [post §13]")
+    positions_are_independent(rep, device)
+    rep.blank()
+    embedding_tie_arithmetic(rep)
+
+    rep.section("11. RoPE: absolute rotation, relative score         [post §14]")
     rope_frequency_table(rep)
     rep.blank()
     rope_data = rope_demo(rep, device)
 
-    rep.section("5. Figures")
+    rep.section("12. Figures")
     make_figures(rep, rows, weights, rope_data, head_weights)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+def whole_model_costs(rep: Report) -> None:
+    """What the whole 8B model costs to serve and to train, on one real card.
+
+    Everything above this is one layer, priced in d_model and seq. This is the
+    whole model against an A100 80GB: does it fit, and how fast does it go.
+    Training and serving differ far more in memory than in arithmetic, and the
+    thing that actually binds serving turns out to be the KV cache, not the
+    weights.
+    """
+    N = 8.03e9
+    rep.note("Everything above was one layer. From here, N means the whole")
+    rep.note("model — all 32 blocks, plus the embedding table and the LM head:")
+    rep.blank()
+    rep.kv("N, whole-model parameters", f"{N / 1e9:.2f}B")
+    rep.note("(not the 67.1M above — that was one layer's four projections)")
+    rep.blank()
+    rep.note("Compute. Going back, each layer forms two products where going in")
+    rep.note("it formed one — dW = X.T @ dY, and dX = dY @ W.T for the layer")
+    rep.note("behind it — so the backward pass costs about twice the forward:")
+    rep.blank()
+    rep.table(
+        ["per token", "FLOPs", "why"],
+        [
+            ["inference", f"2N = {2 * N / 1e9:.1f} G", "one forward pass"],
+            ["training", f"6N = {6 * N / 1e9:.1f} G", "forward, then backward at ~2x"],
+        ],
+    )
+    rep.blank()
+    rep.note("Memory. This is where they really diverge — training has to keep")
+    rep.note("the optimizer's state alongside the weights:")
+    rep.blank()
+    running = 0
+    rows = []
+    for label, b in (("bf16 weights", 2), ("bf16 gradients", 2), ("fp32 master copy", 4),
+                     ("Adam moment m", 4), ("Adam moment v", 4)):
+        running += b
+        rows.append([label, f"{b} B/param", f"{N * b / 1e9:.1f} GB",
+                     f"{N * running / 1e9:.1f} GB"])
+    rep.table(["what", "cost", "size", "running total"], rows)
+    rep.blank()
+    rep.kv("inference needs", f"~2 B/param  = {2 * N / 1e9:.1f} GB")
+    rep.kv("training needs", f"~16 B/param = {16 * N / 1e9:.0f} GB, pre-activations")
+    rep.blank()
+    rep.note("So training costs 3x the arithmetic but 8x the memory. Which is why")
+    rep.note("a model you can serve on one accelerator can still need a cluster")
+    rep.note("to train — and why inference work is usually about moving bytes")
+    rep.note("rather than doing math.")
+
+    # --- against actual silicon --------------------------------------------
+    #
+    # Spec-sheet peaks for dense BF16 tensor-core math. Real kernels reach a
+    # fraction of these, but the ratio between compute and bandwidth is what
+    # matters here and it survives the discount.
+    gpus = (("A100 80GB", 80e9, 2.039e12, 312e12), ("H100 80GB", 80e9, 3.35e12, 990e12))
+    w_bytes = 2 * N
+    per_token_kv = 2 * 32 * 8 * 128 * 2  # Llama-3-8B, fp16: 128 KiB
+
+    rep.blank()
+    rep.note("Against real silicon — spec-sheet peaks, dense BF16:")
+    rep.blank()
+    rep.table(
+        ["GPU", "memory", "bandwidth", "BF16 compute"],
+        [[n, f"{m / 1e9:.0f} GB", f"{bw / 1e12:.2f} TB/s", f"{fl / 1e12:.0f} TFLOP/s"]
+         for n, m, bw, fl in gpus],
+    )
+    rep.blank()
+    # Weights are only the floor. What you can actually serve is decided by the
+    # KV cache, and GQA is the reason it is affordable: 8 kv heads, not 32.
+    rep.blank()
+    rep.note("SERVING — weights are the floor, KV cache is the ceiling:")
+    rep.blank()
+    rep.table(
+        ["stored as", "bytes/param", "weights"],
+        [[n, f"{b:g}", f"{N * b / 1e9:.1f} GB"]
+         for n, b in (("fp32", 4), ("bf16/fp16", 2), ("int8", 1), ("int4", 0.5))],
+    )
+    rep.blank()
+    mha_kv = 2 * 32 * 32 * 128 * 2          # the same cache without GQA
+    rep.kv("KV cache per token (GQA, 8 kv)", f"{per_token_kv / 1024:.0f} KiB")
+    rep.kv("  had it been MHA (32 kv)", f"{mha_kv / 1024:.0f} KiB — 4x worse")
+    rep.kv("KV per full 8k sequence", f"{per_token_kv * 8192 / 1024**3:.2f} GiB")
+    rep.blank()
+    # ~77 GB is what remains of a nominal 80 GB after CUDA context, cuBLAS
+    # workspaces and allocator fragmentation; leave ~3 GB for activations.
+    usable, act = 77e9, 3e9
+    kv_budget = usable - w_bytes - act
+    rep.kv("card, nominal / usable", f"80 GB / ~{usable / 1e9:.0f} GB")
+    rep.kv("  minus weights, workspace", f"{kv_budget / 1e9:.0f} GB left for KV")
+    rep.kv("  which buys", f"~{kv_budget / per_token_kv / 1000:.0f}k tokens of cache")
+    rep.blank()
+    rep.table(
+        ["context length", "concurrent sequences"],
+        [[f"{c // 1024}k", f"~{kv_budget / per_token_kv / c:.0f}"]
+         for c in (8192, 32768, 131072)],
+    )
+    rep.blank()
+    rep.note("TRAINING — the same card, the same model:")
+    rep.blank()
+    rep.kv("training state (16 B/param)", f"{16 * N / 1e9:.0f} GB")
+    rep.kv("  against usable", f"{usable / 1e9:.0f} GB — over by {(16 * N - usable) / 1e9:.0f} GB")
+    rep.kv("  activations, ckpt b=1 s=4096", f"{2 * 4096 * 4096 * 32 / 1e9:.1f} GB")
+    rep.kv("  logits, fp32 at seq 4096", f"{4096 * 128256 * 4 / 1e9:.1f} GB per sequence")
+
+    rep.blank()
+    rep.note("And the number that decides how fast you can generate. At batch 1")
+    rep.note("a decode step reads every weight once, so time it two ways:")
+    rep.blank()
+    rep.table(
+        ["GPU", "if compute-bound", "if bandwidth-bound", "gap"],
+        [[n,
+          f"{1 / ((2 * N) / fl):,.0f} tok/s",
+          f"{1 / (w_bytes / bw):,.0f} tok/s",
+          f"{(w_bytes / bw) / ((2 * N) / fl):.0f}x"]
+         for n, m, bw, fl in gpus],
+    )
+    rep.blank()
+    rep.note("Bandwidth wins by two orders of magnitude — the chip finishes the")
+    rep.note("arithmetic and then waits. Note it gets WORSE on the newer card:")
+    rep.note("H100 has 3.2x the compute of an A100 but only 1.6x the bandwidth,")
+    rep.note("so the gap roughly doubles. Post 2 is about living with this.")

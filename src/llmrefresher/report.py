@@ -15,6 +15,7 @@ enough to sit inside a Markdown code fence without wrapping on a phone.
 
 from __future__ import annotations
 
+import textwrap
 from typing import Iterable, Sequence
 
 from .device import hardware_info
@@ -69,7 +70,9 @@ class Report:
         def line(cells: Sequence[str]) -> str:
             out = [f"  {cells[0]:<{widths[0]}}"]
             out += [f"{c:>{widths[i]}}" for i, c in enumerate(cells[1:], start=1)]
-            return "  ".join(out)
+            # rstrip: a short or empty trailing cell otherwise pads the line with
+            # spaces, which show up as diff noise when output is pasted into a post.
+            return "  ".join(out).rstrip()
 
         print(line(list(headers)))
         print("  " + "-" * (sum(widths) + 2 * len(widths)))
@@ -77,9 +80,15 @@ class Report:
             print(line(row))
 
     def takeaway(self, text: str) -> None:
-        """The one sentence the demo exists to earn."""
+        """The one sentence the demo exists to earn.
+
+        Wrapped to WIDTH like everything else here. These run long by nature —
+        they are whole sentences, not table cells — and an unwrapped one blows
+        past 200 columns and breaks the fixed-width promise this module makes.
+        """
         print()
-        print(f"  >> {text}")
+        for i, line in enumerate(textwrap.wrap(text, width=WIDTH - 5)):
+            print(f"  {'>>' if i == 0 else '  '} {line}")
 
     # -- helpers -----------------------------------------------------------
 
