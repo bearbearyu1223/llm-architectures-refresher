@@ -79,12 +79,13 @@ def what_each_step_needs(rep: Report) -> None:
     each step reaches for, and that is fixed by causal masking alone.
     """
     words = ["The", "cat", "sat", "on", "the", "mat"]
-    rep.note("Generating from a 3-token prompt. At each step the model needs the")
+    prompt_len, steps = 3, 3
+    rep.note(f"Generating from a {prompt_len}-token prompt. At each step the model needs the")
     rep.note("new token's query, and the key and value of every token so far:")
     rep.blank()
     rows = []
-    for step in range(3):
-        n = 3 + step                      # tokens present before this step
+    for step in range(steps):
+        n = prompt_len + step             # tokens present before this step
         rows.append([
             step + 1,
             "[" + " ".join(words[:n]) + "]",
@@ -96,14 +97,32 @@ def what_each_step_needs(rep: Report) -> None:
     rep.table(["step", "sequence so far", "needs", "and", "and", "predicts"], rows)
     rep.blank()
 
-    # Count the reads. Q is read once per step (a diagonal); each K and V is
-    # read again by every later step (a triangle). That gap is the whole case.
-    steps = 3
-    q_reads = steps
-    kv_reads = sum(3 + s for s in range(steps))
-    rep.kv("Q vectors read, over 3 steps", q_reads)
-    rep.kv("K vectors read, over 3 steps", kv_reads)
-    rep.kv("of which are recomputations", kv_reads - (3 + steps - 1))
+    # Count what the table demands. Q is needed once per step (a diagonal); each
+    # K and V is needed again by every later step (a triangle). Print the two
+    # counts *and* the distinct total, because the interesting number is the
+    # difference between them and a reader cannot do that subtraction without
+    # being handed both halves.
+    per_step = [prompt_len + s for s in range(steps)]      # 3, 4, 5
+    kv_reads = sum(per_step)                               # 12
+    kv_distinct = per_step[-1]                             # 5: K1..K5
+    rep.note("Add up what that table asks for. Keys, step by step: "
+             + " + ".join(str(n) for n in per_step) + f" = {kv_reads}.")
+    rep.note(f"But only K1..K{kv_distinct} ever appear, so most of those are repeats:")
+    rep.blank()
+    rep.table(
+        ["tensor", f"needed over {steps} steps", "distinct vectors", "repeat reads"],
+        [
+            ["Q", steps, steps, 0],
+            ["K", kv_reads, kv_distinct, kv_reads - kv_distinct],
+            ["V", kv_reads, kv_distinct, kv_reads - kv_distinct],
+        ],
+    )
+    rep.blank()
+    rep.note("The last column is the whole argument. Zero for Q: nothing is ever")
+    rep.note("asked for twice, so a cache would have nothing to hand back. For K")
+    rep.note(f"and V it is {kv_reads - kv_distinct} — and without a cache every one of those is a key")
+    rep.note("or value vector being computed a second time, from a token that has")
+    rep.note("not changed since the first time.")
     rep.takeaway(
         "Every step recomputes keys and values the previous step already had. "
         "Q is used once and never again — which is why the thing is a KV cache "
