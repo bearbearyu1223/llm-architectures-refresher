@@ -57,11 +57,11 @@ def _gib(n_bytes: float) -> float:
 # claims accelerators need "roughly 100-300 FLOP/byte"; this is where that
 # range comes from rather than being asserted.
 ACCELERATORS = (
-    # name,            dense fp16 TFLOP/s,  HBM GB/s
-    ("A100 40GB SXM", 312.0, 1_555.0),
-    ("A100 80GB SXM", 312.0, 2_039.0),
-    ("H100 SXM", 989.0, 3_350.0),
-    ("H200 SXM", 989.0, 4_800.0),
+    # name,            dense fp16 TFLOP/s,  HBM GB/s,  HBM capacity GB
+    ("A100 40GB SXM", 312.0, 1_555.0, 40),
+    ("A100 80GB SXM", 312.0, 2_039.0, 80),
+    ("H100 SXM", 989.0, 3_350.0, 80),
+    ("H200 SXM", 989.0, 4_800.0, 141),
 )
 
 
@@ -567,7 +567,7 @@ def prefill_vs_decode(rep: Report, device: torch.device) -> dict[str, object]:
     rep.note("That 100-300 figure is the roofline ridge point — peak dense fp16")
     rep.note("throughput divided by HBM bandwidth. Vendor datasheet numbers:")
     rep.blank()
-    ridges = [(name, tflops, bw, tflops * 1_000 / bw) for name, tflops, bw in ACCELERATORS]
+    ridges = [(name, tflops, bw, tflops * 1_000 / bw) for name, tflops, bw, _ in ACCELERATORS]
     rep.table(
         ["accelerator", "dense fp16", "HBM bandwidth", "ridge point"],
         [[name, f"{tflops:.0f} TFLOP/s", f"{bw:,.0f} GB/s", f"{ridge:.0f} FLOP/byte"]
@@ -766,7 +766,7 @@ def compute_scaling(rep: Report) -> None:
     rep.blank()
     contexts = (128, 1_024, 8_192, 32_768)
     rows = []
-    for name, tflops, bw in (ACCELERATORS[1], ACCELERATORS[2]):
+    for name, tflops, bw, _ in (ACCELERATORS[1], ACCELERATORS[2]):
         flops, bw_bytes = tflops * 1e12, bw * 1e9
         cells = []
         for S in contexts:
@@ -791,6 +791,135 @@ def compute_scaling(rep: Report) -> None:
         "keeps binding, so decode stays memory-bound however many users you add. "
         "Compute binds on the other phase: prefill is compute-bound from batch 1, "
         "which is what caps how fast new prompts can be admitted."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Putting it together: sizing a real deployment
+# ---------------------------------------------------------------------------
+
+# How much of a card's HBM a serving stack can actually hand to the KV cache.
+# The rest goes to framework overhead, fragmentation, and the activation
+# working set. 90% before weights is a deliberately generous planning figure;
+# real stacks land lower.
+USABLE_FRACTION = 0.90
+ACTIVATION_HEADROOM = 2 * GIB
+
+
+def sizing_example(rep: Report) -> None:
+    """1,000 concurrent users, Llama-3.1-8B, 128k context. What does it take?
+
+    Everything the post has measured separately, pointed at one question. The
+    cache arithmetic of the size section fixes the memory; the traffic argument
+    of the sweep fixes the speed; the compute section says which of the two
+    binds. Nothing new is introduced here — it is the same three numbers
+    multiplied out at a scale a laptop cannot reach.
+    """
+    spec, bytes_per, users, ctx = LLAMA3_8B, 2, 1_000, 131_072
+    kv_per_user = spec.kv_bytes(ctx, bytes_per_elem=bytes_per)
+    weight_bytes = spec.weight_bytes(bytes_per)
+    total_kv = kv_per_user * users
+
+    rep.note(f"Serving Llama-3.1-8B to {users:,} concurrent users at {ctx // 1024}k context, fp16.")
+    rep.note("Same layer shapes as Llama-3-8B; only the context window differs.")
+    rep.blank()
+    rep.table(
+        ["what", "per user", f"x {users:,} users"],
+        [
+            ["KV cache", f"{_gib(kv_per_user):.2f} GiB", f"{_gib(total_kv) / 1024:.2f} TiB"],
+            ["model weights", "—", f"{_gib(weight_bytes):.2f} GiB per GPU"],
+        ],
+    )
+    rep.blank()
+    rep.note("The cache is three orders of magnitude larger than the model. So the")
+    rep.note("fleet is sized by cache, and the weights are a rounding error:")
+    rep.blank()
+
+    rows = []
+    for name, tflops, bw, hbm_gb in ACCELERATORS[1:]:
+        hbm = hbm_gb * 1e9
+        usable = hbm * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM
+        per_gpu = usable / kv_per_user
+        n_gpu = -(-users // max(per_gpu, 1e-9))  # ceil
+        # Capacity decides how many cards; bandwidth decides how fast each
+        # decode step clears. They are separate questions with separate answers,
+        # so print both rather than letting "GPUs needed" imply a token rate.
+        step_s = (kv_per_user * per_gpu + weight_bytes) / (bw * 1e9)
+        rows.append([name, f"{hbm_gb} GB", f"{_gib(usable):.0f} GiB",
+                     f"{per_gpu:.1f}", f"{int(n_gpu):,}", f"{1 / step_s:.0f}"])
+    rep.table(
+        ["accelerator", "HBM", "usable for KV", "users/GPU", "GPUs needed", "tok/s per user"],
+        rows,
+    )
+    rep.blank()
+    rep.note("Those last two columns answer different questions. Capacity sets the")
+    rep.note("fleet size: the A100 and the H100 need the same 320 cards because")
+    rep.note("they hold the same 80 GB. Bandwidth sets the token rate, and there")
+    rep.note("the H100 is worth 1.6x the A100 for an identical bill of materials.")
+    rep.blank()
+    rep.note("The H200 row is the one to think about. Twice the capacity halves the")
+    rep.note("fleet — and each user gets *slower*, because a card holding twice as")
+    rep.note("many caches re-reads twice as much of them on every step. Buying")
+    rep.note("capacity buys density, not speed; only bandwidth buys speed.")
+    rep.blank()
+    rep.note(f"Assumes {USABLE_FRACTION:.0%} of HBM is reachable before weights, minus")
+    rep.note(f"{_gib(ACTIVATION_HEADROOM):.0f} GiB of activation headroom. Real stacks land lower.")
+
+    # Can those GPUs actually keep up? At 128k every decode step re-reads the
+    # whole cache for every resident user, so KV traffic dwarfs the weight read
+    # that batching was supposed to amortize.
+    name, tflops, bw, hbm_gb = ACCELERATORS[2]  # H100
+    hbm = hbm_gb * 1e9
+    per_gpu = (hbm * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM) / kv_per_user
+    kv_read = kv_per_user * per_gpu
+    bytes_moved = kv_read + weight_bytes
+    step_s = bytes_moved / (bw * 1e9)
+    attn_flops = 4 * spec.n_heads * spec.head_dim * ctx * spec.n_layers
+    flops = (2 * spec.n_params * 1e9 + attn_flops) * per_gpu
+    compute_s = flops / (tflops * 1e12)
+
+    rep.blank()
+    rep.note(f"Now the speed, on one {name} holding {per_gpu:.1f} users' caches.")
+    rep.note("Every decode step re-reads all of them:")
+    rep.blank()
+    rep.table(
+        ["per decode step", "bytes or time", "share"],
+        [
+            ["KV cache read", f"{_gib(kv_read):.1f} GiB", f"{kv_read / bytes_moved:.0%}"],
+            ["weight read", f"{_gib(weight_bytes):.1f} GiB", f"{weight_bytes / bytes_moved:.0%}"],
+            ["time, memory-bound", f"{step_s * 1000:.1f} ms", "—"],
+            ["time, if compute-bound", f"{compute_s * 1000:.2f} ms", f"{compute_s / step_s:.1%} of the step"],
+        ],
+    )
+    rep.blank()
+    rep.kv("tokens/s per user", f"{1 / step_s:.0f}")
+    rep.kv("tokens/s per GPU", f"{per_gpu / step_s:.0f}")
+    rep.kv(f"tokens/s across {int(-(-users // max(per_gpu, 1e-9))):,} GPUs", f"{users / step_s:,.0f}")
+    rep.blank()
+    rep.note("Compute is a rounding error on the step — the 'never' column of the")
+    rep.note("previous section, seen from the deployment end.")
+
+    # The levers, in the order a serving team would reach for them.
+    rep.blank()
+    rep.note("What actually moves the GPU count:")
+    rep.blank()
+    levers = [
+        ("baseline — fp16 cache, full 128k", 2, ctx),
+        ("quantize the KV cache to fp8", 1, ctx),
+        ("cap context at 32k", 2, 32_768),
+        ("both", 1, 32_768),
+    ]
+    rows = []
+    for label, bp, c in levers:
+        kv = spec.kv_bytes(c, bytes_per_elem=bp)
+        usable = hbm * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM
+        n = -(-users // max(usable / kv, 1e-9))
+        rows.append([label, f"{_gib(kv):.2f} GiB", f"{usable / kv:.1f}", f"{int(n):,}"])
+    rep.table(["lever", "cache/user", "users/GPU", f"{name}s needed"], rows)
+    rep.takeaway(
+        "A 15 GiB model needs a fleet sized by 15.6 TiB of cache. Both levers "
+        "that matter shrink the cache rather than adding compute — which is the "
+        "whole argument of this post, arriving as a purchase order."
     )
 
 
@@ -1002,7 +1131,10 @@ def main() -> None:
     rep.section("9. How compute scales alongside it                      [post §7]")
     compute_scaling(rep)
 
-    rep.section("10. Figures")
+    rep.section("10. Sizing a real deployment                          [post §8]")
+    sizing_example(rep)
+
+    rep.section("11. Figures")
     make_figures(rep, quad, perf)
 
 
