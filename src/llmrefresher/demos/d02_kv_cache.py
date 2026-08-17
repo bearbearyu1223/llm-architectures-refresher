@@ -859,8 +859,67 @@ def sizing_example(rep: Report) -> None:
     rep.blank()
     rep.note("The H200 row is the one to think about. Twice the capacity halves the")
     rep.note("fleet — and each user gets *slower*, because a card holding twice as")
-    rep.note("many caches re-reads twice as much of them on every step. Buying")
-    rep.note("capacity buys density, not speed; only bandwidth buys speed.")
+    rep.note("many caches re-reads twice as much of them on every step:")
+    rep.blank()
+    cmp_rows = []
+    for cn, _, cbw, chbm in (ACCELERATORS[2], ACCELERATORS[3]):
+        cu = (chbm * 1e9 * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM) / kv_per_user
+        cr = kv_per_user * cu + weight_bytes
+        cs = cr / (cbw * 1e9)
+        cmp_rows.append([cn, f"{_gib(kv_per_user):.0f} x {cu:.2f} + {_gib(weight_bytes):.2f}",
+                         f"{_gib(cr):.2f} GiB", f"{cbw:,.0f} GB/s",
+                         f"{cs * 1000:.2f} ms", f"{1 / cs:.0f}"])
+    rep.table(["card", "bytes per step", "=", "bandwidth", "step", "tok/s"], cmp_rows)
+    rep.blank()
+    # The fixed subtractions are why usable capacity outruns raw capacity, and
+    # the fixed weight read is why bytes-per-step lags behind usable capacity.
+    h_use = ACCELERATORS[2][3] * 1e9 * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM
+    n_use = ACCELERATORS[3][3] * 1e9 * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM
+    h_read = kv_per_user * (h_use / kv_per_user) + weight_bytes
+    n_read = kv_per_user * (n_use / kv_per_user) + weight_bytes
+    rep.kv("raw HBM, H100 -> H200", f"+{(ACCELERATORS[3][3] / ACCELERATORS[2][3] - 1) * 100:.0f}%")
+    rep.kv("usable for KV", f"+{(n_use / h_use - 1) * 100:.0f}%")
+    rep.kv("bytes moved per step", f"+{(n_read / h_read - 1) * 100:.0f}%")
+    rep.kv("bandwidth", f"+{(ACCELERATORS[3][2] / ACCELERATORS[2][2] - 1) * 100:.0f}%")
+    rep.blank()
+    rep.note("Usable capacity outruns raw capacity, because the weights and the")
+    rep.note("headroom come off once whatever the card. Bytes per step then lags")
+    rep.note("usable capacity, because the weight read is shared. And bandwidth")
+    rep.note("grows slowest of all — which is the whole of why the step got longer.")
+    rep.note("Capacity buys density, not speed; only bandwidth buys speed.")
+
+    # Work one row through by hand. The columns above are three chained
+    # formulas, and a reader who cannot reproduce them has to take the fleet
+    # size on trust — which is the one thing this post is trying not to ask for.
+    ref_name, _, ref_bw, ref_hbm = ACCELERATORS[2]  # H100
+    ref_usable = ref_hbm * 1e9 * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM
+    ref_per_gpu = ref_usable / kv_per_user
+    ref_read = kv_per_user * ref_per_gpu + weight_bytes
+    ref_step = ref_read / (ref_bw * 1e9)
+    rep.blank()
+    rep.note(f"Those columns are three chained formulas. Worked through for {ref_name}:")
+    rep.blank()
+    rep.table(
+        ["column", "arithmetic", "result"],
+        [
+            ["usable for KV",
+             f"{ref_hbm}e9 x {USABLE_FRACTION:.2f} - {_gib(weight_bytes):.2f} - {_gib(ACTIVATION_HEADROOM):.2f}",
+             f"{_gib(ref_usable):.2f} GiB"],
+            ["users/GPU", f"{_gib(ref_usable):.2f} / {_gib(kv_per_user):.2f}", f"{ref_per_gpu:.2f}"],
+            ["GPUs needed", f"ceil({users:,} / {ref_per_gpu:.2f})", f"{int(-(-users // ref_per_gpu)):,}"],
+            ["bytes per step",
+             f"{_gib(kv_per_user):.0f} x {ref_per_gpu:.2f} + {_gib(weight_bytes):.2f}",
+             f"{_gib(ref_read):.2f} GiB"],
+            ["step time", f"{_gib(ref_read):.2f} GiB / {ref_bw:,.0f} GB/s", f"{ref_step * 1000:.2f} ms"],
+            ["tok/s per user", f"1 / {ref_step * 1000:.2f} ms", f"{1 / ref_step:.1f}"],
+        ],
+    )
+    rep.blank()
+    rep.note("Two facts do the work in the last three rows. Every decode step")
+    rep.note("re-reads each resident user's *whole* cache, because attention at any")
+    rep.note("step attends over every earlier position — that is the multiplication")
+    rep.note("by users/GPU. And one step emits one token for every resident user at")
+    rep.note("once, so a single user sees 1/step while the card sees users/step.")
     rep.blank()
     rep.note(f"Assumes {USABLE_FRACTION:.0%} of HBM is reachable before weights, minus")
     rep.note(f"{_gib(ACTIVATION_HEADROOM):.0f} GiB of activation headroom. Real stacks land lower.")
