@@ -18,6 +18,9 @@ Claims from the post, each with a receipt:
 6. Batching raises throughput almost for free, until it doesn't: weight traffic
    is flat in batch and KV traffic is linear in it, so past a crossover the term
    batching cannot amortize becomes the majority of memory traffic.
+7. Compute scales with batch too and never amortizes either — but attention over
+   the cache runs at an arithmetic intensity of exactly the GQA group size, so
+   past a short context no batch size makes decode compute-bound.
 
 Run: ``uv run demo02``
 """
@@ -694,6 +697,104 @@ def batch_sweep(rep: Report, device: torch.device, ctx: dict[str, object]) -> di
 
 
 # ---------------------------------------------------------------------------
+# The third term: compute
+# ---------------------------------------------------------------------------
+
+
+def compute_scaling(rep: Report) -> None:
+    """Where compute enters the batch story, and why it usually doesn't.
+
+    The sweep above pits KV traffic against weight traffic — but both are
+    memory, and neither accounts for the arithmetic itself. Compute scales with
+    batch exactly as KV traffic does: one pass through the weights per
+    sequence, shared with nobody. So the question is not whether it grows, but
+    whether it grows fast enough to bind before bandwidth does.
+
+    Analytic rather than measured: model shapes and datasheet peaks, the same
+    footing as the ridge-point table, and labelled as such. The laptop cannot
+    reach the batch sizes where the answer changes.
+    """
+    spec, bytes_per = LLAMA3_8B, 2  # fp16
+    weight_bytes = spec.weight_bytes(bytes_per)
+    kv_per_token = 2 * spec.n_layers * spec.n_kv_heads * spec.head_dim * bytes_per
+
+    rep.note("Per decode step at batch B there are three terms, and only the")
+    rep.note("first of them is shared:")
+    rep.blank()
+    rep.table(
+        ["term", "scales as", "shared across users?"],
+        [
+            ["weight reads", f"{_gib(weight_bytes):.1f} GiB, flat", "yes — one copy feeds everybody"],
+            ["weight matmuls", "2 x params x B", "no — one pass per sequence"],
+            ["KV cache reads", f"{kv_per_token // 1024} KiB x S x B", "no — one cache per sequence"],
+        ],
+    )
+    rep.blank()
+    rep.note("Batching amortizes the first and multiplies the other two. So the")
+    rep.note("plateau in the sweep above could be either of them — bandwidth or")
+    rep.note("arithmetic. Which one arrives first is what this section settles.")
+
+    # Attention over the cache re-reads the whole thing every step. Both its
+    # FLOPs and its bytes scale with B and S, so the ratio is a constant of the
+    # architecture: 2*n_heads / (n_kv_heads * bytes). In fp16 that is exactly
+    # the GQA group size.
+    rep.blank()
+    rep.note("Start with attention over the cache, which is the part that reads")
+    rep.note("KV. Its FLOPs and its bytes both scale with B and with S, so those")
+    rep.note("cancel and its arithmetic intensity is a constant of the design:")
+    rep.blank()
+    rows = []
+    for label, s in (("as MHA", spec.as_mha()), ("Llama-3-8B (GQA)", spec), ("as MQA", spec.as_mqa())):
+        rows.append([
+            label, s.n_kv_heads, s.n_heads // s.n_kv_heads,
+            f"{2 * s.n_heads / (s.n_kv_heads * bytes_per):.1f}",
+        ])
+    rep.table(["variant", "kv heads", "q heads per kv head", "FLOP/byte"], rows)
+    rep.blank()
+    rep.note("That column is the grouping ratio, and nothing else. Sharing K/V")
+    rep.note("heads does not only shrink the cache — it raises the arithmetic")
+    rep.note("intensity of every read from it, by the same factor.")
+
+    # Crossover. compute_time(B) = memory_time(B), solved for B:
+    #   B * (2P + attn(S)) / FLOPS = (W + kv*S*B) / BW
+    #   B = FLOPS * W / [ (2P + attn(S)) * BW  -  FLOPS * kv * S ]
+    # A non-positive denominator means KV traffic grows at least as fast as the
+    # arithmetic does, so no batch size ever gets you there.
+    rep.blank()
+    rep.note("Now solve for the batch where the matmuls take longer than the")
+    rep.note("bytes take to arrive — where decode stops being memory-bound:")
+    rep.blank()
+    contexts = (128, 1_024, 8_192, 32_768)
+    rows = []
+    for name, tflops, bw in (ACCELERATORS[1], ACCELERATORS[2]):
+        flops, bw_bytes = tflops * 1e12, bw * 1e9
+        cells = []
+        for S in contexts:
+            attn = 4 * spec.n_heads * spec.head_dim * S * spec.n_layers
+            denom = (2 * spec.n_params * 1e9 + attn) * bw_bytes - flops * kv_per_token * S
+            cells.append(f"{flops * weight_bytes / denom:,.0f}" if denom > 0 else "never")
+        rows.append([name, f"{flops / bw_bytes:.0f}", *cells])
+    rep.table(
+        ["accelerator", "ridge", *[f"S={c // 1024}k" if c >= 1024 else f"S={c}" for c in contexts]],
+        rows,
+    )
+    rep.blank()
+    rep.note("At a short context the answer is a real batch size, and it lands")
+    rep.note("near the ridge point — no coincidence: the weight term's intensity")
+    rep.note("is 2B/bytes, which in fp16 is just B. Past a thousand tokens of")
+    rep.note("context the answer is 'never': the KV read is only 4 FLOP/byte, so")
+    rep.note("every user you add brings more bytes than arithmetic, and the gap")
+    rep.note("to the ridge widens rather than closes.")
+    rep.takeaway(
+        "Compute does scale with users — it never amortizes, exactly like KV "
+        "traffic. But at any real context length the cache read binds first and "
+        "keeps binding, so decode stays memory-bound however many users you add. "
+        "Compute binds on the other phase: prefill is compute-bound from batch 1, "
+        "which is what caps how fast new prompts can be admitted."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Figures
 # ---------------------------------------------------------------------------
 
@@ -898,7 +999,10 @@ def main() -> None:
     rep.section("8. The batch sweep, and where it stops working        [post §7]")
     perf = batch_sweep(rep, device, ctx)
 
-    rep.section("9. Figures")
+    rep.section("9. How compute scales alongside it                      [post §7]")
+    compute_scaling(rep)
+
+    rep.section("10. Figures")
     make_figures(rep, quad, perf)
 
 
