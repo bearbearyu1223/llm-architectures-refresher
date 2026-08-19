@@ -1112,6 +1112,91 @@ def figure_cache_size(theme: Theme) -> Path:
         return save_both(fig, SLUG, "cache-size", theme)
 
 
+def figure_roofline(theme: Theme) -> Path:
+    """The roofline, with prefill and decode placed on it.
+
+    §6 states this shape in prose — a line that climbs while memory is the
+    constraint, then flattens once arithmetic is — and quotes a ridge point and
+    two operating points against it. Numbers alone undersell the result: 0.5 and
+    256 read as "small and large", where the picture shows decode is not a
+    little under the ceiling but three orders of magnitude below it.
+
+    Both points sit *on* the roof, which is the honest placement. A
+    memory-bound kernel is not failing to reach its ceiling — the sloped part of
+    the roof *is* its ceiling, and it is desperately low.
+
+    A100 80GB SXM, dense fp16: 312 TFLOP/s against 2,039 GB/s.
+    """
+    peak_tflops, bw_gbs = 312.0, 2039.0
+    slope = bw_gbs / 1000.0                     # TFLOP/s gained per FLOP/byte
+    ridge = peak_tflops / slope                 # 153 FLOP/byte
+    xs = [10 ** (i / 60) for i in range(-60, 241)]   # 0.1 .. 10^4
+    roof = [min(peak_tflops, slope * x) for x in xs]
+
+    decode_x, prefill_x = 0.5, 256.0
+    decode_y = slope * decode_x
+    prefill_y = min(peak_tflops, slope * prefill_x)
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(7.6, 4.8))
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlim(0.1, 1e4)
+        ax.set_ylim(0.08, 1_200)
+
+        # Everything under the roof is attainable; everything above it is not.
+        ax.fill_between(xs, 0.08, roof, color=theme.grid, alpha=0.55, zorder=0)
+        ax.plot(xs, roof, color=theme.ink, linewidth=2.2, zorder=4,
+                solid_joinstyle="miter")
+
+        # The ridge: where the two ceilings meet.
+        ax.axvline(ridge, color=theme.muted, linewidth=1.1, linestyle=(0, (4, 3)), zorder=2)
+        ax.text(ridge * 1.18, 0.30, f"ridge point\n{ridge:.0f} FLOP/byte",
+                color=theme.secondary, fontsize=9.5, va="bottom", ha="left")
+
+        # Which constraint owns which half of the roof. Each label sits above
+        # its own segment, clear of the roof line itself.
+        ax.text(1.3, 110, "memory-bound\nbytes can't arrive fast enough",
+                color=theme.muted, fontsize=9.5, ha="center", va="center")
+        ax.text(1.5e3, 640, "compute-bound\narithmetic units saturated",
+                color=theme.muted, fontsize=9.5, ha="center", va="center")
+
+        # The two operating points, both sitting on the roof. prefill's label
+        # goes below-right: at 312 TFLOP/s it would otherwise hit the title.
+        # Everything about decode goes right of its marker: the roof passes
+        # straight through the space above and below it, and the band underneath
+        # is spoken for by the ridge arrow.
+        ax.plot([decode_x], [decode_y], marker="o", markersize=9, color=theme.series[0],
+                markeredgecolor=theme.surface, markeredgewidth=1.8, zorder=6)
+        ax.annotate(f"decode · {decode_x:g} FLOP/byte", (decode_x, decode_y),
+                    textcoords="offset points", xytext=(16, -18), ha="left",
+                    color=theme.series[0], fontsize=10.5, fontweight="bold", zorder=6)
+
+        ax.plot([prefill_x], [prefill_y], marker="o", markersize=9, color=theme.series[1],
+                markeredgecolor=theme.surface, markeredgewidth=1.8, zorder=6)
+        ax.annotate(f"prefill\n{prefill_x:g} FLOP/byte", (prefill_x, prefill_y),
+                    textcoords="offset points", xytext=(14, -30), ha="left",
+                    color=theme.series[1], fontsize=10.5, fontweight="bold", zorder=6)
+
+        # The gap the post quotes as "306x short of the ridge". Sits low, in the
+        # empty band under the slope, so the arrow crosses nothing.
+        ax.annotate("", xy=(ridge, 0.135), xytext=(decode_x, 0.135),
+                    arrowprops=dict(arrowstyle="<->", color=theme.secondary, lw=1.2))
+        ax.text((decode_x * ridge) ** 0.5, 0.152, f"{ridge / decode_x:.0f}x short of the ridge",
+                color=theme.secondary, fontsize=9.5, ha="center", va="bottom")
+
+        # What that costs, in the units the chip is sold in — stacked directly
+        # under the decode tag so the two read as one annotation.
+        ax.annotate(f"{decode_y:.1f} of {peak_tflops:.0f} TFLOP/s — {decode_y / peak_tflops:.1%} of the chip",
+                    (decode_x, decode_y), textcoords="offset points", xytext=(16, -34),
+                    ha="left", va="center", color=theme.secondary, fontsize=9, zorder=6)
+
+        ax.set_xlabel("arithmetic intensity (FLOPs performed per byte fetched)")
+        ax.set_ylabel("achievable throughput (TFLOP/s, log)")
+        ax.set_title("Below the ridge, the ceiling is bandwidth — not the chip's arithmetic")
+        return save_both(fig, SLUG, "roofline", theme)
+
+
 def figure_batch_sweep(data: dict[str, list], theme: Theme) -> Path:
     """Two panels: latency and throughput have different units, so never one axis."""
     short = data["sweeps"]["32"]
@@ -1151,7 +1236,8 @@ def figure_batch_sweep(data: dict[str, list], theme: Theme) -> Path:
 def make_figures(rep: Report, quad: list[dict[str, float]], perf: dict[str, list]) -> None:
     for theme in THEMES:
         for path in (figure_why_cache(theme), figure_quadratic(quad, theme),
-                     figure_cache_size(theme), figure_batch_sweep(perf, theme)):
+                     figure_cache_size(theme), figure_roofline(theme),
+                     figure_batch_sweep(perf, theme)):
             rep.note(f"wrote {path.relative_to(path.parents[2])}")
 
 
