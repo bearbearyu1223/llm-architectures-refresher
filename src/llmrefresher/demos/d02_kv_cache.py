@@ -693,7 +693,13 @@ def batch_sweep(rep: Report, device: torch.device, ctx: dict[str, object]) -> di
         "With a long prefix the gain shrinks, because KV traffic scales with batch "
         "while weight traffic does not. That is the whole economics of serving."
     )
-    return {"sweeps": {str(k): v for k, v in sweeps.items()}}
+    return {
+        "sweeps": {str(k): v for k, v in sweeps.items()},
+        "weight_bytes": weight_bytes,
+        "kv_per_token": 2 * cfg.n_layers * cfg.n_kv_heads * cfg.head_dim * 4,
+        "prefixes": list(sweeps),
+        "batches": list(batches),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1197,6 +1203,66 @@ def figure_roofline(theme: Theme) -> Path:
         return save_both(fig, SLUG, "roofline", theme)
 
 
+def figure_traffic_crossover(data: dict[str, object], theme: Theme) -> Path:
+    """Why the sweep plateaus: two traffic terms, one flat and one not.
+
+    The sweep's own figure shows latency and throughput — the symptoms. This
+    draws the cause. Weight traffic is a horizontal line because one copy of the
+    weights serves the whole batch; KV traffic is a diagonal because every
+    sequence brings its own cache. Where the diagonal crosses the horizontal is
+    where batching stops being cheap.
+
+    The two prompt lengths make the point that the crossover is not a property
+    of the model but of how much context each user carries: sixteen times the
+    context moves the crossing sixteen times earlier.
+    """
+    weight_bytes = float(data["weight_bytes"])          # type: ignore[arg-type]
+    kv_per_token = float(data["kv_per_token"])          # type: ignore[arg-type]
+    prefixes = [int(p) for p in data["prefixes"]]       # type: ignore[union-attr]
+    swept = [int(b) for b in data["batches"]]           # type: ignore[union-attr]
+
+    batches = [2 ** (i / 8) for i in range(0, 89)]      # 1 .. 1024, smooth on log2
+    weights_gib = weight_bytes / GIB
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(7.6, 4.6))
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+
+        # The span the sweep in this section actually covered. Everything to the
+        # right is extrapolation, and saying so is cheaper than being asked.
+        ax.axvspan(swept[0], swept[-1], color=theme.grid, alpha=0.55, zorder=0)
+        ax.text((swept[0] * swept[-1]) ** 0.5, 4.2e-4, f"measured here\nbatch {swept[0]}-{swept[-1]}",
+                color=theme.muted, fontsize=9, ha="center", va="bottom", zorder=2)
+
+        # Weights: one copy, however many users. A flat reference line.
+        ax.axhline(weights_gib, color=theme.muted, linewidth=1.4, linestyle=(0, (4, 3)), zorder=3)
+        ax.text(1.15, weights_gib * 1.25, f"model weights — {weights_gib:.2f} GiB, flat in batch",
+                color=theme.secondary, fontsize=9.5, va="bottom", zorder=3)
+
+        # KV: one cache per user, so a straight line through the origin on log-log.
+        for prefix, color in zip(prefixes, theme.series):
+            gib = [kv_per_token * prefix * b / GIB for b in batches]
+            ax.plot(batches, gib, color=color, linewidth=2.0, zorder=4,
+                    label=f"KV cache, {prefix}-token prompt")
+
+            crossing = weight_bytes / (kv_per_token * prefix)
+            ax.plot([crossing], [weights_gib], marker="o", markersize=9, color=color,
+                    markeredgecolor=theme.surface, markeredgewidth=1.8, zorder=6)
+            ax.annotate(f"batch {crossing:.0f}", (crossing, weights_gib),
+                        textcoords="offset points", xytext=(0, -30), ha="center",
+                        color=color, fontsize=10.5, fontweight="bold", zorder=6)
+
+        ax.set_xlim(1, 1024)
+        ax.set_ylim(3e-4, 30)
+        ax.set_xticks(swept + [128, 512], [str(b) for b in swept] + ["128", "512"])
+        ax.set_xlabel("batch size (conversations served at once)")
+        ax.set_ylabel("bytes moved per decode step (GiB, log)")
+        ax.set_title("Weight traffic is flat in batch. KV traffic is not.")
+        ax.legend(loc="upper left", framealpha=0.0)
+        return save_both(fig, SLUG, "traffic-crossover", theme)
+
+
 def figure_batch_sweep(data: dict[str, list], theme: Theme) -> Path:
     """Two panels: latency and throughput have different units, so never one axis."""
     short = data["sweeps"]["32"]
@@ -1237,7 +1303,8 @@ def make_figures(rep: Report, quad: list[dict[str, float]], perf: dict[str, list
     for theme in THEMES:
         for path in (figure_why_cache(theme), figure_quadratic(quad, theme),
                      figure_cache_size(theme), figure_roofline(theme),
-                     figure_batch_sweep(perf, theme)):
+                     figure_batch_sweep(perf, theme),
+                     figure_traffic_crossover(perf, theme)):
             rep.note(f"wrote {path.relative_to(path.parents[2])}")
 
 
