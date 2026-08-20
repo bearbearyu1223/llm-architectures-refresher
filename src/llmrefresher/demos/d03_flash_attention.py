@@ -53,7 +53,9 @@ def _mib(n: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def online_softmax(x: torch.Tensor, block_size: int) -> torch.Tensor:
+def online_softmax(
+    x: torch.Tensor, block_size: int, trace: list[dict[str, float]] | None = None
+) -> torch.Tensor:
     """Softmax over the last dim, seeing only ``block_size`` entries at a time.
 
     The textbook stable softmax needs the global maximum before it can
@@ -67,6 +69,10 @@ def online_softmax(x: torch.Tensor, block_size: int) -> torch.Tensor:
     The correction factor ``exp(m_old - m_new)`` retroactively rebases every term
     already accumulated. This is the entire mathematical content of Flash
     Attention; everything else is memory choreography.
+
+    Pass ``trace`` to have each block append its statistics to it. The figure
+    plots that, so what is drawn is this loop's own numbers rather than a
+    re-derivation of them.
     """
     *lead, n = x.shape
     m = torch.full((*lead, 1), float("-inf"), device=x.device, dtype=x.dtype)
@@ -76,8 +82,18 @@ def online_softmax(x: torch.Tensor, block_size: int) -> torch.Tensor:
     for start in range(0, n, block_size):
         block = x[..., start : start + block_size]
         m_new = torch.maximum(m, block.max(dim=-1, keepdim=True).values)
-        l = l * torch.exp(m - m_new) + torch.exp(block - m_new).sum(dim=-1, keepdim=True)
+        correction = torch.exp(m - m_new)
+        l = l * correction + torch.exp(block - m_new).sum(dim=-1, keepdim=True)
         m = m_new
+        if trace is not None:
+            trace.append(
+                {
+                    "block_max": block.max(dim=-1).values.flatten()[0].item(),
+                    "running_max": m.flatten()[0].item(),
+                    "correction": correction.flatten()[0].item(),
+                    "running_sum": l.flatten()[0].item(),
+                }
+            )
 
     # Pass 2: with the final statistics, each block normalizes independently.
     out = torch.empty_like(x)
@@ -87,7 +103,7 @@ def online_softmax(x: torch.Tensor, block_size: int) -> torch.Tensor:
     return out
 
 
-def check_online_softmax(rep: Report, device: torch.device) -> None:
+def check_online_softmax(rep: Report, device: torch.device) -> list[dict[str, float]]:
     torch.manual_seed(0)
     x = torch.randn(4, 2048, device=device) * 8  # wide spread: stresses stability
     reference = torch.softmax(x, dim=-1)
@@ -96,8 +112,10 @@ def check_online_softmax(rep: Report, device: torch.device) -> None:
     rep.blank()
 
     rows = []
+    trace: list[dict[str, float]] = []
     for block in (64, 128, 512, 2048):
-        got = online_softmax(x, block)
+        # The 64-wide pass also records its running statistics; the figure draws them.
+        got = online_softmax(x, block, trace=trace if block == 64 else None)
         rows.append([block, (got - reference).abs().max().item(), got.sum(-1).mean().item()])
 
     rep.table(["block size", "max |online - torch|", "rows sum to"], rows)
@@ -105,7 +123,7 @@ def check_online_softmax(rep: Report, device: torch.device) -> None:
 
     # Why the max subtraction is in there at all. It is tempting to claim the
     # naive exp(x)/sum(exp(x)) blows up on these logits — it does not, in fp32.
-    # exp overflows fp32 only past x ~ 88.7, and a row max near 33 is nowhere
+    # exp overflows fp32 only past x ~ 88.7, and a row max near 30 is nowhere
     # close. In fp16 the threshold is x ~ 11.1, and the same logits overflow
     # immediately. So the honest statement is that stability is a *precision*
     # question, and inference runs in the precision where it bites.
@@ -141,6 +159,7 @@ def check_online_softmax(rep: Report, device: torch.device) -> None:
         "rescale makes partial softmaxes composable, and the running max is what "
         "keeps them representable once the precision drops."
     )
+    return trace
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +380,7 @@ def memory_scaling(rep: Report, device: torch.device) -> list[dict[str, float]]:
     return rows
 
 
-def flops_vs_bytes(rep: Report, device: torch.device) -> None:
+def flops_vs_bytes(rep: Report, device: torch.device) -> list[dict[str, float]]:
     """The post's subtitle claim: the win is memory traffic, not arithmetic.
 
     Everything else in this demo measures one side or the other — §3 measures
@@ -382,6 +401,7 @@ def flops_vs_bytes(rep: Report, device: torch.device) -> None:
     batch, heads, dim = 1, 8, 64
     block = 128
 
+    figure_rows: list[dict[str, float]] = []
     for causal in (False, True):
         rows = []
         for seq in (512, 1024, 2048, 4096):
@@ -392,6 +412,17 @@ def flops_vs_bytes(rep: Report, device: torch.device) -> None:
             naive_flops = 2 * (2 * batch * heads * seq * seq * dim)
             # Score bytes crossing HBM: write S, read S, write P, read P.
             naive_score_bytes = 4 * batch * heads * seq * seq * 4
+
+            if not causal:  # the figure draws the non-causal case, where the FLOPs match
+                figure_rows.append(
+                    {
+                        "seq": seq,
+                        "naive_flops": naive_flops,
+                        "tiled_flops": c["matmul_flops"],
+                        "naive_score_bytes": naive_score_bytes,
+                        "tiled_score_bytes": 0,
+                    }
+                )
 
             rows.append([
                 seq,
@@ -421,6 +452,7 @@ def flops_vs_bytes(rep: Report, device: torch.device) -> None:
         "it is why the win grows with sequence length: FLOPs and traffic both "
         "scale as n^2, but only one of them is still being paid."
     )
+    return figure_rows
 
 
 def causal_skipping(rep: Report, device: torch.device) -> None:
@@ -478,6 +510,100 @@ def timing(rep: Report, device: torch.device) -> list[dict[str, float]]:
 # ---------------------------------------------------------------------------
 # 5. Figures
 # ---------------------------------------------------------------------------
+
+
+def figure_online_softmax(trace: list[dict[str, float]], theme: Theme) -> Path:
+    """The running max stepping up, and what that costs the accumulated history.
+
+    Top panel: each block's own max against the running max. Bottom: the
+    correction factor ``exp(m_old - m_new)`` applied to everything accumulated so
+    far. It is exactly 1 for every block that fails to raise the max — most of
+    them, and increasingly so as the running max settles.
+
+    Block 0 is left out of the bottom panel: it initializes the max from -inf,
+    so its "correction" is exp(-inf) = 0 rather than a rescale of real history.
+    """
+    idx = list(range(len(trace)))
+    block_max = [t["block_max"] for t in trace]
+    running_max = [t["running_max"] for t in trace]
+    corr_idx, corr = idx[1:], [t["correction"] for t in trace[1:]]
+    deepest = min(range(len(corr)), key=lambda i: corr[i])
+    floor = 10 ** int(math.floor(math.log10(min(corr))))
+
+    with styled(theme):
+        fig, (ax_top, ax_bot) = plt.subplots(
+            2, 1, figsize=(7.8, 5.8), sharex=True, gridspec_kw={"height_ratios": [1.1, 1]}
+        )
+
+        ax_top.vlines(idx, min(block_max) - 2, block_max, color=theme.axis, linewidth=1.1)
+        ax_top.scatter(idx, block_max, color=theme.muted, s=22, zorder=3, label="this block's own max")
+        ax_top.step(idx, running_max, where="post", color=theme.series[0], label="running max $m$")
+        ax_top.text(idx[-1] + 0.5, running_max[-1], "running max", color=theme.series[0],
+                    fontsize=10.5, fontweight="bold", va="center")
+        ax_top.set_ylim(min(block_max) - 2, max(running_max) + 6.5)
+        ax_top.set_xlim(-1.2, idx[-1] + 4.0)
+        ax_top.set_ylabel("logit")
+        ax_top.set_title("A block only costs a rescale if it beats every block before it")
+        ax_top.legend(loc="upper left", fontsize=9.5)
+
+        ax_bot.axhline(1.0, color=theme.muted, linestyle="--", linewidth=1.4)
+        ax_bot.text(-0.8, 1.35, "no rescale needed  ($e^0 = 1$)", color=theme.muted,
+                    fontsize=9.5, va="bottom", ha="left")
+        ax_bot.vlines(corr_idx, floor, corr, color=theme.axis, linewidth=1.1)
+        ax_bot.scatter(corr_idx, corr, color=theme.series[1], s=26, zorder=3)
+        ax_bot.annotate(
+            f"×{corr[deepest]:.3f} — one multiply\nrebases the whole history",
+            (corr_idx[deepest], corr[deepest]), textcoords="offset points", xytext=(10, 4),
+            color=theme.series[1], fontsize=9.5, fontweight="bold", va="bottom", ha="left",
+        )
+        ax_bot.set_yscale("log")
+        ax_bot.set_ylim(floor, 6.0)
+        ax_bot.set_xlabel("key/value block, streamed in order")
+        ax_bot.set_ylabel("correction $e^{m_{old}-m_{new}}$")
+
+        fig.align_ylabels([ax_top, ax_bot])
+        return save_both(fig, SLUG, "online-softmax", theme)
+
+
+def figure_flops_vs_traffic(rows: list[dict[str, float]], theme: Theme) -> Path:
+    """Identical arithmetic, and the traffic that only one path pays.
+
+    Two measures on different scales, so two panels — the contrast between the
+    panels is the point, and a shared axis would hide it. Non-causal data, where
+    the two paths provably do the same arithmetic.
+    """
+    seqs = [int(r["seq"]) for r in rows]
+    xs = list(range(len(seqs)))
+    w = 0.38
+
+    with styled(theme):
+        fig, (ax_f, ax_t) = plt.subplots(1, 2, figsize=(9.8, 4.2))
+
+        for ax, naive_key, tiled_key, title, ylabel, scale in (
+            (ax_f, "naive_flops", "tiled_flops", "Arithmetic: identical",
+             "GFLOP per forward pass", 1e9),
+            (ax_t, "naive_score_bytes", "tiled_score_bytes", "Score traffic to HBM: only one path pays",
+             "MiB moved per forward pass", MIB),
+        ):
+            naive = [r[naive_key] / scale for r in rows]
+            tiled = [r[tiled_key] / scale for r in rows]
+            ax.bar([i - w / 2 for i in xs], naive, w, color=theme.series[1], label="naive")
+            ax.bar([i + w / 2 for i in xs], tiled, w, color=theme.series[0], label="tiled")
+            ax.set_xticks(xs, [str(n) for n in seqs])
+            ax.set_xlabel("sequence length")
+            ax.set_ylabel(ylabel)
+            ax.set_title(title, fontsize=11.5)
+            ax.set_ylim(0, max(naive) * 1.28)
+            for i, (a, b) in enumerate(zip(naive, tiled)):
+                if b == 0:
+                    ax.text(i + w / 2, max(naive) * 0.015, "0", color=theme.series[0],
+                            fontsize=10.5, fontweight="bold", ha="center", va="bottom")
+                else:
+                    ax.text(i, a * 1.05, "1.00×", color=theme.secondary, fontsize=9.5, ha="center")
+            ax.legend(loc="upper left", fontsize=9.5)
+
+        fig.tight_layout()
+        return save_both(fig, SLUG, "flops-vs-traffic", theme)
 
 
 def figure_memory(rows: list[dict[str, float]], theme: Theme) -> Path:
@@ -560,9 +686,15 @@ def figure_tiling(theme: Theme) -> Path:
         return save_both(fig, SLUG, "tiling", theme)
 
 
-def make_figures(rep: Report, mem_rows, time_rows) -> None:
+def make_figures(rep: Report, softmax_trace, mem_rows, flop_rows, time_rows) -> None:
     for theme in THEMES:
-        for path in (figure_memory(mem_rows, theme), figure_timing(time_rows, theme), figure_tiling(theme)):
+        for path in (
+            figure_online_softmax(softmax_trace, theme),
+            figure_memory(mem_rows, theme),
+            figure_tiling(theme),
+            figure_flops_vs_traffic(flop_rows, theme),
+            figure_timing(time_rows, theme),
+        ):
             rep.note(f"wrote {path.relative_to(path.parents[2])}")
 
 
@@ -575,7 +707,7 @@ def main() -> None:
     rep.header()
 
     rep.section("1. Online softmax: partial softmaxes that compose     [post §2-3]")
-    check_online_softmax(rep, device)
+    softmax_trace = check_online_softmax(rep, device)
 
     rep.section("2. Tiled attention reproduces the reference exactly   [post §4-5]")
     check_exactness(rep, device)
@@ -583,17 +715,17 @@ def main() -> None:
     rep.section("3. The memory that is never allocated                   [post §6]")
     mem_rows = memory_scaling(rep, device)
 
-    rep.section("4. Same arithmetic, different bytes                      [post §8]")
-    flops_vs_bytes(rep, device)
-
-    rep.section("5. Causal masking lets whole tiles be skipped            [post §7]")
+    rep.section("4. Causal masking lets whole tiles be skipped            [post §7]")
     causal_skipping(rep, device)
+
+    rep.section("5. Same arithmetic, different bytes                      [post §8]")
+    flop_rows = flops_vs_bytes(rep, device)
 
     rep.section("6. Where the speed actually comes from                   [post §8]")
     time_rows = timing(rep, device)
 
     rep.section("7. Figures")
-    make_figures(rep, mem_rows, time_rows)
+    make_figures(rep, softmax_trace, mem_rows, flop_rows, time_rows)
 
 
 if __name__ == "__main__":
