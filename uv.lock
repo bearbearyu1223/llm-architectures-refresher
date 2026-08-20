@@ -404,6 +404,7 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
+    { name = "transformers" },
 ]
 
 [package.optional-dependencies]
@@ -420,6 +421,7 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "torch", specifier = ">=2.4" },
+    { name = "transformers", specifier = ">=4.44" },
     { name = "transformers", marker = "extra == 'cuda'", specifier = ">=4.44" },
 ]
 provides-extras = ["cuda"]
