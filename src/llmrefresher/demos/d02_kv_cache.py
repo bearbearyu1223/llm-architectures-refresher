@@ -27,6 +27,7 @@ Run: ``uv run demo02``
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import matplotlib.patches as patches
@@ -812,6 +813,32 @@ USABLE_FRACTION = 0.90
 ACTIVATION_HEADROOM = 2 * GIB
 
 
+def _worked_row(hbm_gb: float, bw_gb_s: float, kv_per_user: float, weight_bytes: float) -> dict:
+    """One card's sizing chain, each step computed from the *previous displayed* value.
+
+    A derivation table is only worth printing if a reader can reproduce it, and
+    that means every row must follow from the numbers actually on the page — not
+    from full-precision values behind them. Two operands each rounded to 2dp can
+    move their sum by 0.01, which is exactly how a correct table ends up looking
+    like a typo.
+
+    Both unit families appear here on purpose and are converted rather than
+    mixed: card capacity and bandwidth are quoted by vendors in decimal GB, and
+    everything this post computes is in binary GiB. So the sticker figure is
+    converted to GiB first, and bandwidth to GiB/s, before either is used.
+    """
+    hbm = round(hbm_gb * 1e9 / GIB, 2)
+    weights = round(_gib(weight_bytes), 2)
+    kv = round(_gib(kv_per_user), 2)
+    bw = round(bw_gb_s * 1e9 / GIB)
+    usable = round(hbm * USABLE_FRACTION - weights - _gib(ACTIVATION_HEADROOM), 2)
+    per_gpu = round(usable / kv, 3)
+    read = round(kv * per_gpu + weights, 2)
+    step_ms = round(read / bw * 1000, 2)
+    return {"hbm": hbm, "weights": weights, "kv": kv, "bw": bw, "usable": usable,
+            "per_gpu": per_gpu, "read": read, "step_ms": step_ms, "tok_s": 1000 / step_ms}
+
+
 def sizing_example(rep: Report) -> None:
     """1,000 concurrent users, Llama-3.1-8B, 128k context. What does it take?
 
@@ -869,12 +896,10 @@ def sizing_example(rep: Report) -> None:
     rep.blank()
     cmp_rows = []
     for cn, _, cbw, chbm in (ACCELERATORS[2], ACCELERATORS[3]):
-        cu = (chbm * 1e9 * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM) / kv_per_user
-        cr = kv_per_user * cu + weight_bytes
-        cs = cr / (cbw * 1e9)
-        cmp_rows.append([cn, f"{_gib(kv_per_user):.0f} x {cu:.2f} + {_gib(weight_bytes):.2f}",
-                         f"{_gib(cr):.2f} GiB", f"{cbw:,.0f} GB/s",
-                         f"{cs * 1000:.2f} ms", f"{1 / cs:.0f}"])
+        d = _worked_row(chbm, cbw, kv_per_user, weight_bytes)
+        cmp_rows.append([cn, f"{d['kv']:.2f} x {d['per_gpu']:.3f} + {d['weights']:.2f}",
+                         f"{d['read']:.2f} GiB", f"{d['bw']:,.0f} GiB/s",
+                         f"{d['step_ms']:.2f} ms", f"{d['tok_s']:.0f}"])
     rep.table(["card", "bytes per step", "=", "bandwidth", "step", "tok/s"], cmp_rows)
     rep.blank()
     # The fixed subtractions are why usable capacity outruns raw capacity, and
@@ -898,10 +923,7 @@ def sizing_example(rep: Report) -> None:
     # formulas, and a reader who cannot reproduce them has to take the fleet
     # size on trust — which is the one thing this post is trying not to ask for.
     ref_name, _, ref_bw, ref_hbm = ACCELERATORS[2]  # H100
-    ref_usable = ref_hbm * 1e9 * USABLE_FRACTION - weight_bytes - ACTIVATION_HEADROOM
-    ref_per_gpu = ref_usable / kv_per_user
-    ref_read = kv_per_user * ref_per_gpu + weight_bytes
-    ref_step = ref_read / (ref_bw * 1e9)
+    d = _worked_row(ref_hbm, ref_bw, kv_per_user, weight_bytes)
     rep.blank()
     rep.note(f"Those columns are three chained formulas. Worked through for {ref_name}:")
     rep.blank()
@@ -909,15 +931,17 @@ def sizing_example(rep: Report) -> None:
         ["column", "arithmetic", "result"],
         [
             ["usable for KV",
-             f"{ref_hbm}e9 x {USABLE_FRACTION:.2f} - {_gib(weight_bytes):.2f} - {_gib(ACTIVATION_HEADROOM):.2f}",
-             f"{_gib(ref_usable):.2f} GiB"],
-            ["users/GPU", f"{_gib(ref_usable):.2f} / {_gib(kv_per_user):.2f}", f"{ref_per_gpu:.2f}"],
-            ["GPUs needed", f"ceil({users:,} / {ref_per_gpu:.2f})", f"{int(-(-users // ref_per_gpu)):,}"],
+             f"{d['hbm']:.2f} GiB x {USABLE_FRACTION:.2f}"
+             f" - {d['weights']:.2f} - {_gib(ACTIVATION_HEADROOM):.2f}",
+             f"{d['usable']:.2f} GiB"],
+            ["users/GPU", f"{d['usable']:.2f} / {d['kv']:.2f}", f"{d['per_gpu']:.3f}"],
+            ["GPUs needed", f"ceil({users:,} / {d['per_gpu']:.3f})",
+             f"{math.ceil(users / d['per_gpu']):,}"],
             ["bytes per step",
-             f"{_gib(kv_per_user):.0f} x {ref_per_gpu:.2f} + {_gib(weight_bytes):.2f}",
-             f"{_gib(ref_read):.2f} GiB"],
-            ["step time", f"{_gib(ref_read):.2f} GiB / {ref_bw:,.0f} GB/s", f"{ref_step * 1000:.2f} ms"],
-            ["tok/s per user", f"1 / {ref_step * 1000:.2f} ms", f"{1 / ref_step:.1f}"],
+             f"{d['kv']:.2f} x {d['per_gpu']:.3f} + {d['weights']:.2f}",
+             f"{d['read']:.2f} GiB"],
+            ["step time", f"{d['read']:.2f} GiB / {d['bw']:,.0f} GiB/s", f"{d['step_ms']:.2f} ms"],
+            ["tok/s per user", f"1 / {d['step_ms']:.2f} ms", f"{d['tok_s']:.1f}"],
         ],
     )
     rep.blank()
