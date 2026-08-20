@@ -127,10 +127,34 @@ def what_each_step_needs(rep: Report) -> None:
     rep.note(f"and V it is {kv_reads - kv_distinct} — and without a cache every one of those is a key")
     rep.note("or value vector being computed a second time, from a token that has")
     rep.note("not changed since the first time.")
+
+    # The same count, run against a *training* step, is what shows the cache to
+    # be an inference-only structure. Teacher forcing hands the model the whole
+    # real sequence up front, so training is one forward pass over all
+    # kv_distinct positions rather than `steps` passes over growing prefixes.
+    # Every key is computed exactly once and the redundancy the cache exists to
+    # remove is simply not there. Counted from the same two numbers as above, so
+    # the contrast cannot drift away from the table it is being contrasted with.
+    rep.blank()
+    rep.note("Now run that same count against a training step. Teacher forcing hands")
+    rep.note("the model the whole real sequence at once, so there is one pass over all")
+    rep.note(f"{kv_distinct} positions instead of {steps} passes over growing prefixes:")
+    rep.blank()
+    rep.table(
+        ["", "K vectors computed", "of them, redundant"],
+        [
+            [f"generation, {steps} steps", kv_reads, kv_reads - kv_distinct],
+            ["training, 1 pass", kv_distinct, 0],
+        ],
+    )
+    rep.blank()
+    rep.note("Zero in the second column, so there is nothing for a cache to hand back.")
+    rep.note("That is why there is no KV cache during training — not that it would be")
+    rep.note("expensive or awkward, but that it would have no work to save.")
     rep.takeaway(
         "Every step recomputes keys and values the previous step already had. "
         "Q is used once and never again — which is why the thing is a KV cache "
-        "and not a QKV cache."
+        "and not a QKV cache. Training recomputes nothing, so it caches nothing."
     )
 
 
