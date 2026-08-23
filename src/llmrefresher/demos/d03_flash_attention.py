@@ -135,7 +135,7 @@ def check_online_softmax(rep: Report, device: torch.device) -> list[dict[str, fl
         xd = x.to(dtype)
         e = torch.exp(xd)
         naive = e / e.sum(-1, keepdim=True)
-        overflow_at = float(torch.log(torch.tensor(torch.finfo(dtype).max)))
+        overflow_at = math.log(torch.finfo(dtype).max)  # past here, exp stops fitting
         bad = int(torch.isinf(e).sum() + torch.isnan(naive).sum())
         err = (naive.float() - reference).abs().max().item()
         stability.append([
@@ -217,10 +217,11 @@ def flash_attention(
 
             kj = k[:, :, j : j + block_k]
             vj = v[:, :, j : j + block_k]
+            cols = kj.shape[2]        # this tile's width; short at the end of a sequence
             # K and V tiles cross HBM once per *computed* tile, so they are re-read
             # for every query block. Skipped tiles cost nothing, which is why the
             # causal path moves less than the non-causal one.
-            counters["hbm_bytes"] += 2 * batch * heads * kj.shape[2] * dim * elem
+            counters["hbm_bytes"] += 2 * batch * heads * cols * dim * elem
             scores = (qi @ kj.transpose(-2, -1)) * scale
             counters["blocks_computed"] += 1
             counters["max_tile_elems"] = max(counters["max_tile_elems"], scores.numel())
@@ -229,11 +230,11 @@ def flash_attention(
             # them as they happen, so the FLOP total is tallied rather than
             # asserted; the naive path's count is the same expression with the
             # tile replaced by the whole matrix.
-            counters["matmul_flops"] += 2 * (2 * batch * heads * rows * kj.shape[2] * dim)
+            counters["matmul_flops"] += 2 * (2 * batch * heads * rows * cols * dim)
 
             if causal:
                 q_pos = torch.arange(i, i + rows, device=q.device)[:, None]
-                k_pos = torch.arange(j, j + kj.shape[2], device=q.device)[None, :]
+                k_pos = torch.arange(j, j + cols, device=q.device)[None, :]
                 scores = scores.masked_fill(k_pos > q_pos, float("-inf"))
 
             m_new = torch.maximum(m, scores.max(dim=-1, keepdim=True).values)
