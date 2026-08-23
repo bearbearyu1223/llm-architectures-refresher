@@ -192,11 +192,17 @@ def flash_attention(
     scale = 1.0 / math.sqrt(dim)
 
     out = torch.zeros_like(q)
-    counters = {"blocks_computed": 0, "blocks_skipped": 0, "max_tile_elems": 0, "matmul_flops": 0}
+    counters = {"blocks_computed": 0, "blocks_skipped": 0, "max_tile_elems": 0,
+                "matmul_flops": 0, "hbm_bytes": 0}
+    elem = q.element_size()
 
     for i in range(0, seq_q, block_q):
         qi = q[:, :, i : i + block_q]
         rows = qi.shape[2]
+        # This query tile is read in from HBM once, and its output written back
+        # once. Tallied as it happens, like the FLOPs, so the traffic total is a
+        # count rather than an estimate.
+        counters["hbm_bytes"] += 2 * batch * heads * rows * dim * elem
 
         m = torch.full((batch, heads, rows, 1), float("-inf"), device=q.device, dtype=q.dtype)
         l = torch.zeros((batch, heads, rows, 1), device=q.device, dtype=q.dtype)
@@ -211,6 +217,10 @@ def flash_attention(
 
             kj = k[:, :, j : j + block_k]
             vj = v[:, :, j : j + block_k]
+            # K and V tiles cross HBM once per *computed* tile, so they are re-read
+            # for every query block. Skipped tiles cost nothing, which is why the
+            # causal path moves less than the non-causal one.
+            counters["hbm_bytes"] += 2 * batch * heads * kj.shape[2] * dim * elem
             scores = (qi @ kj.transpose(-2, -1)) * scale
             counters["blocks_computed"] += 1
             counters["max_tile_elems"] = max(counters["max_tile_elems"], scores.numel())
@@ -441,6 +451,41 @@ def flops_vs_bytes(rep: Report, device: torch.device) -> list[dict[str, float]]:
             rows,
         )
         rep.blank()
+
+    rep.note("But 'score traffic' is not all the traffic. The tiled path still reads")
+    rep.note("Q, K and V in from HBM and writes O back out — and because the inner")
+    rep.note("loop streams all of K and V past every query block, K and V are re-read")
+    rep.note("once per query block. Counting every tensor that crosses HBM, not just")
+    rep.note("the score matrix (causal off):")
+    rep.blank()
+    total_rows = []
+    for seq in (512, 1024, 2048, 4096):
+        q, k, v = (torch.randn(batch, heads, seq, dim, device=device) for _ in range(3))
+        _, c = flash_attention(q, k, v, block_q=block, block_k=block, causal=False)
+        elem = q.element_size()
+        naive_score = 4 * batch * heads * seq * seq * elem
+        qkvo = 4 * batch * heads * seq * dim * elem      # Q, K, V in; O out; once each
+        naive_total = naive_score + qkvo
+        total_rows.append([
+            seq,
+            f"{_mib(naive_total):.0f} MiB",
+            f"{_mib(c['hbm_bytes']):.0f} MiB",
+            f"{naive_total / c['hbm_bytes']:.1f}x",
+            f"{-(-seq // block)}x",
+        ])
+        del q, k, v
+    rep.table(
+        ["seq", "naive: all tensors", "tiled: all tensors", "reduction", "K/V re-reads"],
+        total_rows,
+    )
+    rep.blank()
+    rep.note("So the win is real but finite: about 4x at 4k context, not the infinity")
+    rep.note("a '0 MiB' score-traffic column might suggest. What Flash Attention")
+    rep.note("removes is the *quadratic intermediate*, and what it pays instead is")
+    rep.note("re-reading K and V once per query block. That trade is why block size")
+    rep.note("is a tuning knob: bigger query blocks mean fewer re-reads and a bigger")
+    rep.note("tile to keep resident.")
+    rep.blank()
 
     rep.note("Non-causal, the FLOP columns are equal to the digit: the tiled path")
     rep.note("does not save a single multiply. What it removes is the entire score")
