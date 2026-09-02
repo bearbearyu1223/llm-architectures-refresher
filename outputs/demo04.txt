@@ -1,0 +1,239 @@
+==========================================================================
+DEMO 04: Quantization: what breaks, and what perplexity hides
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  model                              Qwen/Qwen2.5-0.5B
+  parameters                         494.0M
+  eval passage                       550 tokens
+
+--------------------------------------------------------------------------
+1. What rounding to a grid costs                       [post §1]
+--------------------------------------------------------------------------
+  One real weight matrix: layer 11 down_proj, (896, 4864), fp32.
+
+  absmax |w|                         0.6133
+  std of w                           0.0183
+  absmax / std                       33.6
+
+  INT8 spreads 255 levels evenly across [-absmax, +absmax], so one step is
+  absmax/127 and nothing can be represented more finely than half of that:
+
+  step = absmax / 127                4.829e-03
+  worst rounding error = step/2      2.414e-03
+  measured max |q(w) - w|            2.414e-03
+
+  Those last two agree, which is the check: the error is not mysterious,
+  it is half a grid step, and the grid step is set by the largest weight
+  sharing the grid. Everything else in this post follows from that.
+
+  >> Quantization error is half a grid step, and the step is fixed by the
+     biggest element on the grid. Shrink what shares a grid and you shrink
+     the error for everything on it.
+
+--------------------------------------------------------------------------
+2. Where the outliers actually live                    [post §2]
+--------------------------------------------------------------------------
+  Spread across channels, as a multiple of the median channel's max.
+  Weights first — one row per output channel:
+
+  tensor                max / median  channels > 5x  channels
+  -------------------------------------------------------------
+  L0 down_proj.weight           4.2x              0       896
+  L5 down_proj.weight           7.6x              3       896
+  L11 down_proj.weight          7.0x              4       896
+  L17 down_proj.weight          4.6x              0       896
+  L23 down_proj.weight          7.3x              1       896
+
+  Now the activations flowing into those same layers:
+
+  tensor         max / median  channels > 5x  channels
+  ------------------------------------------------------
+  L0 o_proj              7.9x              5       896
+  L0 down_proj          11.7x            155      4864
+  L5 o_proj              3.8x              0       896
+  L5 down_proj          85.5x            224      4864
+  L11 o_proj             5.4x              2       896
+  L11 down_proj         10.3x             28      4864
+  L17 o_proj             5.5x              2       896
+  L17 down_proj         20.9x            158      4864
+  L23 o_proj             8.2x             22       896
+  L23 down_proj         19.1x             97      4864
+
+  Weights sit within a single order of magnitude of each other. The
+  activations into down_proj do not. A grid sized to hold a channel 85x
+  above the median has to be wide enough that ordinary values land on
+  almost the same level.
+
+  >> Outliers are an activation phenomenon, not a weight phenomenon. That
+     single fact is why production quantization is almost always weight-
+     only.
+
+--------------------------------------------------------------------------
+3. Are they the same channels every time?              [post §3]
+--------------------------------------------------------------------------
+  Top-10 outlier channels at layer 5, across five unrelated inputs
+  (English prose, science, economics, Python source, Spanish):
+
+  input pair                  shared of top-10
+  ----------------------------------------------
+  English prose vs science                3/10
+  science vs economics                    2/10
+  economics vs Python source              2/10
+  Python source vs Spanish                2/10
+
+  shared by all five inputs          2/10
+  distinct channels across inputs    41
+
+  shared by all 6 sampled layers     0/10
+
+  So the textbook line — that the same few dimensions are extreme
+  everywhere — is only partly true here. A small core does persist: two
+  channels are in the top ten for all five inputs, including Python source
+  and Spanish, which is not a coincidence you get for free. But most of
+  the outliers move with the input, and across layers there is no overlap
+  at all. The systematic version of this is documented at 6.7B and above
+  (Dettmers et al.); this is a 0.5B model and not measured at that scale.
+
+  >> Enough of the outlier structure is stable to matter, and not enough
+     to let you pick the channels once and hard-code them. Either way the
+     fix is the same: never let a whole tensor share one scale.
+
+--------------------------------------------------------------------------
+4. Same bits, different scale placement                [post §4]
+--------------------------------------------------------------------------
+  Identical format — 8 bits, evenly spaced. Only the scope of the scale
+  changes: one divisor for the whole tensor, or one per row.
+
+  tensor                      per-tensor  per-row  ratio
+  --------------------------------------------------------
+  L0 down_proj.weight              3.81%    1.14%   3.3x
+  L11 down_proj.weight             7.63%    1.41%   5.4x
+  L23 down_proj.weight             6.69%    1.14%   5.9x
+  L5 down_proj (activations)      58.10%    6.10%   9.5x
+
+  For weights, splitting the scale by row is worth a few times less
+  error - worth having, not decisive. For the activation tensor it is
+  the difference between a usable number and a destroyed one, and the
+  reason is the row above: that tensor has a channel two orders of
+  magnitude above its median, and per-tensor scaling makes every other
+  channel share a grid built to survive it.
+
+  >> Same bits, same spacing, two orders of magnitude of difference in
+     error. What matters is not how many bits you keep but how much
+     dynamic range is forced to share one scale.
+
+--------------------------------------------------------------------------
+5. NF4, derived rather than copied                     [post §5]
+--------------------------------------------------------------------------
+  NF4's 16 levels are the equal-probability quantiles of a standard
+  normal, not a hand-picked table. Deriving them and comparing against
+  the constants bitsandbytes ships:
+
+  levels derived                     16
+  max |derived - bitsandbytes|       5.96e-08
+
+  narrowest step (near zero)         0.0796
+  widest step (near +/-1)            0.3038
+  ratio                              3.82x
+
+  That ratio is the whole idea. Weights are roughly normal, so most of
+  them are near zero — and NF4 puts its levels closest together exactly
+  there, spending resolution where the values are instead of spreading it
+  evenly over a range that is mostly empty.
+
+  Both formats on the same matrix, at their real stored cost:
+
+  format                  rel RMSE  bits/weight incl. scales
+  ------------------------------------------------------------
+  INT8 per-tensor            7.63%                     8.000
+  INT8 per-channel           1.41%                     8.007
+  INT4 uniform, block=64    12.21%                     4.500
+  NF4 block=64               9.64%                     4.500
+  NF4 block=256             11.15%                     4.125
+
+  The comparison that tests NF4's claim is the middle pair: uniform INT4
+  against NF4 at the same width and the same number of scales, so the
+  only variable left is where the levels sit. NF4 cuts the error by
+  about a fifth, which is what shaping the grid to the data buys.
+
+  It does *not* beat 8-bit, and no rearrangement of 16 levels was ever
+  going to beat 256 of them. What it does is get within a few points of
+  per-tensor INT8 at half the storage — and per-channel INT8, at 1.4%,
+  is better than both by a wide margin.
+
+  Note the bits column: NF4 at block=64 carries an fp32 scale for every
+  64 weights, half a bit on top of four, so a '4-bit' model is really a
+  4.5-bit one. Widening to 256 buys that down to 4.125 and pays for it in
+  error, because more weights then share one absmax.
+
+  >> At equal width, placing the levels where the weights are beats
+     spacing them evenly by about a quarter of the error. Against 8 bits
+     it loses on error and wins on size, which is the trade actually on
+     offer.
+
+--------------------------------------------------------------------------
+6. What it actually saves                              [post §6]
+--------------------------------------------------------------------------
+  lm_head.weight is embed_tokens.weight  yes
+
+  parameters                         494.0M
+  of which embedding (tied)          136.1M  (28%)
+  of which other Linear              357.8M  (72%)
+
+  Model size if the Linear weights are quantized and everything else —
+  embeddings, norms — is left in fp16, which is what real tools do:
+
+  scheme            bits/weight (Linear)  model size  vs fp16
+  -------------------------------------------------------------
+  fp16 (baseline)                 16.000     942 MiB    1.00x
+  INT8 per-channel                 8.036     603 MiB    1.56x
+  NF4 block=64                     4.500     452 MiB    2.09x
+
+  The shrink is real but smaller than the bit-width suggests, because a
+  quarter of this model is an embedding table nobody quantizes and the
+  scales ride along with every block.
+
+  >> 4-bit weights do not make a 4x smaller model. Scales, and the tensors
+     left alone on purpose, both dilute the headline number.
+
+--------------------------------------------------------------------------
+7. Perplexity against the tail                         [post §7]
+--------------------------------------------------------------------------
+  Reference: unquantized fp32. Eval passage is 550 tokens of
+  non-repeating prose, shipped in the demo so the number reproduces.
+
+  scheme                perplexity  vs fp32   mean KL    max KL  max/mean
+  -------------------------------------------------------------------------
+  fp32 reference            20.869        —         —         —         —
+  INT8 per-channel          20.913   +0.21%  2.60e-03  1.76e-01       68x
+  NF4 block=64              24.104  +15.50%  1.57e-01  1.09e+01       69x
+  NF4 block=64, + head      26.486  +26.92%  2.44e-01  1.09e+01       45x
+
+  Read the INT8 row twice. Perplexity moves by a fraction of a percent —
+  a number that clears any ship/no-ship gate anyone sets. The same run
+  has a token whose predicted distribution moved by tens of times the
+  average. Perplexity is a mean over thousands of tokens, and a mean is
+  exactly the statistic that cannot see a tail.
+
+  INT8 KL at quantile 0.5            1.730e-03
+  INT8 KL at quantile 0.9            4.341e-03
+  INT8 KL at quantile 0.99           1.194e-02
+  INT8 KL at quantile 0.999          9.441e-02
+  INT8 KL at quantile 1.0            1.756e-01
+
+  >> Perplexity says INT8 weight-only is free. The tail of the same
+     distribution says a handful of tokens changed a great deal. Both are
+     true, and only one of them is what a user meets.
+
+--------------------------------------------------------------------------
+8. Figures
+--------------------------------------------------------------------------
+  wrote figures/04-quantization/quant-grids-light.png
+  wrote figures/04-quantization/outlier-channels-light.png
+  wrote figures/04-quantization/kl-tail-light.png
+  wrote figures/04-quantization/quant-grids-dark.png
+  wrote figures/04-quantization/outlier-channels-dark.png
+  wrote figures/04-quantization/kl-tail-dark.png

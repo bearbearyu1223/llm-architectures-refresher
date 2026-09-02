@@ -87,7 +87,12 @@ Cartographers of the sixteenth century filled the unknown interiors of continent
 def _load(dtype: torch.dtype = torch.float32):
     """Qwen2.5-0.5B on CPU. Cached locally; no network access at run time."""
     from transformers import AutoModelForCausalLM
+    from transformers.utils import logging as hf_logging
 
+    # The weight-loading progress bar writes to stdout, which lands in the
+    # captured output the post pastes from. Silence it: this demo's stdout is a
+    # document, not a terminal.
+    hf_logging.disable_progress_bar()
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=dtype)
     model.eval()
     return model
@@ -294,11 +299,11 @@ def scale_placement(rep: Report, model, acts: dict) -> None:
     rep.table(["tensor", "per-tensor", "per-row", "ratio"], rows)
     rep.blank()
     rep.note("For weights, splitting the scale by row is worth a few times less")
-    rep.note("error — worth having, not decisive. For the activation tensor it is the")
-    rep.note("difference between a usable number and a destroyed one, and the reason")
-    rep.note("is the row above: that tensor has a channel two orders of magnitude")
-    rep.note("above its median, and per-tensor scaling makes every other channel")
-    rep.note("share a grid built to survive it.")
+    rep.note("error - worth having, not decisive. For the activation tensor it is")
+    rep.note("the difference between a usable number and a destroyed one, and the")
+    rep.note("reason is the row above: that tensor has a channel two orders of")
+    rep.note("magnitude above its median, and per-tensor scaling makes every other")
+    rep.note("channel share a grid built to survive it.")
     rep.takeaway(
         "Same bits, same spacing, two orders of magnitude of difference in error. "
         "What matters is not how many bits you keep but how much dynamic range is "
@@ -354,8 +359,8 @@ def nf4_derivation(rep: Report, model) -> None:
     rep.blank()
     rep.note("The comparison that tests NF4's claim is the middle pair: uniform INT4")
     rep.note("against NF4 at the same width and the same number of scales, so the")
-    rep.note("only variable left is where the levels sit. NF4 cuts the error by about a")
-    rep.note("fifth, which is what shaping the grid to the data buys.")
+    rep.note("only variable left is where the levels sit. NF4 cuts the error by")
+    rep.note("about a fifth, which is what shaping the grid to the data buys.")
     rep.blank()
     rep.note("It does *not* beat 8-bit, and no rearrangement of 16 levels was ever")
     rep.note("going to beat 256 of them. What it does is get within a few points of")
@@ -386,6 +391,11 @@ def memory_cost(rep: Report, model) -> None:
         for n, m in model.named_modules()
         if isinstance(m, torch.nn.Linear) and n != "lm_head"
     )
+    # "Tied" is a claim about storage, so check it rather than assert it in a
+    # label: the post's §7 conclusion rests entirely on this being true.
+    tied = model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+    rep.kv("lm_head.weight is embed_tokens.weight", tied, width=38)
+    rep.blank()
     rep.kv("parameters", f"{total / 1e6:.1f}M")
     rep.kv("of which embedding (tied)", f"{embed / 1e6:.1f}M  ({embed / total:.0%})")
     rep.kv("of which other Linear", f"{linear / 1e6:.1f}M  ({linear / total:.0%})")
@@ -446,7 +456,7 @@ def quality(rep: Report, ids) -> dict:
     schemes = (
         ("INT8 per-channel", int8_per_channel, ("lm_head",)),
         ("NF4 block=64", lambda w: nf4(w, 64), ("lm_head",)),
-        ("NF4 block=64, head too", lambda w: nf4(w, 64), ()),
+        ("NF4 block=64, + head", lambda w: nf4(w, 64), ()),
     )
     rows, kls = [], {}
     for label, fn, skip in schemes:
@@ -590,10 +600,10 @@ def main() -> None:
     rep.kv("parameters", f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
     rep.kv("eval passage", f"{ids.shape[1]} tokens")
 
-    rep.section("1. What rounding to a grid costs                       [post §2]")
+    rep.section("1. What rounding to a grid costs                       [post §1]")
     what_rounding_costs(rep, model)
 
-    rep.section("2. Where the outliers actually live                    [post §3]")
+    rep.section("2. Where the outliers actually live                    [post §2]")
     acts = where_the_outliers_are(rep, model, ids)
 
     rep.section("3. Are they the same channels every time?              [post §3]")
