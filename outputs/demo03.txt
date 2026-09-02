@@ -7,22 +7,75 @@ platform      : Darwin 24.6.0 (arm64)
 device memory : 17.2 GB
 
 --------------------------------------------------------------------------
-1. Online softmax: partial softmaxes that compose
+1. Online softmax: one multiply rebases the history    [post §2]
 --------------------------------------------------------------------------
-  block size  max |online - torch|  rows sum to
-  -----------------------------------------------
-  64                     5.960e-08       1.0000
-  128                    1.192e-07       1.0000
-  512                    1.788e-07       1.0000
-  2048                   1.192e-07       1.0000
+  six logits, streamed two at a time, with every step written out:
 
-  logits were scaled by 8, so the row range spans ~80 — an unstable
-  implementation would return inf or nan here, not 1e-9.
+  block 0   m = 0.9, nothing held yet
+    l = exp(0.4 - 0.9) + exp(0.9 - 0.9)
+      = 0.6065 + 1.0000
+      = 1.6065
 
-  >> Block size changes the memory schedule, not the answer. The running rescale makes partial softmaxes composable.
+  block 1   m: 0.9 -> 1.8, so correction = exp(0.9 - 1.8) = 0.4066
+    l = 1.6065 x 0.4066 + exp(0.5 - 1.8) + exp(1.8 - 1.8)
+      = 0.6532 + 0.2725 + 1.0000
+      = 1.9257
+
+  block 2   m: 1.8 -> 1.8, so correction = exp(1.8 - 1.8) = 1.0000
+    l = 1.9257 x 1.0000 + exp(0.6 - 1.8) + exp(0.7 - 1.8)
+      = 1.9257 + 0.3012 + 0.3329
+      = 2.5598
+
+  block 1 raises the max 0.9 -> 1.8, so the 2 terms already
+  held are measured against the wrong reference. Two ways to fix them:
+
+  one multiply: l_old x correction   0.6532
+  recomputed: sum exp(x - m_new)     0.6532
+  difference                         0.0000
+
+  streamed sum after 3 blocks        2.5598
+  one-shot sum exp(x - max)          2.5598
+  difference                         0.0000
+
 
 --------------------------------------------------------------------------
-2. Tiled attention reproduces the reference exactly
+2. Partial softmaxes compose, and stay exact            [post §3]
+--------------------------------------------------------------------------
+  logit row range (max - min)        58.0
+  largest probability in a row       0.7605
+
+  block size  max |online - torch|  in ulps  rows sum to
+  --------------------------------------------------------
+  64                     1.788e-07      3.0       1.0000
+  128                    8.941e-08      1.5       1.0000
+  512                    1.192e-07      2.0       1.0000
+  2048                   1.192e-07      2.0       1.0000
+
+  'in ulps' counts steps of 2^-24, the gap between neighbouring fp32
+  numbers just below 1 — the scale the largest probability sits at.
+  Every block size lands within a few of those, so the column records
+  reassociation noise and not a trend. The error digits themselves
+  depend on the backend's summation order and will differ on CUDA or
+  CPU; the ulp count is the part that reproduces.
+
+  Why subtract the max at all? Compare against the naive
+  exp(x)/sum(exp(x)), at the two precisions inference actually uses:
+
+  dtype  exp overflows past  actual row max  overflowed?  bad values  naive error
+  ---------------------------------------------------------------------------------
+  fp32                 88.7            32.8           no           0    1.192e-07
+  fp16                 11.1            32.8          yes       1,320          nan
+
+  So in fp32 the unstable version happens to survive these logits. In
+  fp16 it does not, and the online version — which subtracts a running
+  max before every exp — is correct in both.
+
+  >> Block size changes the memory schedule, not the answer. The running
+     rescale makes partial softmaxes composable, and the running max is
+     what keeps them representable once the precision drops.
+
+--------------------------------------------------------------------------
+3. Tiled attention reproduces the reference exactly   [post §4-5]
 --------------------------------------------------------------------------
   causal=False: tiled vs F.scaled_dot_product_attention
 
@@ -48,10 +101,13 @@ device memory : 17.2 GB
   sliding window, w=256                       0.6047
   sliding window, w=64                        1.5660
 
-  >> Flash Attention differs from the reference by float reassociation noise. Sliding-window attention differs by five orders of magnitude more — it changes the function, Flash changes only the memory schedule.
+  >> Flash Attention differs from the reference by float reassociation
+     noise. Sliding-window attention differs by five orders of magnitude
+     more — it changes the function, Flash changes only the memory
+     schedule.
 
 --------------------------------------------------------------------------
-3. The memory that is never allocated
+4. The memory that is never allocated                   [post §6]
 --------------------------------------------------------------------------
   batch=1, heads=8, head_dim=64, fp32
 
@@ -79,10 +135,12 @@ device memory : 17.2 GB
   32768                     32.0 GiB
   131072                   512.0 GiB
 
-  >> The naive score matrix is quadratic in sequence length and is the reason long context was infeasible. The tile is a constant, chosen to fit in SRAM.
+  >> The naive score matrix is quadratic in sequence length and is the
+     reason long context was infeasible. The tile is a constant, chosen to
+     fit in SRAM.
 
 --------------------------------------------------------------------------
-4. Causal masking lets whole tiles be skipped
+5. Causal masking lets whole tiles be skipped            [post §7]
 --------------------------------------------------------------------------
   block size  tiles computed  tiles skipped  fraction skipped
   -------------------------------------------------------------
@@ -90,30 +148,91 @@ device memory : 17.2 GB
   256                     36             28               44%
   512                     10              6               38%
 
-  >> With causal masking, just under half the score matrix is structurally -inf. The naive path computes it and then throws it away; a tiled loop never touches those tiles at all.
+  >> With causal masking, just under half the score matrix is structurally
+     -inf. The naive path computes it and then throws it away; a tiled
+     loop never touches those tiles at all.
 
 --------------------------------------------------------------------------
-5. Where the speed actually comes from
+6. Same arithmetic, different bytes                      [post §8]
+--------------------------------------------------------------------------
+  causal=False: arithmetic done, against score bytes moved
+
+  seq   naive FLOPs  tiled FLOPs  ratio  naive score traffic  tiled
+  -------------------------------------------------------------------
+  512         0.5 G        0.5 G  1.00x               32 MiB  0 MiB
+  1024        2.1 G        2.1 G  1.00x              128 MiB  0 MiB
+  2048        8.6 G        8.6 G  1.00x              512 MiB  0 MiB
+  4096       34.4 G       34.4 G  1.00x             2048 MiB  0 MiB
+
+  causal=True: arithmetic done, against score bytes moved
+
+  seq   naive FLOPs  tiled FLOPs  ratio  naive score traffic  tiled
+  -------------------------------------------------------------------
+  512         0.5 G        0.3 G  0.62x               32 MiB  0 MiB
+  1024        2.1 G        1.2 G  0.56x              128 MiB  0 MiB
+  2048        8.6 G        4.6 G  0.53x              512 MiB  0 MiB
+  4096       34.4 G       17.7 G  0.52x             2048 MiB  0 MiB
+
+  But 'score traffic' is not all the traffic. The tiled path still reads
+  Q, K and V in from HBM and writes O back out — and because the inner
+  loop streams all of K and V past every query block, K and V are re-read
+  once per query block. Counting every tensor that crosses HBM, not just
+  the score matrix (causal off):
+
+  seq   naive: all tensors  tiled: all tensors  reduction  K/V re-reads
+  -----------------------------------------------------------------------
+  512               36 MiB              10 MiB       3.6x            4x
+  1024             136 MiB              36 MiB       3.8x            8x
+  2048             528 MiB             136 MiB       3.9x           16x
+  4096            2080 MiB             528 MiB       3.9x           32x
+
+  So the win is real but finite: about 4x at 4k context, not the infinity
+  a '0 MiB' score-traffic column might suggest. What Flash Attention
+  removes is the *quadratic intermediate*, and what it pays instead is
+  re-reading K and V once per query block. That trade is why block size
+  is a tuning knob: bigger query blocks mean fewer re-reads and a bigger
+  tile to keep resident.
+
+  Non-causal, the FLOP columns are equal to the digit: the tiled path
+  does not save a single multiply. What it removes is the entire score
+  traffic column — quadratic in sequence length, and gone. Causal masking
+  then removes about half the arithmetic too, but that is a bonus from
+  tiling, not the mechanism.
+
+  >> Same arithmetic, zero score-matrix traffic. That is the whole trade,
+     and it is why the win grows with sequence length: FLOPs and traffic
+     both scale as n^2, but only one of them is still being paid.
+
+--------------------------------------------------------------------------
+7. Where the speed actually comes from                   [post §8]
 --------------------------------------------------------------------------
   seq   naive (ms)  fused SDPA (ms)  speedup
   --------------------------------------------
-  512       1.2126           0.3504    3.46x
-  1024      3.5275           0.8312    4.24x
-  2048     12.9022           2.0488    6.30x
-  4096     54.5067           6.9834    7.81x
+  512       1.2422           0.3726    3.33x
+  1024      3.7080           0.7676    4.83x
+  2048     13.2959           2.0374    6.53x
+  4096     55.3251           7.5176    7.36x
 
   The Python tiled loop above is far slower than either — it pays full
   HBM traffic per tile plus Python overhead. The algorithm buys memory;
   fusing it into one kernel is what buys time.
 
-  >> The speedup grows with sequence length, because the naive path's memory traffic grows quadratically while the fused path's grows linearly.
+  >> The speedup grows with sequence length, because the naive path's
+     memory traffic grows quadratically while the fused path's grows
+     linearly.
 
 --------------------------------------------------------------------------
-6. Figures
+8. Figures
 --------------------------------------------------------------------------
+  wrote figures/03-flash-attention/online-rebase-light.png
+  wrote figures/03-flash-attention/online-softmax-light.png
   wrote figures/03-flash-attention/memory-scaling-light.png
-  wrote figures/03-flash-attention/timing-light.png
   wrote figures/03-flash-attention/tiling-light.png
+  wrote figures/03-flash-attention/flops-vs-traffic-light.png
+  wrote figures/03-flash-attention/timing-light.png
+  wrote figures/03-flash-attention/online-rebase-dark.png
+  wrote figures/03-flash-attention/online-softmax-dark.png
   wrote figures/03-flash-attention/memory-scaling-dark.png
-  wrote figures/03-flash-attention/timing-dark.png
   wrote figures/03-flash-attention/tiling-dark.png
+  wrote figures/03-flash-attention/flops-vs-traffic-dark.png
+  wrote figures/03-flash-attention/timing-dark.png

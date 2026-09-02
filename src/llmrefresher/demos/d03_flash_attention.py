@@ -103,22 +103,137 @@ def online_softmax(
     return out
 
 
+# --- new: the worked walkthrough behind the rebase figure -------------------
+
+# Six logits in three blocks of two. Small enough to check by hand, and picked
+# so the running max moves once and then stops, so one rescale is real and one
+# is free. Values sit in the range attention scores land in after 1/sqrt(d_k).
+#
+# They are also picked so the printed arithmetic *reconciles at 4 decimals*:
+# a reader adding the displayed addends lands on the displayed total, on every
+# line. That is not automatic — with the obvious round numbers, one line came
+# out as 2.2447 + 0.7408 + 0.2019 = 3.1874 against a printed total of 3.1875,
+# which is exactly the kind of un-derivable number the receipts exist to avoid.
+WALK_LOGITS = (0.4, 0.9, 0.5, 1.8, 0.6, 0.7)
+WALK_BLOCK = 2
+
+
+def rebase_walkthrough(rep: Report) -> list[dict[str, object]]:
+    """Trace every term the accumulator holds, not just the running sum.
+
+    The question the figure has to answer is why *one* multiply can fix N terms
+    already added. It is because they all share the same reference: each one was
+    stored as ``exp(x - m_old)``, so ``exp(m_old - m_new)`` is a common factor
+    and pulls straight out of the sum. Recording the individual terms at each
+    reference is what lets the figure draw that, and the receipt below checks the
+    shortcut against recomputing the terms from scratch.
+
+    float64 here, not the fp32 the rest of the demo uses: this is a hand-checkable
+    walkthrough, and the point is the algebra rather than the precision.
+    """
+    x = torch.tensor(WALK_LOGITS, dtype=torch.float64)
+    m = torch.tensor(float("-inf"), dtype=torch.float64)
+    l = torch.tensor(0.0, dtype=torch.float64)
+
+    trace: list[dict[str, object]] = []
+    for start in range(0, x.numel(), WALK_BLOCK):
+        block = x[start : start + WALK_BLOCK]
+        m_old, l_old = m.clone(), l.clone()
+        m = torch.maximum(m_old, block.max())
+        correction = torch.exp(m_old - m)  # exp(-inf) = 0 on the first block
+        l = l_old * correction + torch.exp(block - m).sum()
+
+        seen = start + block.numel()
+        trace.append(
+            {
+                "block": start // WALK_BLOCK,
+                "logits": block.tolist(),
+                "m_old": m_old.item(),
+                "m_new": m.item(),
+                "correction": correction.item(),
+                "l_old": l_old.item(),
+                "l_new": l.item(),
+                # the terms held before this block's own are added, at each
+                # reference: same numbers, measured two different ways
+                "held_at_m_old": torch.exp(x[:start] - m_old).tolist() if start else [],
+                "held_at_m_new": torch.exp(x[:start] - m).tolist(),
+                "all_at_m_new": torch.exp(x[:seen] - m).tolist(),
+            }
+        )
+
+    rep.note("six logits, streamed two at a time, with every step written out:")
+    rep.blank()
+    for step in trace:
+        b, m_old, m_new = step["block"], step["m_old"], step["m_new"]
+        terms = [f"exp({v:.1f} - {m_new:.1f})" for v in step["logits"]]
+        values = [f"{math.exp(v - m_new):.4f}" for v in step["logits"]]
+        if b == 0:
+            rep.note(f"block 0   m = {m_new:.1f}, nothing held yet")
+        else:
+            rep.note(f"block {b}   m: {m_old:.1f} -> {m_new:.1f}, so correction ="
+                     f" exp({m_old:.1f} - {m_new:.1f}) = {step['correction']:.4f}")
+            terms.insert(0, f"{step['l_old']:.4f} x {step['correction']:.4f}")
+            values.insert(0, f"{step['l_old'] * step['correction']:.4f}")
+        rep.note("  l = " + " + ".join(terms))
+        rep.note("    = " + " + ".join(values))
+        rep.note(f"    = {step['l_new']:.4f}")
+        rep.blank()
+
+    # The claim the figure is drawing: rescaling the running sum by one factor
+    # gives the same answer as recomputing each held term against the new max.
+    rescale = trace[1]
+    shortcut = rescale["l_old"] * rescale["correction"]
+    recomputed = sum(rescale["held_at_m_new"])
+    rep.note(f"block 1 raises the max {rescale['m_old']:.1f} -> {rescale['m_new']:.1f}, so the"
+             f" {len(rescale['held_at_m_new'])} terms already")
+    rep.note("held are measured against the wrong reference. Two ways to fix them:")
+    rep.blank()
+    rep.kv("one multiply: l_old x correction", shortcut)
+    rep.kv("recomputed: sum exp(x - m_new)", recomputed)
+    rep.kv("difference", abs(shortcut - recomputed))
+    rep.blank()
+
+    direct = torch.exp(x - x.max()).sum().item()
+    rep.kv("streamed sum after 3 blocks", trace[-1]["l_new"])
+    rep.kv("one-shot sum exp(x - max)", direct)
+    rep.kv("difference", abs(trace[-1]["l_new"] - direct))
+    rep.blank()
+    return trace
+
+
 def check_online_softmax(rep: Report, device: torch.device) -> list[dict[str, float]]:
     torch.manual_seed(0)
-    x = torch.randn(4, 2048, device=device) * 8  # wide spread: stresses stability
+    # Draw on CPU, then move. torch.randn(device=...) pulls from a different RNG
+    # stream per backend, so seeding alone leaves this table showing different
+    # digits on CUDA than on MPS — and the post quotes these digits. Generating
+    # once on CPU makes the receipt reproduce everywhere.
+    x = (torch.randn(4, 2048) * 8).to(device)  # wide spread: stresses stability
     reference = torch.softmax(x, dim=-1)
 
     rep.kv("logit row range (max - min)", f"{(x.max(-1).values - x.min(-1).values).max().item():.1f}")
+    rep.kv("largest probability in a row", f"{reference.max().item():.4f}")
     rep.blank()
 
+    # fp32 spacing just below 1.0, which is the scale the largest probability
+    # sits at once a row is this wide. Reporting the error in these units is
+    # what keeps the column from reading as a trend.
+    ulp = 2.0**-24
     rows = []
     trace: list[dict[str, float]] = []
     for block in (64, 128, 512, 2048):
         # The 64-wide pass also records its running statistics; the figure draws them.
         got = online_softmax(x, block, trace=trace if block == 64 else None)
-        rows.append([block, (got - reference).abs().max().item(), got.sum(-1).mean().item()])
+        err = (got - reference).abs().max().item()
+        rows.append([block, err, f"{err / ulp:.1f}", got.sum(-1).mean().item()])
 
-    rep.table(["block size", "max |online - torch|", "rows sum to"], rows)
+    rep.table(["block size", "max |online - torch|", "in ulps", "rows sum to"], rows)
+    rep.blank()
+    rep.note("'in ulps' counts steps of 2^-24, the gap between neighbouring fp32")
+    rep.note("numbers just below 1 — the scale the largest probability sits at.")
+    rep.note("Every block size lands within a few of those, so the column records")
+    rep.note("reassociation noise and not a trend. The error digits themselves")
+    rep.note("depend on the backend's summation order and will differ on CUDA or")
+    rep.note("CPU; the ulp count is the part that reproduces.")
     rep.blank()
 
     # Why the max subtraction is in there at all. It is tempting to claim the
@@ -558,54 +673,185 @@ def timing(rep: Report, device: torch.device) -> list[dict[str, float]]:
 # ---------------------------------------------------------------------------
 
 
+def figure_online_rebase(trace: list[dict[str, object]], theme: Theme) -> Path:
+    """Six logits streamed in three blocks, one column per step of the loop.
+
+    Bottom panel: the running sum drawn as the individual terms it is made of,
+    coloured by the block each came from. A rescale column shows the whole stack
+    shrinking by one factor — the dashed connectors carry each term's boundary
+    across, so the proportions are visibly kept — and an add column shows the
+    next block's terms landing on top. Top panel: the reference those terms are
+    measured against, which is the thing that moves at a rescale.
+
+    The loop does the rescale and the add in a single statement
+    (``l = l * correction + ...``); they get a column each here because that is
+    the step the reader is being asked to believe.
+    """
+    cols: list[dict[str, object]] = []
+    for step in trace:
+        b = step["block"]
+        if b > 0:
+            cols.append({
+                "terms": step["held_at_m_new"],
+                "m": step["m_new"],
+                "logits": step["logits"],
+                "tick": f"block {b} read\nrebase",
+                "arrow": f"$\\times$ {step['correction']:.4f}",
+                "kind": "rescale",
+            })
+        cols.append({
+            "terms": step["all_at_m_new"],
+            "m": step["m_new"],
+            "logits": step["logits"] if b == 0 else None,
+            "tick": f"block {b}\nadded" if b else "block 0\nread + added",
+            "arrow": None if b == 0 else f"+ {len(step['logits'])} terms",
+            "kind": "add",
+        })
+
+    sizes = [len(step["logits"]) for step in trace]
+    origin = [i for i, n in enumerate(sizes) for _ in range(n)]  # term -> block
+    fill = [theme.ramp[1], theme.ramp[3], theme.ramp[5]]
+    top = max(sum(c["terms"]) for c in cols)
+    xs = list(range(len(cols)))
+    half = 0.26
+
+    with styled(theme):
+        fig, (ax_m, ax_l) = plt.subplots(
+            2, 1, figsize=(8.4, 6.6), sharex=True, gridspec_kw={"height_ratios": [0.74, 1.7]}
+        )
+
+        # -- top: the reference every term is measured against ---------------
+        ax_m.step(xs + [xs[-1] + 0.5], [c["m"] for c in cols] + [cols[-1]["m"]],
+                  where="post", color=theme.series[0], zorder=2)
+        for x, c in zip(xs, cols):
+            if c["logits"] is None:
+                continue
+            ax_m.scatter([x] * len(c["logits"]), c["logits"], s=30, zorder=3, color=theme.muted)
+            # Two logits close together would stack their labels on top of each
+            # other, so split them onto opposite sides of the dot instead.
+            lo, hi = min(c["logits"]), max(c["logits"])
+            for v in c["logits"]:
+                right = hi - lo < 0.25 and v == hi
+                ax_m.text(x + (0.09 if right else -0.09), v, f"{v:.1f}",
+                          color=theme.secondary, fontsize=9.5, va="center",
+                          ha="left" if right else "right")
+        ax_m.text(2.6, cols[-1]["m"] + 0.13, "running max $m$", color=theme.series[0],
+                  fontsize=10.5, fontweight="bold", va="bottom", ha="left")
+        ax_m.annotate("block 1 carries a bigger logit,\nso the reference moves",
+                      (1.0, cols[1]["m"]), textcoords="offset points", xytext=(24, -20),
+                      fontsize=9.5, color=theme.series[1], fontweight="bold", ha="left",
+                      arrowprops=dict(arrowstyle="->", color=theme.series[1], linewidth=1.3))
+        ax_m.set_ylim(-0.15, max(WALK_LOGITS) + 0.85)
+        ax_m.set_ylabel("logit")
+        ax_m.set_title("Each block is read, then its terms are added")
+
+        # -- bottom: the sum, as the terms it is made of ---------------------
+        for x, c in zip(xs, cols):
+            base = 0.0
+            for i, t in enumerate(c["terms"]):
+                ax_l.bar(x, t, bottom=base, width=2 * half, color=fill[origin[i]],
+                         edgecolor=theme.surface, linewidth=1.4, zorder=2)
+                base += t
+            ax_l.text(x, base + top * 0.055, f"$\\ell$ = {base:.4f}", ha="center",
+                      va="bottom", fontsize=10, fontweight="bold", color=theme.ink)
+
+        # Every boundary in column 0 maps onto column 1 scaled by the same
+        # factor. Drawn, that is the claim; no annotation needed for it.
+        held = cols[0]["terms"]
+        for k in range(1, len(held) + 1):
+            ax_l.plot([half, 1 - half], [sum(held[:k]), sum(cols[1]["terms"][:k])],
+                      color=theme.series[1], linewidth=1.1, linestyle=(0, (4, 3)), zorder=4)
+
+        y_arrow = top * 1.34
+        for x, c in zip(xs, cols):
+            if c["arrow"] is None:
+                continue
+            rescale = c["kind"] == "rescale"
+            colour = theme.series[1] if rescale else theme.secondary
+            ax_l.annotate("", (x - 0.30, y_arrow), xytext=(x - 0.70, y_arrow),
+                          arrowprops=dict(arrowstyle="-|>", color=colour, linewidth=1.6))
+            ax_l.text(x - 0.50, y_arrow + top * 0.032, c["arrow"], ha="center", va="bottom",
+                      fontsize=10, fontweight="bold" if rescale else "normal", color=colour)
+
+        ax_l.text(-0.72, top * 1.21,
+                  "A rescale changes what the terms are\n"
+                  "measured against, not which terms are held.\n"
+                  "Same shape, one multiply.",
+                  fontsize=9.5, color=theme.secondary, va="top", ha="left")
+
+        ax_l.set_ylim(0, top * 1.56)
+        ax_l.set_xlim(-0.78, len(cols) - 0.30)
+        ax_l.set_xticks(xs, [c["tick"] for c in cols], fontsize=9.5)
+        ax_l.set_ylabel(r"running sum  $\ell = \sum e^{\,x - m}$")
+        ax_l.set_title("One multiply rebases every term already held")
+
+        handles = [patches.Patch(facecolor=fill[i], edgecolor=theme.surface,
+                                 label=f"terms from block {i}") for i in range(len(sizes))]
+        ax_l.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.14),
+                    ncol=3, fontsize=9.5, handlelength=1.3, columnspacing=1.8)
+
+        fig.align_ylabels([ax_m, ax_l])
+        return save_both(fig, SLUG, "online-rebase", theme)
+
+
 def figure_online_softmax(trace: list[dict[str, float]], theme: Theme) -> Path:
-    """The running max stepping up, and what that costs the accumulated history.
+    """How often the rescale actually fires, over a real 2,048-logit row.
 
-    Top panel: each block's own max against the running max. Bottom: the
-    correction factor ``exp(m_old - m_new)`` applied to everything accumulated so
-    far. It is exactly 1 for every block that fails to raise the max — most of
-    them, and increasingly so as the running max settles.
+    This is the frequency question, not the mechanism one — ``figure_online_rebase``
+    covers what a rescale *does*. Top panel: each block's own max against the
+    running max, which is what a block has to beat to cost anything. Bottom: the
+    correction factor, drawn as a drop *down from 1*, so the ink on a block is
+    the work that block causes and a free block draws nothing.
 
-    Block 0 is left out of the bottom panel: it initializes the max from -inf,
-    so its "correction" is exp(-inf) = 0 rather than a rescale of real history.
+    Block 0 is left out of the bottom panel: it initializes the max from -inf, so
+    its "correction" is exp(-inf) = 0 rather than a rescale of real history.
     """
     idx = list(range(len(trace)))
     block_max = [t["block_max"] for t in trace]
     running_max = [t["running_max"] for t in trace]
     corr_idx, corr = idx[1:], [t["correction"] for t in trace[1:]]
+    free = sum(1 for c in corr if c >= 1.0)
     deepest = min(range(len(corr)), key=lambda i: corr[i])
     floor = 10 ** int(math.floor(math.log10(min(corr))))
 
     with styled(theme):
         fig, (ax_top, ax_bot) = plt.subplots(
-            2, 1, figsize=(7.8, 5.8), sharex=True, gridspec_kw={"height_ratios": [1.1, 1]}
+            2, 1, figsize=(7.8, 6.0), sharex=True, gridspec_kw={"height_ratios": [1.0, 1.0]}
         )
 
-        ax_top.vlines(idx, min(block_max) - 2, block_max, color=theme.axis, linewidth=1.1)
-        ax_top.scatter(idx, block_max, color=theme.muted, s=22, zorder=3, label="this block's own max")
-        ax_top.step(idx, running_max, where="post", color=theme.series[0], label="running max $m$")
-        ax_top.text(idx[-1] + 0.5, running_max[-1], "running max", color=theme.series[0],
-                    fontsize=10.5, fontweight="bold", va="center")
-        ax_top.set_ylim(min(block_max) - 2, max(running_max) + 6.5)
-        ax_top.set_xlim(-1.2, idx[-1] + 4.0)
+        ax_top.scatter(idx, block_max, color=theme.muted, s=22, zorder=3,
+                       label="this block's own max")
+        ax_top.step(idx, running_max, where="post", color=theme.series[0],
+                    label="running max $m$", zorder=2)
+        ax_top.set_ylim(min(block_max) - 1.5, max(running_max) + 4.0)
+        ax_top.set_xlim(-1.2, idx[-1] + 1.2)
         ax_top.set_ylabel("logit")
-        ax_top.set_title("A block only costs a rescale if it beats every block before it")
-        ax_top.legend(loc="upper left", fontsize=9.5)
+        ax_top.set_title("A block costs a rescale only by beating every block before it")
+        ax_top.legend(loc="upper left", fontsize=9.5, ncol=2)
 
-        ax_bot.axhline(1.0, color=theme.muted, linestyle="--", linewidth=1.4)
-        ax_bot.text(-0.8, 1.35, "no rescale needed  ($e^0 = 1$)", color=theme.muted,
-                    fontsize=9.5, va="bottom", ha="left")
-        ax_bot.vlines(corr_idx, floor, corr, color=theme.axis, linewidth=1.1)
+        ax_bot.axhline(1.0, color=theme.muted, linestyle="--", linewidth=1.4, zorder=1)
+        # Ink measures cost: a drop from 1 down to the correction. A block that
+        # raises nothing has correction 1 and therefore draws no stem at all.
+        ax_bot.vlines(corr_idx, corr, 1.0, color=theme.series[1], linewidth=1.4, zorder=2)
         ax_bot.scatter(corr_idx, corr, color=theme.series[1], s=26, zorder=3)
+        ax_bot.text(idx[-1] + 0.9, 1.0, f"no rescale\n({free} of {len(corr)} blocks)",
+                    color=theme.muted, fontsize=9.5, va="center", ha="left")
+        # Put the callout on whichever side has room: a deepest block near the
+        # left edge would otherwise push its label into the y-axis title.
+        left = corr_idx[deepest] < len(corr) / 2
         ax_bot.annotate(
-            f"×{corr[deepest]:.3f} — one multiply\nrebases the whole history",
-            (corr_idx[deepest], corr[deepest]), textcoords="offset points", xytext=(10, 4),
-            color=theme.series[1], fontsize=9.5, fontweight="bold", va="bottom", ha="left",
+            f"deepest rescale, $\\times${corr[deepest]:.3f}:\nstill one multiply",
+            (corr_idx[deepest], corr[deepest]), textcoords="offset points",
+            xytext=(64, 4) if left else (-14, 30),
+            color=theme.series[1], fontsize=9.5, fontweight="bold", va="bottom",
+            ha="left" if left else "right",
+            arrowprops=dict(arrowstyle="->", color=theme.series[1], linewidth=1.3),
         )
         ax_bot.set_yscale("log")
-        ax_bot.set_ylim(floor, 6.0)
-        ax_bot.set_xlabel("key/value block, streamed in order")
+        ax_bot.set_ylim(floor, 2.4)
+        ax_bot.set_xlabel("block of logits, streamed in order")
         ax_bot.set_ylabel("correction $e^{m_{old}-m_{new}}$")
+        ax_bot.set_title("...and most of them never do")
 
         fig.align_ylabels([ax_top, ax_bot])
         return save_both(fig, SLUG, "online-softmax", theme)
@@ -732,9 +978,10 @@ def figure_tiling(theme: Theme) -> Path:
         return save_both(fig, SLUG, "tiling", theme)
 
 
-def make_figures(rep: Report, softmax_trace, mem_rows, flop_rows, time_rows) -> None:
+def make_figures(rep: Report, walk_trace, softmax_trace, mem_rows, flop_rows, time_rows) -> None:
     for theme in THEMES:
         for path in (
+            figure_online_rebase(walk_trace, theme),
             figure_online_softmax(softmax_trace, theme),
             figure_memory(mem_rows, theme),
             figure_tiling(theme),
@@ -752,26 +999,29 @@ def main() -> None:
     rep = Report("03", "Flash Attention: exact, not approximate")
     rep.header()
 
-    rep.section("1. Online softmax: partial softmaxes that compose     [post §2-3]")
+    rep.section("1. Online softmax: one multiply rebases the history    [post §2]")
+    walk_trace = rebase_walkthrough(rep)
+
+    rep.section("2. Partial softmaxes compose, and stay exact            [post §3]")
     softmax_trace = check_online_softmax(rep, device)
 
-    rep.section("2. Tiled attention reproduces the reference exactly   [post §4-5]")
+    rep.section("3. Tiled attention reproduces the reference exactly   [post §4-5]")
     check_exactness(rep, device)
 
-    rep.section("3. The memory that is never allocated                   [post §6]")
+    rep.section("4. The memory that is never allocated                   [post §6]")
     mem_rows = memory_scaling(rep, device)
 
-    rep.section("4. Causal masking lets whole tiles be skipped            [post §7]")
+    rep.section("5. Causal masking lets whole tiles be skipped            [post §7]")
     causal_skipping(rep, device)
 
-    rep.section("5. Same arithmetic, different bytes                      [post §8]")
+    rep.section("6. Same arithmetic, different bytes                      [post §8]")
     flop_rows = flops_vs_bytes(rep, device)
 
-    rep.section("6. Where the speed actually comes from                   [post §8]")
+    rep.section("7. Where the speed actually comes from                   [post §8]")
     time_rows = timing(rep, device)
 
-    rep.section("7. Figures")
-    make_figures(rep, softmax_trace, mem_rows, flop_rows, time_rows)
+    rep.section("8. Figures")
+    make_figures(rep, walk_trace, softmax_trace, mem_rows, flop_rows, time_rows)
 
 
 if __name__ == "__main__":
