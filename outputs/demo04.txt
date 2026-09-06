@@ -10,8 +10,30 @@ device memory : 17.2 GB
   eval passage                       550 tokens
 
 --------------------------------------------------------------------------
-1. What rounding to a grid costs                       [post §1]
+1. What gets quantized, and what rounding costs         [post §1]
 --------------------------------------------------------------------------
+  blocks (layers)                    24
+  d_model (vector per token)         896
+  attention heads / KV heads         14 / 2
+  MLP inner width                    4864
+  vocabulary                         151,936
+  parameters                         494.0M
+
+  'Quantize the model' means the projection matrices and nothing else.
+  'tensors' counts stored arrays, not layers: 4 attention matrices in
+  each of 24 blocks is 96, and 3 MLP matrices in each is 72.
+
+  part                   tensors  params  share  quantized
+  ----------------------------------------------------------
+  attention q,k,v,o           96   44.0M   8.9%        yes
+  MLP gate,up,down            72  313.8M  63.5%        yes
+  embedding (= lm_head)        1  136.1M  27.6%         no
+  norms and biases           121    0.1M   0.0%         no
+
+  The MLP carries most of it. Note also that k_proj and v_proj are
+  7x smaller than q_proj: this model uses grouped-query attention,
+  so several query heads share one set of keys and values (post 2).
+
   One real weight matrix: layer 11 down_proj, (896, 4864), fp32.
 
   absmax |w|                         0.6133
@@ -106,6 +128,16 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
   Identical format — 8 bits, evenly spaced. Only the scope of the scale
   changes: one divisor for the whole tensor, or one per row.
+
+
+  What each scale has to cover, for L11 down_proj:
+
+  weights per scale, per-tensor      4,358,144
+  weights per scale, per-row         4,864
+
+  tensor absmax                      0.6133
+  row absmax, median                 0.0879
+  rows under half the tensor absmax  881 of 896
 
   tensor                      per-tensor  per-row  ratio
   --------------------------------------------------------
@@ -231,9 +263,11 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 8. Figures
 --------------------------------------------------------------------------
+  wrote figures/04-quantization/where-quantized-light.png
   wrote figures/04-quantization/quant-grids-light.png
   wrote figures/04-quantization/outlier-channels-light.png
   wrote figures/04-quantization/kl-tail-light.png
+  wrote figures/04-quantization/where-quantized-dark.png
   wrote figures/04-quantization/quant-grids-dark.png
   wrote figures/04-quantization/outlier-channels-dark.png
   wrote figures/04-quantization/kl-tail-dark.png

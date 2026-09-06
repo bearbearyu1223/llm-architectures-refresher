@@ -37,9 +37,10 @@ import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import torch
 
-from ..plotting import THEMES, Theme, save_both, styled
+from ..plotting import THEMES, Theme, ink_for, save_both, styled
 from ..quantizers import (
     bits_per_weight,
     int4_blockwise,
@@ -111,6 +112,65 @@ def _rel_rmse(reference: torch.Tensor, got: torch.Tensor) -> float:
 # ---------------------------------------------------------------------------
 # 1. What quantization does to a number
 # ---------------------------------------------------------------------------
+
+
+def what_gets_quantized(rep: Report, model) -> None:
+    """Which matrices a quantizer actually touches, and how big each group is.
+
+    The post needs this before it measures anything: "quantize the model" means
+    the projection matrices inside each block, and nothing else. Counting them
+    also shows why the MLP is the part that matters -- it is roughly seven times
+    the attention weights -- and why leaving the norms in fp16 costs nothing.
+    """
+    total = sum(p.numel() for p in model.parameters())
+    groups: dict[str, list[int]] = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, torch.nn.Linear):
+            leaf = name.split(".")[-1]
+            g = groups.setdefault(leaf, [0, 0])
+            g[0] += 1
+            g[1] += mod.weight.numel()
+
+    attn = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    mlp = ["gate_proj", "up_proj", "down_proj"]
+    rows = []
+    for label, keys in (("attention q,k,v,o", attn), ("MLP gate,up,down", mlp)):
+        n = sum(groups[k][0] for k in keys if k in groups)
+        params = sum(groups[k][1] for k in keys if k in groups)
+        rows.append([label, n, f"{params / 1e6:.1f}M", f"{params / total:.1%}", "yes"])
+
+    embed = model.model.embed_tokens.weight.numel()
+    tied = model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+    rows.append(["embedding" + (" (= lm_head)" if tied else ""), 1,
+                 f"{embed / 1e6:.1f}M", f"{embed / total:.1%}", "no"])
+
+    rest = total - sum(groups[k][1] for k in attn + mlp if k in groups) - embed
+    # Every remaining parameter tensor: the RMSNorm scales and the q/k/v biases.
+    # Counted the same way as the rows above, one entry per stored tensor.
+    n_rest = sum(1 for n, _ in model.named_parameters()
+                 if not any(k in n for k in ("embed", "lm_head"))
+                 and not n.endswith(".weight") or n.endswith("norm.weight"))
+    rows.append(["norms and biases", n_rest, f"{rest / 1e6:.1f}M", f"{rest / total:.1%}", "no"])
+
+    cfg = model.config
+    rep.kv("blocks (layers)", cfg.num_hidden_layers)
+    rep.kv("d_model (vector per token)", cfg.hidden_size)
+    rep.kv("attention heads / KV heads", f"{cfg.num_attention_heads} / {cfg.num_key_value_heads}")
+    rep.kv("MLP inner width", cfg.intermediate_size)
+    rep.kv("vocabulary", f"{cfg.vocab_size:,}")
+    rep.kv("parameters", f"{total / 1e6:.1f}M")
+    rep.blank()
+    rep.note("'Quantize the model' means the projection matrices and nothing else.")
+    rep.note("'tensors' counts stored arrays, not layers: 4 attention matrices in")
+    rep.note("each of 24 blocks is 96, and 3 MLP matrices in each is 72.")
+    rep.blank()
+    rep.table(["part", "tensors", "params", "share", "quantized"], rows)
+    rep.blank()
+    q = groups["q_proj"][1] / groups["k_proj"][1] if "k_proj" in groups else 0
+    rep.note(f"The MLP carries most of it. Note also that k_proj and v_proj are")
+    rep.note(f"{q:.0f}x smaller than q_proj: this model uses grouped-query attention,")
+    rep.note("so several query heads share one set of keys and values (post 2).")
+    rep.blank()
 
 
 def what_rounding_costs(rep: Report, model) -> None:
@@ -296,6 +356,21 @@ def scale_placement(rep: Report, model, acts: dict) -> None:
         f"{_rel_rmse(x, int8_per_channel(x)):.2%}",
         f"{_rel_rmse(x, int8_per_tensor(x)) / _rel_rmse(x, int8_per_channel(x)):.1f}x",
     ])
+    # Why per-row wins, in the shape of the tensor rather than in the error:
+    # one scale for the matrix is sized by a value almost no row contains.
+    w = model.model.layers[11].mlp.down_proj.weight.data
+    rmax = w.abs().amax(dim=-1)
+    rep.blank()
+    rep.note("What each scale has to cover, for L11 down_proj:")
+    rep.blank()
+    rep.kv("weights per scale, per-tensor", f"{w.numel():,}")
+    rep.kv("weights per scale, per-row", f"{w.shape[1]:,}")
+    rep.blank()
+    rep.kv("tensor absmax", f"{w.abs().max():.4f}")
+    rep.kv("row absmax, median", f"{rmax.median():.4f}")
+    rep.kv("rows under half the tensor absmax", f"{int((rmax < w.abs().max() / 2).sum())} of {w.shape[0]}")
+    rep.blank()
+
     rep.table(["tensor", "per-tensor", "per-row", "ratio"], rows)
     rep.blank()
     rep.note("For weights, splitting the scale by row is worth a few times less")
@@ -500,6 +575,140 @@ def quality(rep: Report, ids) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def figure_where_quantized(model, theme: Theme) -> Path:
+    """Where quantization lands in one block, in post 1's block-anatomy idiom.
+
+    Same vertical trunk, full-width bands and skip rails as post 1's figure, so a
+    reader who has seen that one recognises this immediately. What differs is what
+    the fill means: here it carries the claim, with the quantized bands in the
+    ramp's strong blues and everything left in 16 bits pale. Counts come off the
+    model, so the figure cannot drift from the table beside it.
+    """
+    cfg = model.config
+    blk = model.model.layers[0]
+    emb = model.model.embed_tokens.weight
+
+    def params(*mods):
+        return sum(p_.numel() for m in mods for p_ in m.parameters())
+
+    attn_n = params(blk.self_attn.q_proj, blk.self_attn.k_proj,
+                    blk.self_attn.v_proj, blk.self_attn.o_proj)
+    mlp_n = params(blk.mlp.gate_proj, blk.mlp.up_proj, blk.mlp.down_proj)
+
+    def shape_of(mod):
+        w = mod.weight
+        return f"({w.shape[0]},)" if w.dim() == 1 else f"({w.shape[0]}, {w.shape[1]})"
+
+    attn_cols = [(n, shape_of(m)) for n, m in
+                 (("q_proj", blk.self_attn.q_proj), ("k_proj", blk.self_attn.k_proj),
+                  ("v_proj", blk.self_attn.v_proj), ("o_proj", blk.self_attn.o_proj))]
+    mlp_cols = [(n, shape_of(m)) for n, m in
+                (("gate_proj", blk.mlp.gate_proj), ("up_proj", blk.mlp.up_proj),
+                 ("down_proj", blk.mlp.down_proj))]
+
+    TRUNK, SKIP = 4.9, 8.6
+    LEFT, WIDTH = 2.0, 5.8
+
+    with styled(theme):
+        fig, ax = plt.subplots(figsize=(7.8, 11.0))
+        ax.grid(False)
+        ax.set_xlim(0, 11.2); ax.set_ylim(0, 16.6); ax.axis("off")
+
+        pale = theme.ramp[0]
+
+        def band(y, h, label, sub, colour, dashed=False, cols=None):
+            ax.add_patch(patches.FancyBboxPatch(
+                (LEFT, y), WIDTH, h, boxstyle="round,pad=0.06",
+                facecolor=colour, edgecolor=theme.muted if dashed else theme.surface,
+                linewidth=1.4, linestyle=(0, (4, 3)) if dashed else "-", zorder=3))
+            tc = ink_for(colour)
+            if cols:
+                # name over shape, one column per matrix: the dimensions are the
+                # reason the MLP dominates, so they belong in the picture.
+                ax.text(TRUNK, y + h - 0.30, label, ha="center", va="center",
+                        fontsize=10.5, fontweight="bold", color=tc, zorder=4)
+                for i, (name, shape) in enumerate(cols):
+                    cx = LEFT + WIDTH * (i + 0.5) / len(cols)
+                    ax.text(cx, y + h - 0.82, name, ha="center", va="center",
+                            fontsize=9, fontweight="bold", color=tc, zorder=4)
+                    ax.text(cx, y + h - 1.16, shape, ha="center", va="center",
+                            fontsize=7.8, color=tc, zorder=4)
+                ax.text(TRUNK, y + 0.26, sub, ha="center", va="center",
+                        fontsize=8.4, color=tc, zorder=4)
+            else:
+                ax.text(TRUNK, y + h / 2 + (0.17 if sub else 0), label, ha="center",
+                        va="center", fontsize=10.5, fontweight="bold", color=tc, zorder=4)
+                if sub:
+                    ax.text(TRUNK, y + h / 2 - 0.27, sub, ha="center", va="center",
+                            fontsize=8.4, color=tc, zorder=4)
+
+        def arrow(y0, y1):
+            ax.annotate("", xy=(TRUNK, y1), xytext=(TRUNK, y0), zorder=2,
+                        arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.4))
+
+        def add_node(y):
+            ax.add_patch(patches.Circle((TRUNK, y), 0.30, facecolor=theme.surface,
+                                        edgecolor=theme.secondary, linewidth=1.6, zorder=4))
+            ax.text(TRUNK, y, "+", ha="center", va="center", fontsize=13,
+                    color=theme.secondary, fontweight="bold", zorder=5)
+
+        def skip(y_branch, y_join):
+            ax.add_patch(patches.Circle((TRUNK, y_branch), 0.075, facecolor=theme.secondary,
+                                        edgecolor="none", zorder=4))
+            ax.plot([TRUNK, SKIP], [y_branch, y_branch], color=theme.secondary, linewidth=1.4, zorder=2)
+            ax.plot([SKIP, SKIP], [y_branch, y_join], color=theme.secondary, linewidth=1.4, zorder=2)
+            ax.annotate("", xy=(TRUNK + 0.30, y_join), xytext=(SKIP, y_join), zorder=2,
+                        arrowprops=dict(arrowstyle="-|>", color=theme.secondary, linewidth=1.4))
+            ax.text(SKIP + 0.18, (y_branch + y_join) / 2, "residual", rotation=90, ha="left",
+                    va="center", fontsize=8.5, color=theme.secondary, style="italic")
+
+        ax.add_patch(patches.FancyBboxPatch(
+            (1.45, 2.20), WIDTH + 2.05, 9.35, boxstyle="round,pad=0.10",
+            facecolor="none", edgecolor=theme.axis, linewidth=1.3,
+            linestyle=(0, (5, 4)), zorder=1))
+        ax.text(1.15, 6.88, f"\u00d7 {cfg.num_hidden_layers}", rotation=90, ha="center",
+                va="center", fontsize=10, color=theme.secondary)
+
+        band(0.55, 1.15, "Token embeddings",
+             f"({emb.shape[0]:,}, {emb.shape[1]}) \u00b7 {emb.numel()/1e6:.1f}M "
+             f"\u00b7 left in 16 bits", pale, True)
+        arrow(1.70, 2.55)
+        band(2.55, 0.95, "RMSNorm", f"{shape_of(blk.input_layernorm)} \u00b7 one scale per number in a token's vector \u00b7 left in 16 bits",
+             pale, True)
+        arrow(3.50, 3.95)
+        band(3.95, 1.75, "Attention",
+             f"4 matrices \u00b7 {attn_n/1e6:.1f}M per block \u00b7 quantized",
+             theme.ramp[3], cols=attn_cols)
+        arrow(5.70, 6.15)
+        add_node(6.45)
+        skip(2.35, 6.45)
+        arrow(6.75, 7.20)
+        band(7.20, 0.95, "RMSNorm", f"{shape_of(blk.post_attention_layernorm)} \u00b7 one scale per number in a token's vector \u00b7 left in 16 bits",
+             pale, True)
+        arrow(8.15, 8.60)
+        band(8.60, 1.75, "SwiGLU MLP",
+             f"3 matrices \u00b7 {mlp_n/1e6:.1f}M per block \u00b7 quantized",
+             theme.ramp[5], cols=mlp_cols)
+        arrow(10.35, 10.80)
+        add_node(11.10)
+        skip(7.00, 11.10)
+        arrow(11.40, 11.95)
+        band(11.95, 0.95, "Final norm",
+             f"{shape_of(model.model.norm)} \u00b7 once after all {cfg.num_hidden_layers} blocks"
+             f" \u00b7 left in 16 bits", pale, True)
+        arrow(12.90, 13.35)
+        band(13.35, 1.15, "LM head",
+             f"({emb.shape[0]:,}, {emb.shape[1]}) \u00b7 the same tensor as the "
+             f"embeddings (tied)", pale, True)
+
+        ax.text(TRUNK, 16.32, "Where quantization lands in a Qwen2.5-0.5B block",
+                ha="center", fontsize=13.5, fontweight="bold", color=theme.ink)
+        ax.text(TRUNK, 15.92, "the strong bands hold trained matrices and get rounded;\n"
+                "the pale ones are left alone", ha="center", va="top", fontsize=9.5,
+                color=theme.secondary, linespacing=1.5)
+        return save_both(fig, SLUG, "where-quantized", theme)
+
+
 def figure_grids(w: torch.Tensor, theme: Theme, block: int = 64) -> Path:
     """Where each format puts its levels, over the values it actually sees.
 
@@ -580,8 +789,8 @@ def make_figures(rep: Report, model, acts: dict, kls: dict) -> None:
     w = model.model.layers[11].mlp.down_proj.weight.data
     weights = {"L11 down_proj": w}
     for theme in THEMES:
-        for path in (figure_grids(w, theme), figure_outliers(acts, weights, theme),
-                     figure_tail(kls, theme)):
+        for path in (figure_where_quantized(model, theme), figure_grids(w, theme),
+                     figure_outliers(acts, weights, theme), figure_tail(kls, theme)):
             rep.note(f"wrote {path.relative_to(path.parents[2])}")
 
 
@@ -600,7 +809,8 @@ def main() -> None:
     rep.kv("parameters", f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
     rep.kv("eval passage", f"{ids.shape[1]} tokens")
 
-    rep.section("1. What rounding to a grid costs                       [post §1]")
+    rep.section("1. What gets quantized, and what rounding costs         [post §1]")
+    what_gets_quantized(rep, model)
     what_rounding_costs(rep, model)
 
     rep.section("2. Where the outliers actually live                    [post §2]")
