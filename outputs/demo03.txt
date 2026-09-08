@@ -128,12 +128,16 @@ device memory : 17.2 GB
 
   extrapolating the score matrix past what fits on this machine:
 
-  seq     score matrix, 8 heads fp32
-  ------------------------------------
-  8192                       2.0 GiB
-  16384                      8.0 GiB
-  32768                     32.0 GiB
-  131072                   512.0 GiB
+  seq     8 heads, fp32  Llama 3.1 8B: 32 heads, bf16
+  -----------------------------------------------------
+  8192          2.0 GiB                       4.0 GiB
+  16384         8.0 GiB                      16.0 GiB
+  32768        32.0 GiB                      64.0 GiB
+  131072      512.0 GiB                    1024.0 GiB
+
+  At 128k in Llama 3.1 8B's shape that is 1.0 TiB of scratch for a
+  single layer - enough to fill about 14 A100 80GB cards, holding a
+  matrix that is normalized and thrown away immediately.
 
   >> The naive score matrix is quadratic in sequence length and is the
      reason long context was infeasible. The tile is a constant, chosen to
@@ -208,10 +212,10 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
   seq   naive (ms)  fused SDPA (ms)  speedup
   --------------------------------------------
-  512       1.2422           0.3726    3.33x
-  1024      3.7080           0.7676    4.83x
-  2048     13.2959           2.0374    6.53x
-  4096     55.3251           7.5176    7.36x
+  512       1.2596           0.3711    3.39x
+  1024      3.5855           0.8322    4.31x
+  2048     13.0506           2.0364    6.41x
+  4096     55.4302           7.0188    7.90x
 
   The Python tiled loop above is far slower than either — it pays full
   HBM traffic per tile plus Python overhead. The algorithm buys memory;

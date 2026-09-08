@@ -495,10 +495,23 @@ def memory_scaling(rep: Report, device: torch.device) -> list[dict[str, float]]:
     rep.blank()
     rep.note("extrapolating the score matrix past what fits on this machine:")
     rep.blank()
+    # A second column in a real model's shape, because the demo's 8 heads at fp32
+    # understate it: Llama 3.1 8B has 32 query heads and runs in bf16, which is
+    # four times the heads against half the bytes, so twice the matrix.
+    L_HEADS, L_BYTES = 32, 2
     rep.table(
-        ["seq", "score matrix, 8 heads fp32"],
-        [[n, f"{batch * heads * n * n * 4 / 1024**3:.1f} GiB"] for n in (8_192, 16_384, 32_768, 131_072)],
+        ["seq", "8 heads, fp32", "Llama 3.1 8B: 32 heads, bf16"],
+        [[n,
+          f"{batch * heads * n * n * 4 / 1024**3:.1f} GiB",
+          f"{L_HEADS * n * n * L_BYTES / 1024**3:.1f} GiB"]
+         for n in (8_192, 16_384, 32_768, 131_072)],
     )
+    rep.blank()
+    a100 = 80e9
+    big = L_HEADS * 131_072 ** 2 * L_BYTES
+    rep.note(f"At 128k in Llama 3.1 8B's shape that is {big / 1024**4:.1f} TiB of scratch for a")
+    rep.note(f"single layer - enough to fill about {big / a100:.0f} A100 80GB cards, holding a")
+    rep.note("matrix that is normalized and thrown away immediately.")
     rep.takeaway(
         "The naive score matrix is quadratic in sequence length and is the reason "
         "long context was infeasible. The tile is a constant, chosen to fit in SRAM."
