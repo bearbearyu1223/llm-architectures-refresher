@@ -291,7 +291,7 @@ def one_token_routed(
         f"after the cut, so how much probability the router left behind becomes "
         f"a scale on the layer's output."
     )
-    return [int(e) for e in top_e.tolist()]
+    return [int(e) for e in top_e.tolist()], kept
 
 
 def routing_depth_profile(rep: Report, model, logits: torch.Tensor, tok, ids: torch.Tensor) -> None:
@@ -520,7 +520,53 @@ def batch_collapse(rep: Report, model, logits: torch.Tensor) -> list[tuple[int, 
 
 
 # ---------------------------------------------------------------------------
-# 7. Load balance
+# 7. Experts across GPUs
+# ---------------------------------------------------------------------------
+
+
+def experts_across_gpus(rep: Report, model, logits: torch.Tensor) -> list[tuple[int, float]]:
+    """When experts are split across GPUs, how many does one token have to reach?
+
+    Expert parallelism shards the experts, not the tokens: GPU g holds a
+    contiguous block of experts, and a token whose top-k spans several GPUs has
+    to be sent to each of them and its results gathered back. That is the
+    all-to-all every MoE serving stack pays for, and it is measurable straight
+    from the routing indices without owning a single GPU.
+    """
+    n_exp, top_k, layers = _cfg(model)
+    idx = _topk_idx(logits, top_k)
+    rows, curve = [], []
+    for g in (2, 4, 8, 16):
+        per_gpu = n_exp // g
+        gpus = idx // per_gpu                       # which GPU each choice lands on
+        hit = torch.zeros(*gpus.shape[:2], g, dtype=torch.bool)
+        hit.scatter_(2, gpus, True)
+        distinct = hit.sum(dim=-1).float()          # GPUs touched, per (layer, token)
+        all_of_them = (distinct == g).float().mean()
+        curve.append((g, distinct.mean().item()))
+        rows.append(
+            [
+                g,
+                per_gpu,
+                f"{distinct.mean():.2f}",
+                f"{100 * distinct.mean() / g:.0f}%",
+                f"{100 * all_of_them:.0f}%",
+            ]
+        )
+    rep.table(
+        ["GPUs", "experts each", "GPUs per token", "of all", "tokens needing all"],
+        rows,
+    )
+    rep.takeaway(
+        f"Split across 8 GPUs, one token's {top_k} experts land on "
+        f"{curve[2][1]:.1f} of them on average. Expert parallelism moves tokens "
+        f"between GPUs, and the router decides how much."
+    )
+    return curve
+
+
+# ---------------------------------------------------------------------------
+# 8. Load balance
 # ---------------------------------------------------------------------------
 
 
@@ -649,6 +695,225 @@ def figure_block(model, chosen: list[int], theme: Theme) -> Path:
     return save_both(fig, SLUG, "moe-block", theme)
 
 
+def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> Path:
+    """One-page orientation diagram: whole model, one MoE layer, one expert.
+
+    Every number on it is this post's own measurement, so the picture cannot
+    drift out of agreement with the tables. Panels get their own axes rather
+    than one shared coordinate space, which keeps each region's layout
+    independent and stops a change in one from shifting the others.
+    """
+    n_exp, top_k, layers = _cfg(model)
+    total = sum(p.numel() for p in model.parameters())
+    hid = model.config.hidden_size
+    inter = model.config.intermediate_size
+    vocab = model.config.vocab_size
+    per_expert = 3 * hid * inter
+
+    fig = plt.figure(figsize=(13.5, 15.5))
+    ax_stack = fig.add_axes([0.015, 0.450, 0.245, 0.470])
+    ax_zoom = fig.add_axes([0.315, 0.450, 0.670, 0.470])
+    ax_exp = fig.add_axes([0.015, 0.020, 0.270, 0.375])
+    ax_num = fig.add_axes([0.345, 0.020, 0.290, 0.375])
+    ax_step = fig.add_axes([0.695, 0.020, 0.290, 0.375])
+    for ax in (ax_stack, ax_zoom, ax_exp, ax_num, ax_step):
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+        ax.grid(False)
+
+    def box(ax, x, y, w, h, label, fill, fs=9.5, ink=None, lw=1.1, ec=None):
+        ax.add_patch(patches.FancyBboxPatch(
+            (x, y), w, h, boxstyle="round,pad=0.008,rounding_size=0.02",
+            linewidth=lw, edgecolor=ec or theme.axis, facecolor=fill, zorder=2))
+        ax.text(x + w / 2, y + h / 2, label, ha="center", va="center",
+                fontsize=fs, color=ink or ink_for(fill), zorder=3, linespacing=1.45)
+
+    def down(ax, x, y1, y2):
+        ax.annotate("", xy=(x, y2), xytext=(x, y1), zorder=1,
+                    arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2))
+
+    def panel(ax, title):
+        ax.add_patch(patches.FancyBboxPatch(
+            (0.005, 0.005), 0.99, 0.99, boxstyle="round,pad=0.006,rounding_size=0.03",
+            linewidth=1.0, edgecolor=theme.axis, facecolor="none", zorder=0))
+        ax.text(0.5, 0.955, title, ha="center", va="center",
+                fontsize=11.5, fontweight="bold", color=theme.ink)
+
+    # ---- left: the whole model -------------------------------------------
+    ax_stack.text(0.5, 0.985, "The whole model", ha="center", fontsize=11.5,
+                  fontweight="bold", color=theme.ink)
+    ax_stack.text(0.5, 0.938, "input text", ha="center", fontsize=9.5,
+                  color=theme.secondary)
+    down(ax_stack, 0.5, 0.924, 0.892)
+    box(ax_stack, 0.06, 0.832, 0.88, 0.060,
+        "token embedding\n({:,} -> {:,})".format(vocab, hid), theme.ramp[1])
+    down(ax_stack, 0.5, 0.832, 0.800)
+
+    ax_stack.add_patch(patches.FancyBboxPatch(
+        (0.02, 0.318), 0.96, 0.482, boxstyle="round,pad=0.006,rounding_size=0.02",
+        linewidth=1.1, edgecolor=theme.muted, facecolor="none",
+        linestyle=(0, (4, 3)), zorder=1))
+    ax_stack.text(0.5, 0.770, "{} × transformer layer".format(layers),
+                  ha="center", fontsize=9.5, style="italic", color=theme.secondary)
+    box(ax_stack, 0.07, 0.652, 0.86, 0.092,
+        "self-attention + RoPE\n(dense: every token\nuses all of it)", theme.ramp[1], fs=9)
+    down(ax_stack, 0.5, 0.652, 0.620)
+    box(ax_stack, 0.07, 0.462, 0.86, 0.158,
+        "MoE feed-forward\n\n{} experts\ntop-{} per token\n\n(sparse)".format(n_exp, top_k),
+        theme.series[1], ink="#ffffff", fs=9, lw=2.0, ec=theme.series[1])
+    down(ax_stack, 0.5, 0.462, 0.412)
+    for dy in (0.0, 0.020, 0.040):
+        ax_stack.plot([0.5], [0.348 + dy], marker="o", markersize=2.2,
+                      color=theme.muted, zorder=3)
+    down(ax_stack, 0.5, 0.310, 0.272)
+    box(ax_stack, 0.06, 0.212, 0.88, 0.060, "final norm", theme.ramp[0])
+    down(ax_stack, 0.5, 0.212, 0.180)
+    box(ax_stack, 0.06, 0.104, 0.88, 0.076,
+        "LM head\n({:,} -> {:,})".format(hid, vocab), theme.ramp[1])
+    down(ax_stack, 0.5, 0.104, 0.072)
+    ax_stack.text(0.5, 0.042, "next-token probabilities", ha="center",
+                  fontsize=9.5, color=theme.secondary)
+
+    # ---- right: one MoE layer, zoomed ------------------------------------
+    ax_zoom.add_patch(patches.FancyBboxPatch(
+        (0.005, 0.005), 0.99, 0.99, boxstyle="round,pad=0.006,rounding_size=0.02",
+        linewidth=1.6, edgecolor=theme.series[1], facecolor="none", zorder=0))
+    ax_zoom.text(0.5, 0.958, "One MoE feed-forward layer, in detail",
+                 ha="center", fontsize=11.5, fontweight="bold", color=theme.ink)
+
+    box(ax_zoom, 0.030, 0.812, 0.195, 0.078,
+        "input from\nattention\n({:,})".format(hid), theme.ramp[0], fs=8.8)
+    ax_zoom.annotate("", xy=(0.320, 0.851), xytext=(0.232, 0.851),
+                     arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2))
+    box(ax_zoom, 0.320, 0.806, 0.235, 0.090,
+        "router\n{} × {:,} linear,\nthen softmax".format(n_exp, hid),
+        theme.series[1], ink="#ffffff", fs=8.8)
+    ax_zoom.annotate("", xy=(0.650, 0.851), xytext=(0.562, 0.851),
+                     arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2))
+    box(ax_zoom, 0.650, 0.803, 0.320, 0.096,
+        "one score per expert, {} of them.\nkeep the top {}, discard the rest".format(n_exp, top_k),
+        theme.ramp[0], fs=8.8)
+
+    down(ax_zoom, 0.4375, 0.806, 0.768)
+    ax_zoom.plot([0.115, 0.885], [0.768, 0.768], color=theme.secondary, lw=1.2)
+    for x in (0.115, 0.30, 0.50, 0.70, 0.885):
+        down(ax_zoom, x, 0.768, 0.720)
+
+    cols = 16
+    cw, ch, gap = 0.0475, 0.050, 0.0045
+    x0 = 0.5 - (cols * cw + (cols - 1) * gap) / 2
+    y0 = 0.708
+    for e in range(n_exp):
+        r, c = divmod(e, cols)
+        x = x0 + c * (cw + gap)
+        y = y0 - r * (ch + gap) - ch
+        on = e in chosen
+        ax_zoom.add_patch(patches.Rectangle(
+            (x, y), cw, ch, linewidth=0.8, zorder=2,
+            edgecolor=theme.series[1] if on else theme.axis,
+            facecolor=theme.ramp[5] if on else theme.surface))
+        if on:
+            ax_zoom.text(x + cw / 2, y + ch / 2, str(e), ha="center", va="center",
+                         fontsize=6.5, color=ink_for(theme.ramp[5]), zorder=3)
+    gb = y0 - (n_exp // cols) * (ch + gap)
+    ax_zoom.text(0.5, gb - 0.032,
+                 "{} experts run  ·  {} are skipped, and stay in memory either way".format(
+                     top_k, n_exp - top_k),
+                 ha="center", fontsize=9.5, color=theme.secondary)
+
+    down(ax_zoom, 0.5, gb - 0.058, gb - 0.108)
+    box(ax_zoom, 0.275, gb - 0.212, 0.45, 0.104,
+        "weighted combination\nadd the {} outputs, each scaled\nby its own router score".format(top_k),
+        theme.ramp[4], fs=8.8)
+    down(ax_zoom, 0.5, gb - 0.212, gb - 0.258)
+    ax_zoom.text(0.5, gb - 0.288,
+                 "output to the next layer ({:,})".format(hid),
+                 ha="center", fontsize=9.5, color=theme.secondary)
+    ax_zoom.text(0.5, gb - 0.360,
+                 "the {} kept scores sum to {:.4f}, not 1 — OLMoE does not renormalize\n"
+                 "after the cut, so that shortfall scales this layer's output".format(top_k, kept),
+                 ha="center", fontsize=9, color=theme.ink, linespacing=1.5)
+
+    # ---- bottom left: inside one expert ----------------------------------
+    panel(ax_exp, "What is inside one expert?")
+    steps = [
+        ("input ({:,})".format(hid), theme.ramp[0], 0.068),
+        ("gate -> {:,}    up -> {:,}\n(two linears, side by side)".format(inter, inter),
+         theme.ramp[1], 0.100),
+        ("SiLU on gate, multiply by up\n(that pairing is SwiGLU)", theme.ramp[2], 0.100),
+        ("down -> {:,}\n(one linear, back down)".format(hid), theme.ramp[1], 0.100),
+        ("output ({:,})".format(hid), theme.ramp[0], 0.068),
+    ]
+    y = 0.858
+    for i, (label, fill, h) in enumerate(steps):
+        box(ax_exp, 0.07, y - h, 0.86, h, label, fill, fs=8.6)
+        if i < len(steps) - 1:
+            down(ax_exp, 0.5, y - h, y - h - 0.040)
+        y -= h + 0.040
+    ax_exp.text(0.5, 0.092,
+                "an ordinary feed-forward network —\nthe same one a dense model has, "
+                "built {} times per layer.\n{:.2f}M parameters each.".format(n_exp, per_expert / 1e6),
+                ha="center", fontsize=8.6, color=theme.secondary, linespacing=1.6)
+
+    # ---- bottom middle: the numbers --------------------------------------
+    panel(ax_num, "Key numbers, all measured here")
+    rows = [
+        ("total parameters", "{:.3f}B".format(total / 1e9)),
+        ("active per token", "1.177B   (17.0%)"),
+        ("layers", "{}".format(layers)),
+        ("experts per layer", "{}".format(n_exp)),
+        ("experts per token", "{}".format(top_k)),
+        ("parameters per expert", "{:.2f}M".format(per_expert / 1e6)),
+        ("weights that are experts", "93.1%"),
+        ("weights that are router", "0.030%"),
+        ("resident in bf16", "12.89 GiB"),
+        ("experts for 1 token", "{}".format(top_k)),
+        ("experts for 256 tokens", "60.9"),
+    ]
+    y = 0.858
+    for label, value in rows:
+        ax_num.text(0.06, y, label, ha="left", va="center", fontsize=9,
+                    color=theme.secondary)
+        ax_num.text(0.94, y, value, ha="right", va="center", fontsize=9,
+                    fontweight="bold", color=theme.ink)
+        y -= 0.0705
+    ax_num.plot([0.06, 0.94], [y + 0.034, y + 0.034], color=theme.axis, lw=0.8)
+    ax_num.text(0.5, y - 0.012, "OLMoE-1B-7B · bfloat16 · Apple M4",
+                ha="center", fontsize=8.5, color=theme.muted)
+
+    # ---- bottom right: the walk-through ----------------------------------
+    panel(ax_step, "What happens to one token")
+    walk = [
+        "It goes through self-attention,\nexactly as in a dense model.",
+        "The router scores all {} experts\nfrom the token's own vector.".format(n_exp),
+        "Softmax, then keep the top {}.\nThe other {} are skipped.".format(top_k, n_exp - top_k),
+        "Those {} experts run, in parallel.\nEach is an ordinary FFN.".format(top_k),
+        "Their outputs are added, each\nscaled by its router score.",
+        "On to the next layer, which\nroutes it again, independently.",
+    ]
+    y = 0.862
+    for i, text in enumerate(walk, start=1):
+        ax_step.add_patch(patches.Circle((0.11, y), 0.030, facecolor=theme.series[0],
+                                         edgecolor="none", zorder=3))
+        ax_step.text(0.11, y, str(i), ha="center", va="center", fontsize=9,
+                     fontweight="bold", color=ink_for(theme.series[0]), zorder=4)
+        ax_step.text(0.195, y, text, ha="left", va="center", fontsize=8.6,
+                     color=theme.ink, linespacing=1.6)
+        y -= 0.126
+    ax_step.text(0.5, 0.048,
+                 "The capacity of {:.1f}B parameters,\nthe arithmetic of 1.2B,\n"
+                 "and the memory bill of all {:.1f}B.".format(total / 1e9, total / 1e9),
+                 ha="center", fontsize=8.8, color=theme.secondary, linespacing=1.6)
+
+    fig.suptitle("Mixture-of-Experts, end to end", fontsize=16, fontweight="bold",
+                 color=theme.ink, y=0.976)
+    fig.text(0.5, 0.950,
+             "OLMoE-1B-7B — every number on this page is measured in this post",
+             ha="center", fontsize=10.5, color=theme.secondary)
+    return save_both(fig, SLUG, "moe-architecture", theme)
+
+
 def figure_where_the_weights_are(rep_counts: dict, theme: Theme) -> Path:
     """Ink measures the quantity: one bar, split by role."""
     fig, ax = plt.subplots(figsize=(9.5, 2.9))
@@ -757,12 +1022,13 @@ def figure_batch_collapse(curve: list[tuple[int, float]], n_exp: int, theme: The
 
 def make_figures(
     rep: Report, model, counts: dict, usage: dict, halves: dict,
-    curve: list, chosen: list[int],
+    curve: list, chosen: list[int], kept: float,
 ) -> None:
     n_exp, _, _ = _cfg(model)
     written = []
     for theme in THEMES:
         with styled(theme):
+            written.append(figure_architecture(model, chosen, kept, theme))
             written.append(figure_block(model, chosen, theme))
             written.append(figure_where_the_weights_are(counts, theme))
             written.append(figure_specialization(usage, halves, theme))
@@ -815,7 +1081,7 @@ def main() -> None:
     logits = route(model, ids)
 
     rep.section("3. One token, routed                               [post §3]")
-    chosen = one_token_routed(rep, model, tok, logits, ids)
+    chosen, kept = one_token_routed(rep, model, tok, logits, ids)
     rep.blank()
     routing_depth_profile(rep, model, logits, tok, ids)
 
@@ -835,14 +1101,19 @@ def main() -> None:
     rep.blank()
     curve = batch_collapse(rep, model, long_logits)
 
-    rep.section("7. Nothing balances the load for free              [post §7]")
+    rep.section("7. Experts across GPUs                             [post §7]")
+    rep.kv("passage", f"{long_ids.shape[1]} tokens")
+    rep.blank()
+    experts_across_gpus(rep, model, long_logits)
+
+    rep.section("8. Nothing balances the load for free              [post §8]")
     rep.kv("passage", f"{long_ids.shape[1]} tokens")
     rep.kv("routing slots per layer", f"{long_ids.shape[1] * top_k}")
     rep.blank()
     load_balance(rep, model, long_logits)
 
-    rep.section("8. Figures")
-    make_figures(rep, model, counts, usage, halves, curve, chosen)
+    rep.section("9. Figures")
+    make_figures(rep, model, counts, usage, halves, curve, chosen, kept)
 
 
 if __name__ == "__main__":
