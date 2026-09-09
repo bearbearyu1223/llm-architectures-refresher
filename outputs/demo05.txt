@@ -1,0 +1,211 @@
+==========================================================================
+DEMO 05: Mixture-of-experts: routing, and what sparsity costs
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  model                              allenai/OLMoE-1B-7B-0924
+  layers                             16
+  experts per layer                  64
+  experts per token                  8
+  dtype                              bfloat16
+  routing passage                    94 tokens
+
+--------------------------------------------------------------------------
+1. Where the parameters actually are               [post §1]
+--------------------------------------------------------------------------
+  role          parameters   share
+  ----------------------------------
+  experts           6.442B   93.1%
+  attention         0.269B    3.9%
+  embed + head      0.206B    3.0%
+  router             2.10M  0.030%
+  norms              0.07M  0.001%
+  TOTAL             6.919B  100.0%
+
+  experts per layer                  64
+  experts used per token             8
+  parameters in one expert           6.29M
+  total parameters                   6.919B
+  active parameters per token        1.177B
+  active share                       17.0%
+
+  >> 93% of the weights are experts, and a token touches 8 of 64 of them.
+     The model is mostly a thing it declines to use.
+
+--------------------------------------------------------------------------
+2. The router is the smallest part of the model    [post §2]
+--------------------------------------------------------------------------
+  router matrices                    16 (one per layer)
+  shape of each                      (64, 2048)
+  router parameters                  2.10M
+  as a share of the model            0.030%
+  router bytes (bf16)                4.0 MiB
+  everything else (bf16)             12.88 GiB
+
+  >> One matrix per layer, 0.03% of the parameters, decides how the other
+     93% are spent on every token.
+
+--------------------------------------------------------------------------
+3. One token, routed                               [post §3]
+--------------------------------------------------------------------------
+  token                              1 = ' harbour'
+  layer                              0
+  router output                      64 logits -> softmax -> top-8
+
+  rank  expert    logit  softmax weight
+  ---------------------------------------
+  1          5  +1.8984          0.1161
+  2         14  +1.6016          0.0862
+  3         41  +1.3516          0.0672
+  4         18  +1.2344          0.0597
+  5          6  +0.7148          0.0355
+  6         17  +0.3340          0.0243
+  7         28  +0.1201          0.0196
+  8          9  +0.1143          0.0195
+
+  sum of the 8 kept weights          0.4281
+  sum of all 64 weights              1.0000
+  discarded by the top-k cut         0.5719
+  renormalized? (norm_topk_prob)     no
+
+  >> The kept weights sum to 0.4281, not 1. OLMoE does not renormalize
+     after the cut, so how much probability the router left behind becomes
+     a scale on the layer's output.
+
+  layer  top-1 expert  its weight  kept total  share
+  ----------------------------------------------------
+  0                 5      0.1161      0.4281   0.27
+  1                53      0.0583      0.2540   0.23
+  2                36      0.0866      0.3215   0.27
+  3                 0      0.0697      0.3567   0.20
+  4                35      0.0761      0.3316   0.23
+  5                23      0.0639      0.3003   0.21
+  6                17      0.0647      0.3298   0.20
+  7                43      0.0443      0.3162   0.14
+  8                 6      0.0636      0.3282   0.19
+  9                41      0.0540      0.3338   0.16
+  10               23      0.1208      0.4334   0.28
+  11               55      0.0755      0.3685   0.20
+  12               48      0.0764      0.4592   0.17
+  13                0      0.0733      0.4784   0.15
+  14               46      0.0982      0.4830   0.20
+  15               23      0.1158      0.4851   0.24
+
+  >> One token is routed independently at every layer, so it visits 16
+     separate committees of 8 on its way through the model.
+
+--------------------------------------------------------------------------
+4. What the router learns                          [post §4]
+--------------------------------------------------------------------------
+  passage  tokens
+  -----------------
+  prose        94
+  code        140
+  math        103
+
+  Total variation distance between expert-usage distributions:
+  0.00 = the two samples used the experts identically.
+  The first row is the noise floor -- two halves of the SAME
+  passage, which differ only by sampling. Read every other row
+  against it.
+
+  comparison           layer 0  layer 8  layer 15   mean
+  --------------------------------------------------------
+  same passage, split    0.240    0.210     0.173  0.216
+  prose vs code          0.465    0.736     0.855  0.731
+  prose vs math          0.362    0.508     0.596  0.535
+  code vs math           0.371    0.491     0.505  0.397
+
+  noise floor, mean over layers      0.216
+  cross-domain, mean over layers     0.554
+  cross-domain over noise floor      2.56x
+
+  most code-leaning expert (layer 15) 17
+    share of code routing slots      9.73%
+    share of prose routing slots     0.13%
+    an even share would be           1.56%
+  experts unused by prose but used by code 13
+
+  noise floor, first layer           0.240
+  cross-domain, first layer          0.400
+  noise floor, last layer            0.173
+  cross-domain, last layer           0.652
+
+  >> Two halves of one passage differ by 0.22; two different kinds of text
+     differ by 0.55, 2.6x as much. Expert choice tracks the kind of text,
+     and the gap widens with depth.
+
+--------------------------------------------------------------------------
+5. Two bills: memory and time                      [post §5]
+--------------------------------------------------------------------------
+  weights resident (bf16)            12.89 GiB
+    every expert must be in memory; the router picks at run time,
+    so there is no subset you could have left on disk.
+
+  experts per token  forward (ms)  vs top-8
+  -------------------------------------------
+  8                         407.4     1.00x
+  64                        920.1     2.26x
+
+  expert FLOPs ratio (64/8)          8x
+  measured wall-clock ratio          2.26x
+    below 8x because attention, norms and the LM head are unchanged
+
+  >> Turning every expert on costs 2.3x the time and 0 extra bytes of
+     weights. Memory is billed on 6.9B parameters no matter which 8 get
+     used.
+
+--------------------------------------------------------------------------
+6. Sparsity does not survive a batch               [post §6]
+--------------------------------------------------------------------------
+  passage                            356 tokens
+
+  tokens together  experts needed  of 64  expert-slots used
+  -----------------------------------------------------------
+  1                           8.0    12%                  8
+  2                          13.1    20%                 16
+  4                          21.1    33%                 32
+  8                          31.4    49%                 64
+  16                         40.8    64%                128
+  32                         48.5    76%                256
+  64                         53.9    84%                512
+  128                        58.0    91%               1024
+  256                        60.9    95%               2048
+
+  >> One token needs 8 experts; 256 tokens together need 61. Sparsity is a
+     property of a token, not of a batch — which is why an MoE saves
+     arithmetic but not memory.
+
+--------------------------------------------------------------------------
+7. Nothing balances the load for free              [post §7]
+--------------------------------------------------------------------------
+  passage                            356 tokens
+  routing slots per layer            2848
+
+  layer  busiest  quietest  busiest vs even  coeff of var
+  ---------------------------------------------------------
+  0        8.92%     0.04%            5.71x          0.88
+  8        7.30%     0.00%            4.67x          0.89
+  15       8.32%     0.00%            5.33x          1.07
+
+  even share would be                1.56%
+  router_aux_loss_coef               0.0100
+  experts never used (last layer)    4
+
+  >> Nothing makes the experts equally popular by construction; a balance
+     penalty during training is what keeps one expert from swallowing the
+     traffic and the rest from starving.
+
+--------------------------------------------------------------------------
+8. Figures
+--------------------------------------------------------------------------
+  wrote figures/05-mixture-of-experts/moe-block-light.png
+  wrote figures/05-mixture-of-experts/weight-census-light.png
+  wrote figures/05-mixture-of-experts/specialization-light.png
+  wrote figures/05-mixture-of-experts/batch-collapse-light.png
+  wrote figures/05-mixture-of-experts/moe-block-dark.png
+  wrote figures/05-mixture-of-experts/weight-census-dark.png
+  wrote figures/05-mixture-of-experts/specialization-dark.png
+  wrote figures/05-mixture-of-experts/batch-collapse-dark.png
