@@ -146,14 +146,14 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         438.8     1.00x
-  64                        932.0     2.12x
+  8                         425.9     1.00x
+  64                        927.3     2.18x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.12x
+  measured wall-clock ratio          2.18x
     below 8x because attention, norms and the LM head are unchanged
 
-  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
+  >> Turning every expert on costs 2.2x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 
@@ -219,11 +219,13 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
   wrote figures/05-mixture-of-experts/moe-architecture-light.png
   wrote figures/05-mixture-of-experts/moe-block-light.png
+  wrote figures/05-mixture-of-experts/router-flow-light.png
   wrote figures/05-mixture-of-experts/weight-census-light.png
   wrote figures/05-mixture-of-experts/specialization-light.png
   wrote figures/05-mixture-of-experts/batch-collapse-light.png
   wrote figures/05-mixture-of-experts/moe-architecture-dark.png
   wrote figures/05-mixture-of-experts/moe-block-dark.png
+  wrote figures/05-mixture-of-experts/router-flow-dark.png
   wrote figures/05-mixture-of-experts/weight-census-dark.png
   wrote figures/05-mixture-of-experts/specialization-dark.png
   wrote figures/05-mixture-of-experts/batch-collapse-dark.png

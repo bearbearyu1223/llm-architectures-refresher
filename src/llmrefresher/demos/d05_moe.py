@@ -914,6 +914,111 @@ def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> 
     return save_both(fig, SLUG, "moe-architecture", theme)
 
 
+def figure_router_flow(model, logits: torch.Tensor, theme: Theme,
+                       layer: int = 0, pos: int = 1) -> Path:
+    """The router as a shape walkthrough, then the same token's real numbers.
+
+    The top row is the pipeline in tensor shapes, which is the form post 1 used
+    for attention. The bottom is all 64 probabilities for one actual token, so
+    the reader can see *why* the kept mass is a fraction rather than being told.
+    """
+    n_exp, top_k, layers = _cfg(model)
+    hid = model.config.hidden_size
+    row = logits[layer, pos]
+    probs = torch.softmax(row, dim=-1)
+    top_w, top_e = torch.topk(probs, top_k)
+    kept = top_w.sum().item()
+
+    fig = plt.figure(figsize=(12.5, 8.2))
+    ax_flow = fig.add_axes([0.02, 0.575, 0.96, 0.355])
+    ax_bar = fig.add_axes([0.075, 0.085, 0.895, 0.405])
+    for ax in (ax_flow, ax_bar):
+        ax.grid(False)
+    ax_flow.set_xlim(0, 1); ax_flow.set_ylim(0, 1); ax_flow.axis("off")
+
+    def grid(ax, cx, cy, cols, rows_n, w, h, fill, edge=None):
+        cw, chh = w / cols, h / rows_n
+        for r in range(rows_n):
+            for c in range(cols):
+                ax.add_patch(patches.Rectangle(
+                    (cx - w / 2 + c * cw, cy + h / 2 - (r + 1) * chh), cw, chh,
+                    linewidth=0.6, edgecolor=edge or theme.axis, facecolor=fill, zorder=2))
+
+    def caption(ax, cx, title, shape, y_title=0.325, y_shape=0.255):
+        ax.text(cx, y_title, title, ha="center", fontsize=10,
+                fontweight="bold", color=theme.ink)
+        ax.text(cx, y_shape, shape, ha="center", va="top", fontsize=9,
+                color=theme.secondary, linespacing=1.5)
+
+    def op(ax, x1, x2, label, sub):
+        y = 0.60
+        ax.annotate("", xy=(x2, y), xytext=(x1, y),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.3))
+        mid = (x1 + x2) / 2
+        ax.text(mid, y + 0.115, label, ha="center", fontsize=9.5,
+                fontweight="bold", color=theme.series[1])
+        ax.text(mid, y + 0.035, sub, ha="center", fontsize=8.5, color=theme.secondary)
+
+    xs = [0.085, 0.375, 0.665, 0.925]
+    grid(ax_flow, xs[0], 0.60, 6, 4, 0.105, 0.30, theme.ramp[1])
+    caption(ax_flow, xs[0], "token vectors", f"(n × {hid:,})")
+    op(ax_flow, xs[0] + 0.075, xs[1] - 0.095, "router matrix",
+       f"{hid:,} -> {n_exp}, one score per expert")
+    grid(ax_flow, xs[1], 0.60, 8, 4, 0.135, 0.30, theme.ramp[2])
+    caption(ax_flow, xs[1], "routing logits", f"(n × {n_exp})   raw scores")
+    op(ax_flow, xs[1] + 0.09, xs[2] - 0.095, "softmax",
+       f"over all {n_exp}, each row sums to 1")
+    grid(ax_flow, xs[2], 0.60, 8, 4, 0.135, 0.30, theme.ramp[4])
+    caption(ax_flow, xs[2], "routing probabilities", f"(n × {n_exp})")
+    op(ax_flow, xs[2] + 0.09, xs[3] - 0.055, f"keep top {top_k}",
+       "discard the rest")
+    grid(ax_flow, xs[3], 0.60, 2, 4, 0.045, 0.30, theme.ramp[5])
+    caption(ax_flow, xs[3], "chosen experts", f"(n × {top_k})\n+ their weights")
+
+    ax_flow.text(0.5, 0.965, "How the router picks, in shapes",
+                 ha="center", fontsize=12.5, fontweight="bold", color=theme.ink)
+    ax_flow.text(0.5, 0.895, "n is however many tokens are being processed together; "
+                 "every row is routed independently",
+                 ha="center", fontsize=9, color=theme.secondary)
+
+    # ---- the same thing, for one real token ------------------------------
+    keep = set(int(e) for e in top_e.tolist())
+    colors = [theme.ramp[5] if e in keep else theme.ramp[1] for e in range(n_exp)]
+    ax_bar.bar(range(n_exp), probs.numpy() * 100, color=colors, width=0.78,
+               edgecolor="none")
+    ax_bar.set_xlim(-1, n_exp)
+    ax_bar.set_xlabel(f"expert (layer {layer})", color=theme.secondary)
+    ax_bar.set_ylabel("routing probability (%)", color=theme.secondary)
+    ax_bar.set_title(
+        f"All {n_exp} probabilities for one token, and the {top_k} that survive the cut",
+        color=theme.ink)
+    for s in ("top", "right"):
+        ax_bar.spines[s].set_visible(False)
+    ax_bar.spines["left"].set_color(theme.axis)
+    ax_bar.spines["bottom"].set_color(theme.axis)
+    ax_bar.tick_params(colors=theme.muted)
+    for lbl in ax_bar.get_xticklabels() + ax_bar.get_yticklabels():
+        lbl.set_color(theme.secondary)
+    ax_bar.set_axisbelow(True)
+    ax_bar.yaxis.grid(True, color=theme.grid, linewidth=0.8)
+
+    # annotate the kept mass, placed on whichever side has room
+    hi = int(top_e[0])
+    side = "left" if hi > n_exp / 2 else "right"
+    tx = hi - 6 if side == "left" else hi + 6
+    ax_bar.annotate(
+        f"kept: {kept:.4f}\ndiscarded: {1 - kept:.4f}",
+        xy=(hi, float(probs[hi]) * 100), xytext=(tx, float(probs[hi]) * 100 * 0.92),
+        ha="right" if side == "left" else "left", va="top", fontsize=9.5,
+        color=theme.ink,
+        arrowprops=dict(arrowstyle="-", color=theme.axis, lw=0.9))
+    ax_bar.text(0.985, 0.90,
+                f"the {top_k} kept weights are NOT rescaled to sum to 1",
+                transform=ax_bar.transAxes, ha="right", fontsize=9,
+                color=theme.secondary)
+    return save_both(fig, SLUG, "router-flow", theme)
+
+
 def figure_where_the_weights_are(rep_counts: dict, theme: Theme) -> Path:
     """Ink measures the quantity: one bar, split by role."""
     fig, ax = plt.subplots(figsize=(9.5, 2.9))
@@ -1022,7 +1127,7 @@ def figure_batch_collapse(curve: list[tuple[int, float]], n_exp: int, theme: The
 
 def make_figures(
     rep: Report, model, counts: dict, usage: dict, halves: dict,
-    curve: list, chosen: list[int], kept: float,
+    curve: list, chosen: list[int], kept: float, logits: torch.Tensor,
 ) -> None:
     n_exp, _, _ = _cfg(model)
     written = []
@@ -1030,6 +1135,7 @@ def make_figures(
         with styled(theme):
             written.append(figure_architecture(model, chosen, kept, theme))
             written.append(figure_block(model, chosen, theme))
+            written.append(figure_router_flow(model, logits, theme))
             written.append(figure_where_the_weights_are(counts, theme))
             written.append(figure_specialization(usage, halves, theme))
             written.append(figure_batch_collapse(curve, n_exp, theme))
@@ -1113,7 +1219,7 @@ def main() -> None:
     load_balance(rep, model, long_logits)
 
     rep.section("9. Figures")
-    make_figures(rep, model, counts, usage, halves, curve, chosen, kept)
+    make_figures(rep, model, counts, usage, halves, curve, chosen, kept, logits)
 
 
 if __name__ == "__main__":
