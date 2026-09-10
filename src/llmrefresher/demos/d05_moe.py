@@ -792,9 +792,10 @@ def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> 
     ax_stack.text(0.5, 0.938, "input text", ha="center", fontsize=9.5,
                   color=theme.secondary)
     down(ax_stack, 0.5, 0.924, 0.892)
-    box(ax_stack, 0.06, 0.832, 0.88, 0.060,
-        "token embedding\n({:,} -> {:,})".format(vocab, hid), theme.ramp[1])
-    down(ax_stack, 0.5, 0.832, 0.800)
+    box(ax_stack, 0.06, 0.818, 0.88, 0.082,
+        "token embedding\n{:,} rows, each {:,} wide\nlook one up".format(vocab, hid),
+        theme.ramp[1], fs=8.6)
+    down(ax_stack, 0.5, 0.818, 0.800)
 
     ax_stack.add_patch(patches.FancyBboxPatch(
         (0.02, 0.318), 0.96, 0.482, boxstyle="round,pad=0.006,rounding_size=0.02",
@@ -815,10 +816,11 @@ def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> 
     down(ax_stack, 0.5, 0.310, 0.272)
     box(ax_stack, 0.06, 0.212, 0.88, 0.060, "final norm", theme.ramp[0])
     down(ax_stack, 0.5, 0.212, 0.180)
-    box(ax_stack, 0.06, 0.104, 0.88, 0.076,
-        "LM head\n({:,} -> {:,})".format(hid, vocab), theme.ramp[1])
-    down(ax_stack, 0.5, 0.104, 0.072)
-    ax_stack.text(0.5, 0.042, "next-token probabilities", ha="center",
+    box(ax_stack, 0.06, 0.098, 0.88, 0.082,
+        "LM head\n{:,} rows, each {:,} wide\none score per row".format(vocab, hid),
+        theme.ramp[1], fs=8.6)
+    down(ax_stack, 0.5, 0.098, 0.066)
+    ax_stack.text(0.5, 0.036, "next-token probabilities", ha="center",
                   fontsize=9.5, color=theme.secondary)
 
     # ---- right: one MoE layer, zoomed ------------------------------------
@@ -829,19 +831,19 @@ def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> 
                  ha="center", fontsize=11.5, fontweight="bold", color=theme.ink)
 
     box(ax_zoom, 0.030, 0.812, 0.195, 0.078,
-        "input from\nattention\n({:,})".format(hid), theme.ramp[0], fs=8.8)
+        "input from attention\n{:,} numbers".format(hid), theme.ramp[0], fs=8.8)
     ax_zoom.annotate("", xy=(0.320, 0.851), xytext=(0.232, 0.851),
                      arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2))
-    box(ax_zoom, 0.320, 0.806, 0.235, 0.090,
-        "router\n{} × {:,} linear,\nthen softmax".format(n_exp, hid),
-        theme.series[1], ink="#ffffff", fs=8.8)
+    box(ax_zoom, 0.320, 0.802, 0.235, 0.098,
+        "router\n{} rows, one per expert\neach row {:,} wide".format(n_exp, hid),
+        theme.series[1], ink="#ffffff", fs=8.6)
     ax_zoom.annotate("", xy=(0.650, 0.851), xytext=(0.562, 0.851),
                      arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2))
-    box(ax_zoom, 0.650, 0.803, 0.320, 0.096,
-        "one score per expert, {} of them.\nkeep the top {}, discard the rest".format(n_exp, top_k),
-        theme.ramp[0], fs=8.8)
+    box(ax_zoom, 0.650, 0.802, 0.320, 0.098,
+        "dot the token against each row\n-> {} scores, then softmax\nkeep the top {}, discard the rest".format(n_exp, top_k),
+        theme.ramp[0], fs=8.6)
 
-    down(ax_zoom, 0.4375, 0.806, 0.768)
+    down(ax_zoom, 0.4375, 0.802, 0.768)
     ax_zoom.plot([0.115, 0.885], [0.768, 0.768], color=theme.secondary, lw=1.2)
     for x in (0.115, 0.30, 0.50, 0.70, 0.885):
         down(ax_zoom, x, 0.768, 0.720)
@@ -874,7 +876,7 @@ def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> 
         theme.ramp[4], fs=8.8)
     down(ax_zoom, 0.5, gb - 0.212, gb - 0.258)
     ax_zoom.text(0.5, gb - 0.288,
-                 "output to the next layer ({:,})".format(hid),
+                 "output to the next layer: {:,} numbers".format(hid),
                  ha="center", fontsize=9.5, color=theme.secondary)
     ax_zoom.text(0.5, gb - 0.360,
                  "the {} kept scores sum to {:.4f}, not 1 — OLMoE does not renormalize\n"
@@ -884,12 +886,12 @@ def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> 
     # ---- bottom left: inside one expert ----------------------------------
     panel(ax_exp, "What is inside one expert?")
     steps = [
-        ("input ({:,})".format(hid), theme.ramp[0], 0.068),
-        ("gate -> {:,}    up -> {:,}\n(two linears, side by side)".format(inter, inter),
-         theme.ramp[1], 0.100),
-        ("SiLU on gate, multiply by up\n(that pairing is SwiGLU)", theme.ramp[2], 0.100),
-        ("down -> {:,}\n(one linear, back down)".format(hid), theme.ramp[1], 0.100),
-        ("output ({:,})".format(hid), theme.ramp[0], 0.068),
+        ("input: {:,} numbers".format(hid), theme.ramp[0], 0.068),
+        ("gate and up\neach {:,} rows, {:,} wide".format(inter, hid), theme.ramp[1], 0.100),
+        ("SiLU(gate) x up\n-> {:,} numbers  (this is SwiGLU)".format(inter),
+         theme.ramp[2], 0.100),
+        ("down\n{:,} rows, {:,} wide".format(hid, inter), theme.ramp[1], 0.100),
+        ("output: {:,} numbers".format(hid), theme.ramp[0], 0.068),
     ]
     y = 0.858
     for i, (label, fill, h) in enumerate(steps):
@@ -954,9 +956,12 @@ def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> 
 
     fig.suptitle("Mixture-of-Experts, end to end", fontsize=16, fontweight="bold",
                  color=theme.ink, y=0.976)
-    fig.text(0.5, 0.950,
+    fig.text(0.5, 0.952,
              "OLMoE-1B-7B — every number on this page is measured in this post",
              ha="center", fontsize=10.5, color=theme.secondary)
+    fig.text(0.5, 0.936,
+             "every matrix is given as rows x width, the way post 1 describes the word table",
+             ha="center", fontsize=9, style="italic", color=theme.muted)
     return save_both(fig, SLUG, "moe-architecture", theme)
 
 
@@ -1007,19 +1012,19 @@ def figure_router_flow(model, logits: torch.Tensor, theme: Theme,
 
     xs = [0.085, 0.375, 0.665, 0.925]
     grid(ax_flow, xs[0], 0.60, 6, 4, 0.105, 0.30, theme.ramp[1])
-    caption(ax_flow, xs[0], "token vectors", f"(n × {hid:,})")
+    caption(ax_flow, xs[0], "token vectors", f"n tokens × {hid:,} wide")
     op(ax_flow, xs[0] + 0.075, xs[1] - 0.095, "router matrix",
-       f"{hid:,} -> {n_exp}, one score per expert")
+       f"{n_exp} rows, each {hid:,} wide")
     grid(ax_flow, xs[1], 0.60, 8, 4, 0.135, 0.30, theme.ramp[2])
-    caption(ax_flow, xs[1], "routing logits", f"(n × {n_exp})   raw scores")
+    caption(ax_flow, xs[1], "routing logits", f"n tokens × {n_exp} wide\nraw scores")
     op(ax_flow, xs[1] + 0.09, xs[2] - 0.095, "softmax",
        f"over all {n_exp}, each row sums to 1")
     grid(ax_flow, xs[2], 0.60, 8, 4, 0.135, 0.30, theme.ramp[4])
-    caption(ax_flow, xs[2], "routing probabilities", f"(n × {n_exp})")
+    caption(ax_flow, xs[2], "routing probabilities", f"n tokens × {n_exp} wide")
     op(ax_flow, xs[2] + 0.09, xs[3] - 0.055, f"keep top {top_k}",
        "discard the rest")
     grid(ax_flow, xs[3], 0.60, 2, 4, 0.045, 0.30, theme.ramp[5])
-    caption(ax_flow, xs[3], "chosen experts", f"(n × {top_k})\n+ their weights")
+    caption(ax_flow, xs[3], "chosen experts", f"n tokens × {top_k} wide\n+ their weights")
 
     ax_flow.text(0.5, 0.965, "How the router picks, in shapes",
                  ha="center", fontsize=12.5, fontweight="bold", color=theme.ink)

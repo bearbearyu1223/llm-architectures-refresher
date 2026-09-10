@@ -174,8 +174,8 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         429.1     1.00x
-  64                        928.7     2.16x
+  8                         430.0     1.00x
+  64                        930.3     2.16x
 
   expert FLOPs ratio (64/8)          8x
   measured wall-clock ratio          2.16x
