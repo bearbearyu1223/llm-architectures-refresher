@@ -708,32 +708,33 @@ def figure_block(model, chosen: list[int], theme: Theme) -> Path:
 
     # All 64 experts, with the 8 this demo actually routed to filled in.
     cols, rows_n = 16, n_exp // 16
-    cell_w, cell_h, gap = 0.049, 0.055, 0.004
+    cell_w, cell_h, gap = 0.0445, 0.050, 0.0095
     x0 = 0.5 - (cols * cell_w + (cols - 1) * gap) / 2
-    y0 = 0.46
+    y0 = 0.455
     for e in range(n_exp):
         r, c = divmod(e, cols)
         x = x0 + c * (cell_w + gap)
         y = y0 - r * (cell_h + gap) - cell_h
         on = e in chosen
-        ax_r.add_patch(
-            patches.Rectangle(
-                (x, y), cell_w, cell_h,
-                linewidth=0.8,
-                edgecolor=theme.series[1] if on else theme.axis,
-                facecolor=theme.ramp[5] if on else theme.surface,
-            )
-        )
-        if on:
-            ax_r.text(x + cell_w / 2, y + cell_h / 2, str(e), ha="center",
-                      va="center", fontsize=6.5, color=ink_for(theme.ramp[5]))
+        ax_r.add_patch(patches.FancyBboxPatch(
+            (x, y), cell_w, cell_h,
+            boxstyle="round,pad=0.0015,rounding_size=0.008",
+            linewidth=1.0 if on else 0.7,
+            edgecolor=theme.series[1] if on else theme.axis,
+            facecolor=theme.ramp[5] if on else theme.surface))
+        ax_r.text(x + cell_w / 2, y + cell_h / 2, str(e), ha="center", va="center",
+                  fontsize=6.2, fontweight="bold" if on else "normal",
+                  color=ink_for(theme.ramp[5]) if on else theme.muted)
 
     grid_bottom = y0 - rows_n * (cell_h + gap)
-    ax_r.text(0.5, grid_bottom - 0.03,
-              f"{top_k} of {n_exp} chosen for this token · the other "
+    ax_r.text(0.5, grid_bottom - 0.028,
+              f"one box per expert — {n_exp} of them, each an entire feed-forward network",
+              ha="center", fontsize=9.5, color=theme.ink)
+    ax_r.text(0.5, grid_bottom - 0.075,
+              f"filled = the {top_k} this token was routed to · the other "
               f"{n_exp - top_k} stay resident and idle",
               ha="center", fontsize=9.5, color=theme.secondary)
-    ax_r.text(0.5, grid_bottom - 0.10,
+    ax_r.text(0.5, grid_bottom - 0.145,
               "all parameters in memory · 17% of them multiply",
               ha="center", fontsize=9.5, color=theme.ink)
 
@@ -848,37 +849,45 @@ def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> 
     for x in (0.115, 0.30, 0.50, 0.70, 0.885):
         down(ax_zoom, x, 0.768, 0.720)
 
+    # One rounded chip per expert, generously spaced and every one numbered, so
+    # this reads as a list of 64 separate networks rather than as a 4x16 matrix --
+    # which matters in a figure whose subtitle explains matrix shapes.
     cols = 16
-    cw, ch, gap = 0.0475, 0.050, 0.0045
+    cw, ch, gap = 0.0445, 0.048, 0.0105
     x0 = 0.5 - (cols * cw + (cols - 1) * gap) / 2
-    y0 = 0.708
+    y0 = 0.690
     for e in range(n_exp):
         r, c = divmod(e, cols)
         x = x0 + c * (cw + gap)
         y = y0 - r * (ch + gap) - ch
         on = e in chosen
-        ax_zoom.add_patch(patches.Rectangle(
-            (x, y), cw, ch, linewidth=0.8, zorder=2,
+        ax_zoom.add_patch(patches.FancyBboxPatch(
+            (x, y), cw, ch, boxstyle="round,pad=0.0015,rounding_size=0.008",
+            linewidth=1.0 if on else 0.7, zorder=2,
             edgecolor=theme.series[1] if on else theme.axis,
             facecolor=theme.ramp[5] if on else theme.surface))
-        if on:
-            ax_zoom.text(x + cw / 2, y + ch / 2, str(e), ha="center", va="center",
-                         fontsize=6.5, color=ink_for(theme.ramp[5]), zorder=3)
+        ax_zoom.text(x + cw / 2, y + ch / 2, str(e), ha="center", va="center",
+                     fontsize=6.4, zorder=3, fontweight="bold" if on else "normal",
+                     color=ink_for(theme.ramp[5]) if on else theme.muted)
     gb = y0 - (n_exp // cols) * (ch + gap)
-    ax_zoom.text(0.5, gb - 0.032,
-                 "{} experts run  ·  {} are skipped, and stay in memory either way".format(
-                     top_k, n_exp - top_k),
+    ax_zoom.text(0.5, gb - 0.028,
+                 "one box per expert — {} of them, each an entire feed-forward network"
+                 .format(n_exp),
+                 ha="center", fontsize=9.5, color=theme.ink)
+    ax_zoom.text(0.5, gb - 0.062,
+                 "filled = the {} this token was routed to  ·  the other {} are skipped, "
+                 "and stay in memory either way".format(top_k, n_exp - top_k),
                  ha="center", fontsize=9.5, color=theme.secondary)
 
-    down(ax_zoom, 0.5, gb - 0.058, gb - 0.108)
-    box(ax_zoom, 0.275, gb - 0.212, 0.45, 0.104,
+    down(ax_zoom, 0.5, gb - 0.088, gb - 0.130)
+    box(ax_zoom, 0.275, gb - 0.234, 0.45, 0.104,
         "weighted combination\nadd the {} outputs, each scaled\nby its own router score".format(top_k),
         theme.ramp[4], fs=8.8)
-    down(ax_zoom, 0.5, gb - 0.212, gb - 0.258)
-    ax_zoom.text(0.5, gb - 0.288,
+    down(ax_zoom, 0.5, gb - 0.234, gb - 0.276)
+    ax_zoom.text(0.5, gb - 0.302,
                  "output to the next layer: {:,} numbers".format(hid),
                  ha="center", fontsize=9.5, color=theme.secondary)
-    ax_zoom.text(0.5, gb - 0.360,
+    ax_zoom.text(0.5, gb - 0.368,
                  "the {} kept scores sum to {:.4f}, not 1 — OLMoE does not renormalize\n"
                  "after the cut, so that shortfall scales this layer's output".format(top_k, kept),
                  ha="center", fontsize=9, color=theme.ink, linespacing=1.5)
