@@ -209,6 +209,52 @@ def where_the_parameters_are(rep: Report, model) -> None:
     )
 
 
+def why_this_many_experts(rep: Report, model) -> None:
+    """Why 64 and 8, rather than 8 and 2?
+
+    The two numbers are not independent, and neither is arbitrary. top_k times
+    the expert width is the FFN arithmetic a token actually does, and OLMoE sets
+    it to exactly the width a dense model of the same shape would use. The count
+    then buys capacity and combinations on top of that fixed budget.
+    """
+    from math import comb
+
+    n_exp, top_k, layers = _cfg(model)
+    hid = model.config.hidden_size
+    inter = model.config.intermediate_size
+    active_w = top_k * inter
+    total_w = n_exp * inter
+
+    rep.kv("model width (hidden_size)", hid)
+    rep.kv("one expert's width", inter)
+    rep.kv("  as a multiple of the model width", f"{inter / hid:.2f}x")
+    rep.kv(f"width actually used per token ({top_k} x {inter})", active_w)
+    rep.kv("  as a multiple of the model width", f"{active_w / hid:.2f}x")
+    rep.kv(f"width held in total ({n_exp} x {inter})", total_w)
+    rep.kv("  as a multiple of the model width", f"{total_w / hid:.2f}x")
+    rep.kv("capacity over compute", f"{n_exp / top_k:.0f}x")
+    rep.blank()
+    rep.note("A dense FFN is conventionally 4x the model width. Per token this")
+    rep.note("model does exactly that much FFN arithmetic -- while holding 8x it.")
+    rep.blank()
+
+    # Same total capacity, same per-token arithmetic, different granularity.
+    rep.note("Same total width, same width used per token, split four ways:")
+    rep.blank()
+    rows = []
+    for k in (1, 2, 4, top_k):
+        width = active_w // k          # same arithmetic per token, split k ways
+        e = total_w // width              # same total capacity, so this many of them
+        rows.append([e, width, k, f"{comb(e, k):,}"])
+    rep.table(["experts", "each of width", "used per token", "possible combinations"], rows)
+    rep.takeaway(
+        f"Every row costs the same to store and the same to run. Splitting the "
+        f"same budget into {n_exp} pieces instead of 8 turns {comb(8, 1)} possible "
+        f"expert combinations into {comb(n_exp, top_k):,}, which is what the "
+        f"count is really buying."
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2. The router
 # ---------------------------------------------------------------------------
@@ -1180,6 +1226,10 @@ def main() -> None:
 
     rep.section("1. Where the parameters actually are               [post §1]")
     where_the_parameters_are(rep, model)
+    rep.blank()
+    rep.note("Why 64 experts and 8 per token, rather than 8 and 2?")
+    rep.blank()
+    why_this_many_experts(rep, model)
 
     rep.section("2. The router is the smallest part of the model    [post §2]")
     the_router_is_tiny(rep, model)

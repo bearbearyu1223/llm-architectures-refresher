@@ -34,6 +34,34 @@ device memory : 17.2 GB
   >> 93% of the weights are experts, and a token touches 8 of 64 of them.
      The model is mostly a thing it declines to use.
 
+  Why 64 experts and 8 per token, rather than 8 and 2?
+
+  model width (hidden_size)          2048
+  one expert's width                 1024
+    as a multiple of the model width 0.50x
+  width actually used per token (8 x 1024) 8192
+    as a multiple of the model width 4.00x
+  width held in total (64 x 1024)    65536
+    as a multiple of the model width 32.00x
+  capacity over compute              8x
+
+  A dense FFN is conventionally 4x the model width. Per token this
+  model does exactly that much FFN arithmetic -- while holding 8x it.
+
+  Same total width, same width used per token, split four ways:
+
+  experts  each of width  used per token  possible combinations
+  ---------------------------------------------------------------
+  8                 8192               1                      8
+  16                4096               2                    120
+  32                2048               4                 35,960
+  64                1024               8          4,426,165,368
+
+  >> Every row costs the same to store and the same to run. Splitting the
+     same budget into 64 pieces instead of 8 turns 8 possible expert
+     combinations into 4,426,165,368, which is what the count is really
+     buying.
+
 --------------------------------------------------------------------------
 2. The router is the smallest part of the model    [post §2]
 --------------------------------------------------------------------------
@@ -146,11 +174,11 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         425.9     1.00x
-  64                        927.3     2.18x
+  8                         429.1     1.00x
+  64                        928.7     2.16x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.18x
+  measured wall-clock ratio          2.16x
     below 8x because attention, norms and the LM head are unchanged
 
   >> Turning every expert on costs 2.2x the time and 0 extra bytes of
