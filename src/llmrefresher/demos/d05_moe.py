@@ -1019,26 +1019,33 @@ def figure_router_flow(model, logits: torch.Tensor, theme: Theme,
                 fontweight="bold", color=theme.series[1])
         ax.text(mid, y + 0.035, sub, ha="center", fontsize=8.5, color=theme.secondary)
 
-    xs = [0.085, 0.375, 0.665, 0.925]
-    grid(ax_flow, xs[0], 0.60, 6, 4, 0.105, 0.30, theme.ramp[1])
+    # Drawn widths must at least be *ordered* like the widths they label:
+    # 2,048 > 64 > 8. An earlier version drew the 2,048-wide grid narrower than
+    # the 64-wide one, which is the figure contradicting its own captions.
+    # Exact proportion is impossible (2,048 is 256x 8), and the subtitle says so.
+    widths = [(0.200, 12), (0.100, 6), (0.100, 6), (0.030, 2)]   # (drawn, columns)
+    lefts = [0.015, 0.375, 0.635, 0.895]
+    xs = [l + w / 2 for l, (w, _) in zip(lefts, widths)]
+    rights = [l + w for l, (w, _) in zip(lefts, widths)]
+    fills = [theme.ramp[1], theme.ramp[2], theme.ramp[4], theme.ramp[5]]
+    for x, (w, cols), fill in zip(xs, widths, fills):
+        grid(ax_flow, x, 0.60, cols, 4, w, 0.30, fill)
+    pad = 0.012
     caption(ax_flow, xs[0], "token vectors", f"n tokens × {hid:,} wide")
-    op(ax_flow, xs[0] + 0.075, xs[1] - 0.095, "router matrix",
+    op(ax_flow, rights[0] + pad, lefts[1] - pad, "router matrix",
        f"{n_exp} rows, each {hid:,} wide")
-    grid(ax_flow, xs[1], 0.60, 8, 4, 0.135, 0.30, theme.ramp[2])
     caption(ax_flow, xs[1], "routing logits", f"n tokens × {n_exp} wide\nraw scores")
-    op(ax_flow, xs[1] + 0.09, xs[2] - 0.095, "softmax",
+    op(ax_flow, rights[1] + pad, lefts[2] - pad, "softmax",
        f"over all {n_exp}, each row sums to 1")
-    grid(ax_flow, xs[2], 0.60, 8, 4, 0.135, 0.30, theme.ramp[4])
     caption(ax_flow, xs[2], "routing probabilities", f"n tokens × {n_exp} wide")
-    op(ax_flow, xs[2] + 0.09, xs[3] - 0.055, f"keep top {top_k}",
+    op(ax_flow, rights[2] + pad, lefts[3] - pad, f"keep top {top_k}",
        "discard the rest")
-    grid(ax_flow, xs[3], 0.60, 2, 4, 0.045, 0.30, theme.ramp[5])
     caption(ax_flow, xs[3], "chosen experts", f"n tokens × {top_k} wide\n+ their weights")
 
     ax_flow.text(0.5, 0.965, "How the router picks, in shapes",
                  ha="center", fontsize=12.5, fontweight="bold", color=theme.ink)
     ax_flow.text(0.5, 0.895, "n is however many tokens are being processed together; "
-                 "every row is routed independently",
+                 "every row is routed independently; widths are in order, not to scale",
                  ha="center", fontsize=9, color=theme.secondary)
 
     # ---- the same thing, for one real token ------------------------------
@@ -1062,20 +1069,21 @@ def figure_router_flow(model, logits: torch.Tensor, theme: Theme,
     ax_bar.set_axisbelow(True)
     ax_bar.yaxis.grid(True, color=theme.grid, linewidth=0.8)
 
-    # annotate the kept mass, placed on whichever side has room
-    hi = int(top_e[0])
-    side = "left" if hi > n_exp / 2 else "right"
-    tx = hi - 6 if side == "left" else hi + 6
-    ax_bar.annotate(
-        f"kept: {kept:.4f}\ndiscarded: {1 - kept:.4f}",
-        xy=(hi, float(probs[hi]) * 100), xytext=(tx, float(probs[hi]) * 100 * 0.92),
-        ha="right" if side == "left" else "left", va="top", fontsize=9.5,
-        color=theme.ink,
-        arrowprops=dict(arrowstyle="-", color=theme.axis, lw=0.9))
-    ax_bar.text(0.985, 0.90,
-                f"the {top_k} kept weights are NOT rescaled to sum to 1",
-                transform=ax_bar.transAxes, ha="right", fontsize=9,
-                color=theme.secondary)
+    # The totals describe two *groups* of bars. A leader line to the tallest bar
+    # made "kept: 0.4281" read as that one expert's weight, so the totals live in
+    # a legend keyed by fill instead, where they cannot attach to a single bar.
+    from matplotlib.patches import Patch
+    ax_bar.legend(
+        handles=[
+            Patch(facecolor=theme.ramp[5], label=f"the {top_k} kept, together {kept:.4f}"),
+            Patch(facecolor=theme.ramp[1],
+                  label=f"the {n_exp - top_k} discarded, together {1 - kept:.4f}"),
+        ],
+        loc="upper right", fontsize=9.5, labelcolor=theme.ink, frameon=False,
+        title=f"kept weights are not rescaled to sum to 1",
+        title_fontsize=9,
+    )
+    ax_bar.get_legend().get_title().set_color(theme.secondary)
     return save_both(fig, SLUG, "router-flow", theme)
 
 
@@ -1098,12 +1106,15 @@ def figure_where_the_weights_are(rep_counts: dict, theme: Theme) -> Path:
             # Too narrow to label inside, and every small segment is crowded into
             # the last few percent of the bar -- so labels go on a spread-out row
             # below with a leader back to the segment they name.
+            # All on one row. Leaders run from segments in left-to-right order to
+            # labels in the same order, and two such lines cannot cross; the
+            # alternating two-row layout this replaces crossed router over embed.
             pct = f"{share:.1f}%" if share >= 0.1 else f"{share:.3f}%"
             slot = small.index(role)
-            label_x = 34 + 22 * slot
-            y_txt = -0.62 if slot % 2 == 0 else -0.95
+            label_x = 40 + 18 * slot
+            y_txt = -0.80
             ax.annotate(
-                f"{role}  {pct}",
+                f"{role}\n{pct}",
                 xy=(left + share / 2, -0.30),
                 xytext=(label_x, y_txt),
                 ha="center", va="center", fontsize=9, color=theme.secondary,
@@ -1144,7 +1155,7 @@ def figure_specialization(
     names = [n for n, _ in rows]
     data = torch.stack([v for _, v in rows]).numpy()
 
-    fig, ax = plt.subplots(figsize=(10.5, 3.3))
+    fig, ax = plt.subplots(figsize=(10.5, 3.7))
     im = ax.imshow(data * 100, aspect="auto", cmap=sequential_cmap(theme),
                    interpolation="nearest")
     ax.set_yticks(range(len(names)), names)
@@ -1152,18 +1163,26 @@ def figure_specialization(
     ax.axhline(1.5, color=theme.surface, lw=3.0)
     ax.set_xlabel(f"expert (layer {last})")
     ax.set_title("The same 64 experts, used differently by different text",
-                 color=theme.ink)
+                 color=theme.ink, pad=26)
+    # Without this line a reader has no way to know why one passage appears as
+    # two rows, and those two rows are the entire basis of the comparison.
+    ax.text(0.5, 1.035, "top two rows: one prose passage split in half, which is what "
+            "noise looks like  ·  bottom two: different kinds of text",
+            transform=ax.transAxes, ha="center", va="bottom", fontsize=9,
+            color=theme.secondary)
     ax.axhline(1.5, color=theme.ink, lw=1.0)
     ax.grid(False)
     cb = fig.colorbar(im, ax=ax, pad=0.015)
-    cb.set_label("% of that passage's routing slots", color=theme.secondary)
+    cb.set_label("% of routing slots\n(8 per token)", color=theme.secondary)
     cb.ax.tick_params(colors=theme.muted)
     cb.outline.set_visible(False)
     fig.tight_layout()
     return save_both(fig, SLUG, "specialization", theme)
 
 
-def figure_batch_collapse(curve: list[tuple[int, float]], n_exp: int, theme: Theme) -> Path:
+def figure_batch_collapse(
+    curve: list[tuple[int, float]], n_exp: int, top_k: int, theme: Theme
+) -> Path:
     """Experts needed against tokens processed together."""
     fig, ax = plt.subplots(figsize=(8.5, 4.6))
     xs = [c[0] for c in curve]
@@ -1172,8 +1191,13 @@ def figure_batch_collapse(curve: list[tuple[int, float]], n_exp: int, theme: The
     ax.text(xs[0], n_exp - 2.5, f"all {n_exp} experts", fontsize=9.5,
             color=theme.secondary, va="top")
     ax.plot(xs, ys, marker="o", color=theme.series[0], label="experts actually needed")
-    ax.plot(xs, [min(n_exp, 8 * x) for x in xs], marker="", ls=":",
-            color=theme.series[1], label="if no two tokens ever agreed")
+    # Stop the worst case where it reaches the ceiling. Drawn all the way along,
+    # it lay on top of the dashed "all 64" line and hid it.
+    worst = [(x, min(n_exp, top_k * x)) for x in xs]
+    cut = next(i for i, (_, y) in enumerate(worst) if y >= n_exp) + 1
+    ax.plot([x for x, _ in worst[:cut]], [y for _, y in worst[:cut]], marker="",
+            ls=":", color=theme.series[1],
+            label="if no two tokens ever shared an expert")
     ax.set_xscale("log", base=2)
     ax.set_xticks(xs, [str(x) for x in xs])
     ax.set_xlabel("tokens processed together")
@@ -1189,7 +1213,7 @@ def make_figures(
     rep: Report, model, counts: dict, usage: dict, halves: dict,
     curve: list, chosen: list[int], kept: float, logits: torch.Tensor,
 ) -> None:
-    n_exp, _, _ = _cfg(model)
+    n_exp, top_k, _ = _cfg(model)
     written = []
     for theme in THEMES:
         with styled(theme):
@@ -1198,7 +1222,7 @@ def make_figures(
             written.append(figure_router_flow(model, logits, theme))
             written.append(figure_where_the_weights_are(counts, theme))
             written.append(figure_specialization(usage, halves, theme))
-            written.append(figure_batch_collapse(curve, n_exp, theme))
+            written.append(figure_batch_collapse(curve, n_exp, top_k, theme))
     for path in written:
         rep.note(f"wrote {path.relative_to(path.parents[2])}")
 
