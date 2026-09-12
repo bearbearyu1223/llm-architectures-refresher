@@ -174,11 +174,11 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         430.8     1.00x
-  64                        931.6     2.16x
+  8                         413.3     1.00x
+  64                        922.0     2.23x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.16x
+  measured wall-clock ratio          2.23x
     below 8x because attention, norms and the LM head are unchanged
 
   >> Turning every expert on costs 2.2x the time and 0 extra bytes of

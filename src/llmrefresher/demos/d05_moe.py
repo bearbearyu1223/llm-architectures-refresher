@@ -685,7 +685,7 @@ def figure_block(model, chosen: list[int], theme: Theme) -> Path:
     ax_l.set_title("Dense block", color=theme.ink)
     box(ax_l, 0.22, 0.80, 0.56, 0.10, "attention", theme.ramp[1])
     arrow(ax_l, 0.5, 0.80, 0.5, 0.66)
-    box(ax_l, 0.22, 0.50, 0.56, 0.16, "one MLP\n(all tokens, every time)", theme.ramp[4])
+    box(ax_l, 0.22, 0.50, 0.56, 0.16, "one FFN\n(all tokens, every time)", theme.ramp[4])
     arrow(ax_l, 0.5, 0.50, 0.5, 0.36)
     box(ax_l, 0.22, 0.24, 0.56, 0.10, "next block", theme.ramp[0])
     ax_l.text(0.5, 0.12, "every parameter runs for every token",
