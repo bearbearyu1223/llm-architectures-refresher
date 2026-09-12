@@ -193,7 +193,10 @@ def where_the_parameters_are(rep: Report, model) -> None:
     n_exp, top_k, layers = _cfg(model)
     per_expert = buckets["experts"] // (n_exp * layers)
     active_experts = per_expert * top_k * layers
-    active = active_experts + buckets["attention"] + buckets["norms"] + buckets["embed + head"] // 2
+    # The router is active: it scores all experts for every token. The embedding
+    # table is not: a token is looked up in it, which multiplies by nothing.
+    active = (active_experts + buckets["attention"] + buckets["router"] + buckets["norms"]
+              + buckets["embed + head"] // 2)
 
     rep.blank()
     rep.kv("experts per layer", n_exp)
@@ -207,6 +210,104 @@ def where_the_parameters_are(rep: Report, model) -> None:
         f"touches {top_k} of {n_exp} of them. The model is mostly a thing it "
         f"declines to use."
     )
+
+
+def derive_the_census(rep: Report, model) -> None:
+    """Every census number, multiplied out from the tensor shapes.
+
+    Reads the shapes from layer 0 rather than from the config, so the arithmetic
+    is checked against what is actually stored, then confirms all 16 layers match
+    and that the role totals sum to the checkpoint's own parameter count.
+    """
+    n_exp, top_k, layers = _cfg(model)
+    params = dict(model.named_parameters())
+    total = sum(p.numel() for p in params.values())
+
+    def shape(name: str) -> str:
+        return "(" + ", ".join(str(d) for d in params[name].shape) + ")"
+
+    def n(name: str) -> int:
+        return params[name].numel()
+
+    L0 = "model.layers.0."
+    attn_mats = [f"{L0}self_attn.{x}_proj.weight" for x in "qkvo"]
+    qk_norms = [f"{L0}self_attn.q_norm.weight", f"{L0}self_attn.k_norm.weight"]
+    router = f"{L0}mlp.gate.weight"
+    gate_up = f"{L0}mlp.experts.gate_up_proj"
+    down = f"{L0}mlp.experts.down_proj"
+    layer_norms = [f"{L0}input_layernorm.weight", f"{L0}post_attention_layernorm.weight"]
+
+    per_layer = {
+        "attention": sum(n(x) for x in attn_mats + qk_norms),
+        "router": n(router),
+        "experts": n(gate_up) + n(down),
+        "norms": sum(n(x) for x in layer_norms),
+    }
+    layer_sizes = {
+        sum(p.numel() for name, p in params.items() if f".layers.{i}." in name)
+        for i in range(layers)
+    }
+    assert len(layer_sizes) == 1, "layers differ in size; per-layer arithmetic would be wrong"
+
+    rep.note("One layer's weight tensors, as stored in the checkpoint:")
+    rep.blank()
+    rep.table(
+        ["tensor", "shape", "parameters"],
+        [
+            ["q, k, v, o projections", f"4 x {shape(attn_mats[0])}", f"{sum(n(x) for x in attn_mats):,}"],
+            ["q_norm, k_norm", f"2 x {shape(qk_norms[0])}", f"{sum(n(x) for x in qk_norms):,}"],
+            ["router", shape(router), f"{n(router):,}"],
+            ["experts: gate_up_proj", shape(gate_up), f"{n(gate_up):,}"],
+            ["experts: down_proj", shape(down), f"{n(down):,}"],
+            ["two layer norms", f"2 x {shape(layer_norms[0])}", f"{per_layer['norms']:,}"],
+            ["one layer", "", f"{sum(per_layer.values()):,}"],
+        ],
+    )
+
+    embed = n("model.embed_tokens.weight")
+    head = n("lm_head.weight")
+    final_norm = n("model.norm.weight")
+    tied = params["model.embed_tokens.weight"].data_ptr() == params["lm_head.weight"].data_ptr()
+    role_total = {
+        "experts": per_layer["experts"] * layers,
+        "attention": per_layer["attention"] * layers,
+        "router": per_layer["router"] * layers,
+        "norms": per_layer["norms"] * layers + final_norm,
+        "embed + head": embed + (0 if tied else head),
+    }
+    rep.blank()
+    rep.note(f"Each role across all {layers} layers, plus what sits outside them:")
+    rep.blank()
+    rep.table(
+        ["role", "per layer", f"x {layers}", "outside", "total"],
+        [
+            ["experts", f"{per_layer['experts']:,}", f"{role_total['experts']:,}", "", f"{role_total['experts']:,}"],
+            ["attention", f"{per_layer['attention']:,}", f"{role_total['attention']:,}", "", f"{role_total['attention']:,}"],
+            ["router", f"{per_layer['router']:,}", f"{role_total['router']:,}", "", f"{role_total['router']:,}"],
+            ["norms", f"{per_layer['norms']:,}", f"{per_layer['norms'] * layers:,}", f"{final_norm:,}", f"{role_total['norms']:,}"],
+            ["embed + head", "", "", f"{embed + head:,}", f"{role_total['embed + head']:,}"],
+            ["TOTAL", "", "", "", f"{sum(role_total.values()):,}"],
+        ],
+    )
+    rep.kv("embedding and LM head tied?", tied)
+    rep.kv("equals the checkpoint's count?", sum(role_total.values()) == total)
+
+    per_expert = per_layer["experts"] // n_exp
+    active_parts = [
+        (f"{top_k} of {n_exp} experts, x {layers} layers", per_expert * top_k * layers),
+        ("attention, all of it", role_total["attention"]),
+        ("router, scores all experts", role_total["router"]),
+        ("norms", role_total["norms"]),
+        ("LM head, a full multiply", head),
+    ]
+    active = sum(v for _, v in active_parts)
+    rep.blank()
+    rep.note("What one token's arithmetic uses:")
+    rep.blank()
+    rep.table(["part", "parameters"], [[k, f"{v:,}"] for k, v in active_parts]
+              + [["embedding table, a lookup", "not counted"], ["active total", f"{active:,}"]])
+    rep.kv("active share of total", f"{100 * active / total:.2f}%")
+    rep.kv("active if the lookup is counted", f"{(active + embed) / 1e9:.2f}B")
 
 
 def why_this_many_experts(rep: Report, model) -> None:
@@ -776,7 +877,8 @@ def figure_architecture(
             roles["norms"] += n
     total = sum(roles.values())
     per_expert = roles["experts"] // (n_exp * layers)
-    active = per_expert * top_k * layers + roles["attention"] + roles["norms"] + roles["head"]
+    active = (per_expert * top_k * layers + roles["attention"] + roles["router"]
+              + roles["norms"] + roles["head"])
     many_tokens, many_experts = curve[-1]
 
     fig = plt.figure(figsize=(13.5, 17.0))
@@ -1346,6 +1448,8 @@ def main() -> None:
 
     rep.section("1. Where the parameters actually are               [post §1]")
     where_the_parameters_are(rep, model)
+    rep.blank()
+    derive_the_census(rep, model)
     rep.blank()
     rep.note("Why 64 experts and 8 per token, rather than 8 and 2?")
     rep.blank()

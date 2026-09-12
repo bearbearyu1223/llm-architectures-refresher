@@ -28,11 +28,50 @@ device memory : 17.2 GB
   experts used per token             8
   parameters in one expert           6.29M
   total parameters                   6.919B
-  active parameters per token        1.177B
+  active parameters per token        1.179B
   active share                       17.0%
 
   >> 93% of the weights are experts, and a token touches 8 of 64 of them.
      The model is mostly a thing it declines to use.
+
+  One layer's weight tensors, as stored in the checkpoint:
+
+  tensor                             shape   parameters
+  -------------------------------------------------------
+  q, k, v, o projections  4 x (2048, 2048)   16,777,216
+  q_norm, k_norm                2 x (2048)        4,096
+  router                        (64, 2048)      131,072
+  experts: gate_up_proj   (64, 2048, 2048)  268,435,456
+  experts: down_proj      (64, 2048, 1024)  134,217,728
+  two layer norms               2 x (2048)        4,096
+  one layer                                 419,569,664
+
+  Each role across all 16 layers, plus what sits outside them:
+
+  role            per layer           x 16      outside          total
+  ----------------------------------------------------------------------
+  experts       402,653,184  6,442,450,944               6,442,450,944
+  attention      16,781,312    268,500,992                 268,500,992
+  router            131,072      2,097,152                   2,097,152
+  norms               4,096         65,536        2,048         67,584
+  embed + head                              206,045,184    206,045,184
+  TOTAL                                                  6,919,161,856
+  embedding and LM head tied?        no
+  equals the checkpoint's count?     yes
+
+  What one token's arithmetic uses:
+
+  part                             parameters
+  ---------------------------------------------
+  8 of 64 experts, x 16 layers    805,306,368
+  attention, all of it            268,500,992
+  router, scores all experts        2,097,152
+  norms                                67,584
+  LM head, a full multiply        103,022,592
+  embedding table, a lookup       not counted
+  active total                  1,178,994,688
+  active share of total              17.04%
+  active if the lookup is counted    1.28B
 
   Why 64 experts and 8 per token, rather than 8 and 2?
 
@@ -174,8 +213,8 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         422.1     1.00x
-  64                        918.0     2.17x
+  8                         428.5     1.00x
+  64                        927.8     2.17x
 
   expert FLOPs ratio (64/8)          8x
   measured wall-clock ratio          2.17x
