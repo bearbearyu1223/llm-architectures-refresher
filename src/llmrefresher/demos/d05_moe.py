@@ -742,235 +742,317 @@ def figure_block(model, chosen: list[int], theme: Theme) -> Path:
     return save_both(fig, SLUG, "moe-block", theme)
 
 
-def figure_architecture(model, chosen: list[int], kept: float, theme: Theme) -> Path:
+def figure_architecture(
+    model, chosen: list[int], kept: float, curve: list[tuple[int, float]], theme: Theme
+) -> Path:
     """One-page orientation diagram: whole model, one MoE layer, one expert.
 
-    Every number on it is this post's own measurement, so the picture cannot
-    drift out of agreement with the tables. Panels get their own axes rather
-    than one shared coordinate space, which keeps each region's layout
-    independent and stops a change in one from shifting the others.
+    Five numbered panels, each on its own axes so their layouts stay independent.
+    Every number is computed here from the model or passed in from the demo's own
+    measurements -- none is typed in -- so the figure cannot drift from the tables.
+    Panel badges are filled circles and the walk-through steps are outlined ones,
+    so the two numbering schemes cannot be mistaken for each other.
     """
     n_exp, top_k, layers = _cfg(model)
-    total = sum(p.numel() for p in model.parameters())
     hid = model.config.hidden_size
     inter = model.config.intermediate_size
     vocab = model.config.vocab_size
-    per_expert = 3 * hid * inter
 
-    fig = plt.figure(figsize=(13.5, 15.5))
-    ax_stack = fig.add_axes([0.015, 0.450, 0.245, 0.470])
-    ax_zoom = fig.add_axes([0.315, 0.450, 0.670, 0.470])
-    ax_exp = fig.add_axes([0.015, 0.020, 0.270, 0.375])
-    ax_num = fig.add_axes([0.345, 0.020, 0.290, 0.375])
-    ax_step = fig.add_axes([0.695, 0.020, 0.290, 0.375])
-    for ax in (ax_stack, ax_zoom, ax_exp, ax_num, ax_step):
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis("off")
-        ax.grid(False)
+    # ---- every figure number, derived rather than typed ---------------------
+    roles = {"experts": 0, "router": 0, "attention": 0, "head": 0, "embed": 0, "norms": 0}
+    for name, p in model.named_parameters():
+        n = p.numel()
+        if ".experts." in name:
+            roles["experts"] += n
+        elif ".mlp.gate." in name:
+            roles["router"] += n
+        elif ".self_attn." in name:
+            roles["attention"] += n
+        elif "lm_head" in name:
+            roles["head"] += n
+        elif "embed_tokens" in name:
+            roles["embed"] += n
+        else:
+            roles["norms"] += n
+    total = sum(roles.values())
+    per_expert = roles["experts"] // (n_exp * layers)
+    active = per_expert * top_k * layers + roles["attention"] + roles["norms"] + roles["head"]
+    many_tokens, many_experts = curve[-1]
 
-    def box(ax, x, y, w, h, label, fill, fs=9.5, ink=None, lw=1.1, ec=None):
+    fig = plt.figure(figsize=(13.5, 17.0))
+
+    tint = {"blue": theme.series[0], "orange": theme.series[1], "green": theme.series[2]}
+
+    def panel_axes(rect, color, badge, title):
+        ax = fig.add_axes(rect)
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off"); ax.grid(False)
         ax.add_patch(patches.FancyBboxPatch(
-            (x, y), w, h, boxstyle="round,pad=0.008,rounding_size=0.02",
+            (0.004, 0.004), 0.992, 0.992, boxstyle="round,pad=0,rounding_size=0.025",
+            linewidth=0, facecolor=tint[color], alpha=0.07, zorder=0))
+        ax.add_patch(patches.FancyBboxPatch(
+            (0.004, 0.004), 0.992, 0.992, boxstyle="round,pad=0,rounding_size=0.025",
+            linewidth=1.3, edgecolor=tint[color], facecolor="none", alpha=0.55, zorder=0))
+        if badge is not None:
+            ax.text(0.055, 0.958, str(badge), ha="center", va="center", fontsize=13,
+                    fontweight="bold", color=ink_for(tint[color]), zorder=5,
+                    bbox=dict(boxstyle="circle,pad=0.32", facecolor=tint[color], edgecolor="none"))
+        # Offset in points, not axes units: panels differ in width, and an
+        # axes-unit gap left the title touching its badge in the narrow ones.
+        if badge is not None:
+            ax.annotate(title, xy=(0.055, 0.958), xytext=(17, 0), textcoords="offset points",
+                        ha="left", va="center", fontsize=14, fontweight="bold", color=theme.ink)
+        else:
+            ax.text(0.5, 0.958, title, ha="center", va="center", fontsize=14,
+                    fontweight="bold", color=theme.ink)
+        return ax
+
+    def box(ax, x, y, w, h, title, body, fill, *, fs=9.0, ec=None, lw=1.0):
+        ax.add_patch(patches.FancyBboxPatch(
+            (x, y), w, h, boxstyle="round,pad=0.004,rounding_size=0.012",
             linewidth=lw, edgecolor=ec or theme.axis, facecolor=fill, zorder=2))
-        ax.text(x + w / 2, y + h / 2, label, ha="center", va="center",
-                fontsize=fs, color=ink or ink_for(fill), zorder=3, linespacing=1.45)
+        ink = ink_for(fill)
+        cx = x + w / 2
+        if body:
+            n_body = body.count("\n") + 1
+            gap = 0.020 if h > 0.09 else 0.017
+            top = y + h / 2 + gap * n_body / 2
+            ax.text(cx, top, title, ha="center", va="center", fontsize=fs + 0.8,
+                    fontweight="bold", color=ink, zorder=3)
+            ax.text(cx, top - gap * 0.7, body, ha="center", va="top", fontsize=fs,
+                    color=ink, zorder=3, linespacing=1.4)
+        else:
+            ax.text(cx, y + h / 2, title, ha="center", va="center", fontsize=fs + 0.8,
+                    fontweight="bold", color=ink, zorder=3)
 
-    def down(ax, x, y1, y2):
-        ax.annotate("", xy=(x, y2), xytext=(x, y1), zorder=1,
-                    arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2))
+    def arrow(ax, x1, y1, x2, y2):
+        ax.annotate("", xy=(x2, y2), xytext=(x1, y1), zorder=1,
+                    arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2,
+                                    shrinkA=0, shrinkB=0))
 
-    def panel(ax, title):
-        ax.add_patch(patches.FancyBboxPatch(
-            (0.005, 0.005), 0.99, 0.99, boxstyle="round,pad=0.006,rounding_size=0.03",
-            linewidth=1.0, edgecolor=theme.axis, facecolor="none", zorder=0))
-        ax.text(0.5, 0.955, title, ha="center", va="center",
-                fontsize=11.5, fontweight="bold", color=theme.ink)
+    # ---- title ---------------------------------------------------------------
+    fig.text(0.5, 0.986, "Mixture-of-Experts, end to end", ha="center", va="top",
+             fontsize=20, fontweight="bold", color=theme.ink)
+    fig.text(0.5, 0.962, "OLMoE-1B-7B — every number on this page is measured in this post",
+             ha="center", va="top", fontsize=11, color=theme.secondary)
+    fig.text(0.5, 0.947, "Same transformer; a different feed-forward: many experts, only a few "
+             "run per token. Matrices are given as rows × width.",
+             ha="center", va="top", fontsize=10, style="italic", color=theme.muted)
 
-    # ---- left: the whole model -------------------------------------------
-    ax_stack.text(0.5, 0.985, "The whole model", ha="center", fontsize=11.5,
-                  fontweight="bold", color=theme.ink)
-    ax_stack.text(0.5, 0.938, "input text", ha="center", fontsize=9.5,
-                  color=theme.secondary)
-    down(ax_stack, 0.5, 0.924, 0.892)
-    box(ax_stack, 0.06, 0.818, 0.88, 0.082,
-        "token embedding\n{:,} rows, each {:,} wide\nlook one up".format(vocab, hid),
-        theme.ramp[1], fs=8.6)
-    down(ax_stack, 0.5, 0.818, 0.800)
+    # ======== panel 1: the whole model =======================================
+    ax = panel_axes([0.012, 0.415, 0.300, 0.515], "blue", 1, "The whole model")
+    ax.text(0.5, 0.900, "input text", ha="center", fontsize=10, color=theme.secondary)
+    arrow(ax, 0.5, 0.890, 0.5, 0.862)
+    box(ax, 0.10, 0.775, 0.80, 0.087, "Token embedding",
+        f"{vocab:,} rows × {hid:,} wide\nlook up one row per token", theme.ramp[1])
+    arrow(ax, 0.5, 0.775, 0.5, 0.738)
 
-    ax_stack.add_patch(patches.FancyBboxPatch(
-        (0.02, 0.318), 0.96, 0.482, boxstyle="round,pad=0.006,rounding_size=0.02",
-        linewidth=1.1, edgecolor=theme.muted, facecolor="none",
-        linestyle=(0, (4, 3)), zorder=1))
-    ax_stack.text(0.5, 0.770, "{} × transformer layer".format(layers),
-                  ha="center", fontsize=9.5, style="italic", color=theme.secondary)
-    box(ax_stack, 0.07, 0.652, 0.86, 0.092,
-        "self-attention + RoPE\n(dense: every token\nuses all of it)", theme.ramp[1], fs=9)
-    down(ax_stack, 0.5, 0.652, 0.620)
-    box(ax_stack, 0.07, 0.462, 0.86, 0.158,
-        "MoE feed-forward\n\n{} experts\ntop-{} per token\n\n(sparse)".format(n_exp, top_k),
-        theme.series[1], ink="#ffffff", fs=9, lw=2.0, ec=theme.series[1])
-    down(ax_stack, 0.5, 0.462, 0.412)
+    ax.add_patch(patches.FancyBboxPatch(
+        (0.28, 0.305), 0.68, 0.433, boxstyle="round,pad=0,rounding_size=0.02",
+        linewidth=1.1, edgecolor=theme.muted, facecolor="none", linestyle=(0, (4, 3)), zorder=1))
+    ax.text(0.14, 0.52, f"× {layers}\ntransformer\nlayers", ha="center", va="center",
+            fontsize=9.5, color=theme.secondary, linespacing=1.4)
+    box(ax, 0.32, 0.615, 0.60, 0.090, "Self-attention + RoPE",
+        "dense: every token\nuses all of it", theme.ramp[1], fs=8.6)
+    arrow(ax, 0.62, 0.615, 0.62, 0.585)
+    box(ax, 0.32, 0.425, 0.60, 0.160, "MoE feed-forward",
+        f"{n_exp} experts\ntop-{top_k} per token\nsparse: only a few run",
+        tint["orange"], fs=8.6, ec=tint["orange"])
+    arrow(ax, 0.62, 0.425, 0.62, 0.392)
     for dy in (0.0, 0.020, 0.040):
-        ax_stack.plot([0.5], [0.348 + dy], marker="o", markersize=2.2,
-                      color=theme.muted, zorder=3)
-    down(ax_stack, 0.5, 0.310, 0.272)
-    box(ax_stack, 0.06, 0.212, 0.88, 0.060, "final norm", theme.ramp[0])
-    down(ax_stack, 0.5, 0.212, 0.180)
-    box(ax_stack, 0.06, 0.098, 0.88, 0.082,
-        "LM head\n{:,} rows, each {:,} wide\none score per row".format(vocab, hid),
-        theme.ramp[1], fs=8.6)
-    down(ax_stack, 0.5, 0.098, 0.066)
-    ax_stack.text(0.5, 0.036, "next-token probabilities", ha="center",
-                  fontsize=9.5, color=theme.secondary)
+        ax.plot([0.62], [0.330 + dy], marker="o", markersize=2.4, color=theme.muted, zorder=3)
+    arrow(ax, 0.5, 0.305, 0.5, 0.268)
+    box(ax, 0.10, 0.212, 0.80, 0.056, "Final norm", "", theme.ramp[0])
+    arrow(ax, 0.5, 0.212, 0.5, 0.180)
+    box(ax, 0.10, 0.090, 0.80, 0.090, "LM head",
+        f"{vocab:,} rows × {hid:,} wide\none score per vocabulary token", theme.ramp[1], fs=8.6)
+    arrow(ax, 0.5, 0.090, 0.5, 0.060)
+    ax.text(0.5, 0.030, "next-token probabilities", ha="center", fontsize=10,
+            color=theme.secondary)
 
-    # ---- right: one MoE layer, zoomed ------------------------------------
-    ax_zoom.add_patch(patches.FancyBboxPatch(
-        (0.005, 0.005), 0.99, 0.99, boxstyle="round,pad=0.006,rounding_size=0.02",
-        linewidth=1.6, edgecolor=theme.series[1], facecolor="none", zorder=0))
-    ax_zoom.text(0.5, 0.958, "One MoE feed-forward layer, in detail",
-                 ha="center", fontsize=11.5, fontweight="bold", color=theme.ink)
+    # ======== panel 2: one MoE layer ==========================================
+    ax = panel_axes([0.325, 0.415, 0.663, 0.515], "orange", 2,
+                    "One MoE feed-forward layer, in detail")
+    box(ax, 0.025, 0.772, 0.215, 0.125, "Input from attention",
+        f"{hid:,} numbers\none token's hidden state", theme.ramp[0], fs=8.4)
+    arrow(ax, 0.240, 0.834, 0.285, 0.834)
+    box(ax, 0.285, 0.772, 0.235, 0.125, "Router",
+        f"{n_exp} rows, one per expert\neach row {hid:,} wide", tint["orange"], fs=8.4,
+        ec=tint["orange"])
+    arrow(ax, 0.520, 0.834, 0.565, 0.834)
+    # top-k box: title plus a left-aligned bullet list
+    ax.add_patch(patches.FancyBboxPatch(
+        (0.565, 0.772), 0.410, 0.125, boxstyle="round,pad=0.004,rounding_size=0.012",
+        linewidth=1.0, edgecolor=theme.axis, facecolor=theme.ramp[0], zorder=2))
+    k_ink = ink_for(theme.ramp[0])
+    ax.text(0.770, 0.874, f"Top-k selection (k = {top_k})", ha="center", va="center",
+            fontsize=9.2, fontweight="bold", color=k_ink, zorder=3)
+    ax.text(0.595, 0.852, f"•  softmax over all {n_exp} scores, keep the top {top_k}\n"
+            f"•  keep their expert indices and weights\n"
+            f"•  discard the other {n_exp - top_k}",
+            ha="left", va="top", fontsize=8.4, color=k_ink, zorder=3, linespacing=1.45)
 
-    box(ax_zoom, 0.030, 0.812, 0.195, 0.078,
-        "input from attention\n{:,} numbers".format(hid), theme.ramp[0], fs=8.8)
-    ax_zoom.annotate("", xy=(0.320, 0.851), xytext=(0.232, 0.851),
-                     arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2))
-    box(ax_zoom, 0.320, 0.802, 0.235, 0.098,
-        "router\n{} rows, one per expert\neach row {:,} wide".format(n_exp, hid),
-        theme.series[1], ink="#ffffff", fs=8.6)
-    ax_zoom.annotate("", xy=(0.650, 0.851), xytext=(0.562, 0.851),
-                     arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2))
-    box(ax_zoom, 0.650, 0.802, 0.320, 0.098,
-        "dot the token against each row\n-> {} scores, then softmax\nkeep the top {}, discard the rest".format(n_exp, top_k),
-        theme.ramp[0], fs=8.6)
+    # selection drives dispatch: stub down from the top-k box, bus, one drop per column group
+    bus = 0.742
+    ax.plot([0.770, 0.770], [0.772, bus], color=theme.secondary, lw=1.2, zorder=1)
+    ax.plot([0.215, 0.770], [bus, bus], color=theme.secondary, lw=1.2, zorder=1)
+    for x in (0.215, 0.353, 0.492, 0.631, 0.770):
+        arrow(ax, x, bus, x, 0.716)
 
-    down(ax_zoom, 0.4375, 0.802, 0.768)
-    ax_zoom.plot([0.115, 0.885], [0.768, 0.768], color=theme.secondary, lw=1.2)
-    for x in (0.115, 0.30, 0.50, 0.70, 0.885):
-        down(ax_zoom, x, 0.768, 0.720)
-
-    # One rounded chip per expert, generously spaced and every one numbered, so
-    # this reads as a list of 64 separate networks rather than as a 4x16 matrix --
-    # which matters in a figure whose subtitle explains matrix shapes.
+    # expert grid inside a dashed container, label on its left, legend on its right
+    ax.add_patch(patches.FancyBboxPatch(
+        (0.155, 0.420), 0.675, 0.292, boxstyle="round,pad=0,rounding_size=0.015",
+        linewidth=1.0, edgecolor=theme.muted, facecolor="none", linestyle=(0, (4, 3)), zorder=1))
+    ax.text(0.085, 0.566, f"{n_exp} experts\n(each an FFN)", ha="center", va="center",
+            fontsize=9, color=theme.secondary, linespacing=1.4)
     cols = 16
-    cw, ch, gap = 0.0445, 0.048, 0.0105
-    x0 = 0.5 - (cols * cw + (cols - 1) * gap) / 2
-    y0 = 0.690
+    cw, ch, gx, gy = 0.0345, 0.052, 0.0055, 0.012
+    x0 = 0.4925 - (cols * cw + (cols - 1) * gx) / 2
+    y0 = 0.692
     for e in range(n_exp):
         r, c = divmod(e, cols)
-        x = x0 + c * (cw + gap)
-        y = y0 - r * (ch + gap) - ch
+        x = x0 + c * (cw + gx)
+        y = y0 - r * (ch + gy) - ch
         on = e in chosen
-        ax_zoom.add_patch(patches.FancyBboxPatch(
-            (x, y), cw, ch, boxstyle="round,pad=0.0015,rounding_size=0.008",
+        ax.add_patch(patches.FancyBboxPatch(
+            (x, y), cw, ch, boxstyle="round,pad=0.001,rounding_size=0.006",
             linewidth=1.0 if on else 0.7, zorder=2,
-            edgecolor=theme.series[1] if on else theme.axis,
+            edgecolor=theme.ramp[5] if on else theme.axis,
             facecolor=theme.ramp[5] if on else theme.surface))
-        ax_zoom.text(x + cw / 2, y + ch / 2, str(e), ha="center", va="center",
-                     fontsize=6.4, zorder=3, fontweight="bold" if on else "normal",
-                     color=ink_for(theme.ramp[5]) if on else theme.muted)
-    gb = y0 - (n_exp // cols) * (ch + gap)
-    ax_zoom.text(0.5, gb - 0.028,
-                 "one box per expert — {} of them, each an entire feed-forward network"
-                 .format(n_exp),
-                 ha="center", fontsize=9.5, color=theme.ink)
-    ax_zoom.text(0.5, gb - 0.062,
-                 "filled = the {} this token was routed to  ·  the other {} are skipped, "
-                 "and stay in memory either way".format(top_k, n_exp - top_k),
-                 ha="center", fontsize=9.5, color=theme.secondary)
+        ax.text(x + cw / 2, y + ch / 2, str(e), ha="center", va="center", fontsize=6.6,
+                zorder=3, fontweight="bold" if on else "normal",
+                color=ink_for(theme.ramp[5]) if on else theme.muted)
+    for (label, on), ly in zip(
+        [("selected experts\n(for this token)", True), ("skipped experts\n(still in memory)", False)],
+        (0.640, 0.520),
+    ):
+        ax.add_patch(patches.FancyBboxPatch(
+            (0.850, ly), 0.030, 0.042, boxstyle="round,pad=0.001,rounding_size=0.005",
+            linewidth=1.0, edgecolor=theme.ramp[5] if on else theme.axis,
+            facecolor=theme.ramp[5] if on else theme.surface, zorder=2))
+        ax.text(0.892, ly + 0.021, label, ha="left", va="center", fontsize=8.2,
+                color=theme.secondary, linespacing=1.3)
 
-    down(ax_zoom, 0.5, gb - 0.088, gb - 0.130)
-    box(ax_zoom, 0.275, gb - 0.234, 0.45, 0.104,
-        "weighted combination\nadd the {} outputs, each scaled\nby its own router score".format(top_k),
-        theme.ramp[4], fs=8.8)
-    down(ax_zoom, 0.5, gb - 0.234, gb - 0.276)
-    ax_zoom.text(0.5, gb - 0.302,
-                 "output to the next layer: {:,} numbers".format(hid),
-                 ha="center", fontsize=9.5, color=theme.secondary)
-    ax_zoom.text(0.5, gb - 0.368,
-                 "the {} kept scores sum to {:.4f}, not 1 — OLMoE does not renormalize\n"
-                 "after the cut, so that shortfall scales this layer's output".format(top_k, kept),
-                 ha="center", fontsize=9, color=theme.ink, linespacing=1.5)
+    ax.text(0.4925, 0.393, f"One box per expert: {n_exp} of them, each an entire "
+            "feed-forward network.", ha="center", fontsize=9.2, color=theme.ink)
+    ax.text(0.4925, 0.365, f"Filled = the {top_k} this token was routed to  ·  the other "
+            f"{n_exp - top_k} are skipped, and stay in memory either way",
+            ha="center", fontsize=8.6, color=theme.secondary)
 
-    # ---- bottom left: inside one expert ----------------------------------
-    panel(ax_exp, "What is inside one expert?")
+    arrow(ax, 0.40, 0.345, 0.40, 0.300)
+    box(ax, 0.120, 0.185, 0.560, 0.115, "Weighted combination",
+        f"add the {top_k} expert outputs, each scaled by its router weight\n"
+        f"result: {hid:,} numbers", theme.ramp[4], fs=8.6)
+    arrow(ax, 0.40, 0.185, 0.40, 0.142)
+    ax.text(0.40, 0.118, f"Output to the next layer: {hid:,} numbers", ha="center",
+            fontsize=10, color=theme.ink)
+    ax.text(0.40, 0.080,
+            f"The {top_k} kept weights sum to {kept:.4f}, not 1. OLMoE does not renormalize\n"
+            "after the cut, so that shortfall scales this layer's output.",
+            ha="center", va="top", fontsize=8.6, color=theme.secondary, linespacing=1.45)
+
+    # key-point callout, beside the combination where the eye already is
+    ax.add_patch(patches.FancyBboxPatch(
+        (0.715, 0.130), 0.260, 0.190, boxstyle="round,pad=0,rounding_size=0.015",
+        linewidth=1.1, edgecolor=tint["orange"], facecolor=tint["orange"], alpha=0.12, zorder=1))
+    ax.add_patch(patches.FancyBboxPatch(
+        (0.715, 0.130), 0.260, 0.190, boxstyle="round,pad=0,rounding_size=0.015",
+        linewidth=1.1, edgecolor=tint["orange"], facecolor="none", zorder=1))
+    ax.text(0.735, 0.290, "Key point", ha="left", va="center", fontsize=11,
+            fontweight="bold", color=tint["orange"])
+    ax.text(0.735, 0.262, f"Only {top_k} experts run for\nthis token, but all {n_exp}\n"
+            "experts' parameters must\nstill be in memory.",
+            ha="left", va="top", fontsize=9.2, color=theme.ink, linespacing=1.4)
+
+    # ======== panel 3: inside one expert =====================================
+    ax = panel_axes([0.012, 0.085, 0.315, 0.318], "blue", 3, "What is inside one expert?")
     steps = [
-        ("input: {:,} numbers".format(hid), theme.ramp[0], 0.068),
-        ("gate and up\neach {:,} rows, {:,} wide".format(inter, hid), theme.ramp[1], 0.100),
-        ("SiLU(gate) x up\n-> {:,} numbers  (this is SwiGLU)".format(inter),
-         theme.ramp[2], 0.100),
-        ("down\n{:,} rows, {:,} wide".format(hid, inter), theme.ramp[1], 0.100),
-        ("output: {:,} numbers".format(hid), theme.ramp[0], 0.068),
+        ("Input", f"{hid:,} numbers", theme.ramp[0], 0.100),
+        ("Gate and up projections", f"each {inter:,} rows × {hid:,} wide", theme.ramp[1], 0.128),
+        ("SiLU(gate) × up", f"gives {inter:,} numbers (this is SwiGLU)", theme.ramp[2], 0.128),
+        ("Down projection", f"{hid:,} rows × {inter:,} wide", theme.ramp[1], 0.128),
+        ("Output", f"{hid:,} numbers", theme.ramp[0], 0.100),
     ]
-    y = 0.858
-    for i, (label, fill, h) in enumerate(steps):
-        box(ax_exp, 0.07, y - h, 0.86, h, label, fill, fs=8.6)
+    y = 0.890
+    for i, (title, body, fill, h) in enumerate(steps):
+        box(ax, 0.08, y - h, 0.84, h, title, body, fill, fs=8.6)
         if i < len(steps) - 1:
-            down(ax_exp, 0.5, y - h, y - h - 0.040)
-        y -= h + 0.040
-    ax_exp.text(0.5, 0.092,
-                "an ordinary feed-forward network —\nthe same one a dense model has, "
-                "built {} times per layer.\n{:.2f}M parameters each.".format(n_exp, per_expert / 1e6),
-                ha="center", fontsize=8.6, color=theme.secondary, linespacing=1.6)
+            arrow(ax, 0.5, y - h, 0.5, y - h - 0.038)
+        y -= h + 0.038
+    ax.text(0.5, 0.058, f"An ordinary feed-forward network, the same shape a dense model\n"
+            f"has, built {n_exp} times per layer. {per_expert / 1e6:.2f}M parameters each.",
+            ha="center", va="center", fontsize=8.4, color=theme.secondary, linespacing=1.45)
 
-    # ---- bottom middle: the numbers --------------------------------------
-    panel(ax_num, "Key numbers, all measured here")
+    # ======== panel 4: key numbers ============================================
+    ax = panel_axes([0.340, 0.085, 0.320, 0.318], "blue", 4, "Key numbers")
     rows = [
-        ("total parameters", "{:.3f}B".format(total / 1e9)),
-        ("active per token", "1.177B   (17.0%)"),
-        ("layers", "{}".format(layers)),
-        ("experts per layer", "{}".format(n_exp)),
-        ("experts per token", "{}".format(top_k)),
-        ("parameters per expert", "{:.2f}M".format(per_expert / 1e6)),
-        ("weights that are experts", "93.1%"),
-        ("weights that are router", "0.030%"),
-        ("resident in bf16", "12.89 GiB"),
-        ("experts for 1 token", "{}".format(top_k)),
-        ("experts for 256 tokens", "60.9"),
+        ("Total parameters", f"{total / 1e9:.3f}B"),
+        ("Active parameters per token", f"{active / 1e9:.3f}B  ({100 * active / total:.1f}%)"),
+        ("Layers", f"{layers}"),
+        ("Experts per layer", f"{n_exp}"),
+        ("Experts used per token (top-k)", f"{top_k}"),
+        ("Parameters per expert", f"{per_expert / 1e6:.2f}M"),
+        ("Share of parameters in experts", f"{100 * roles['experts'] / total:.1f}%"),
+        ("Share of parameters in the router", f"{100 * roles['router'] / total:.3f}%"),
+        ("Model size in bf16", f"{total * 2 / GIB:.2f} GiB"),
+        ("Experts needed by 1 token", f"{top_k}"),
+        (f"Experts needed by {many_tokens} tokens together", f"{many_experts:.1f}"),
     ]
-    y = 0.858
-    for label, value in rows:
-        ax_num.text(0.06, y, label, ha="left", va="center", fontsize=9,
-                    color=theme.secondary)
-        ax_num.text(0.94, y, value, ha="right", va="center", fontsize=9,
-                    fontweight="bold", color=theme.ink)
-        y -= 0.0705
-    ax_num.plot([0.06, 0.94], [y + 0.034, y + 0.034], color=theme.axis, lw=0.8)
-    ax_num.text(0.5, y - 0.012, "OLMoE-1B-7B · bfloat16 · Apple M4",
-                ha="center", fontsize=8.5, color=theme.muted)
+    top, row_h, left, right, split = 0.880, 0.066, 0.05, 0.95, 0.68
+    ax.add_patch(patches.Rectangle((left, top - row_h), right - left, row_h,
+                                   facecolor=theme.grid, edgecolor="none", zorder=1))
+    ax.text(left + 0.02, top - row_h / 2, "Item", ha="left", va="center", fontsize=9.4,
+            fontweight="bold", color=theme.ink)
+    ax.text(split + 0.02, top - row_h / 2, "Value", ha="left", va="center", fontsize=9.4,
+            fontweight="bold", color=theme.ink)
+    for i, (label, value) in enumerate(rows):
+        yy = top - row_h * (i + 1.5)
+        ax.text(left + 0.02, yy, label, ha="left", va="center", fontsize=8.6,
+                color=theme.secondary)
+        ax.text(split + 0.02, yy, value, ha="left", va="center", fontsize=8.6,
+                fontweight="bold", color=theme.ink)
+        ax.plot([left, right], [yy - row_h / 2, yy - row_h / 2], color=theme.grid, lw=0.8)
+    table_bottom = top - row_h * (len(rows) + 1)
+    ax.add_patch(patches.Rectangle((left, table_bottom), right - left, top - table_bottom,
+                                   facecolor="none", edgecolor=theme.axis, lw=0.9, zorder=2))
+    ax.plot([split, split], [table_bottom, top], color=theme.axis, lw=0.9, zorder=2)
+    ax.text(0.5, 0.045, "OLMoE-1B-7B  ·  bfloat16  ·  Apple M4", ha="center",
+            fontsize=8.4, color=theme.muted)
 
-    # ---- bottom right: the walk-through ----------------------------------
-    panel(ax_step, "What happens to one token")
+    # ======== panel 5: one token's journey ====================================
+    ax = panel_axes([0.673, 0.085, 0.315, 0.318], "blue", 5, "What happens to one token?")
     walk = [
         "It goes through self-attention,\nexactly as in a dense model.",
-        "The router scores all {} experts\nfrom the token's own vector.".format(n_exp),
-        "Softmax, then keep the top {}.\nThe other {} are skipped.".format(top_k, n_exp - top_k),
-        "Those {} experts run, in parallel.\nEach is an ordinary FFN.".format(top_k),
-        "Their outputs are added, each\nscaled by its router score.",
+        f"The router scores all {n_exp} experts\nfrom the token's own vector.",
+        f"Softmax, then keep the top {top_k}.\nThe other {n_exp - top_k} are skipped.",
+        f"Those {top_k} experts run, in parallel.\nEach is an ordinary FFN.",
+        "Their outputs are added, each\nscaled by its router weight.",
         "On to the next layer, which\nroutes it again, independently.",
     ]
-    y = 0.862
+    y = 0.855
     for i, text in enumerate(walk, start=1):
-        ax_step.add_patch(patches.Circle((0.11, y), 0.030, facecolor=theme.series[0],
-                                         edgecolor="none", zorder=3))
-        ax_step.text(0.11, y, str(i), ha="center", va="center", fontsize=9,
-                     fontweight="bold", color=ink_for(theme.series[0]), zorder=4)
-        ax_step.text(0.195, y, text, ha="left", va="center", fontsize=8.6,
-                     color=theme.ink, linespacing=1.6)
-        y -= 0.126
-    ax_step.text(0.5, 0.048,
-                 "The capacity of {:.1f}B parameters,\nthe arithmetic of 1.2B,\n"
-                 "and the memory bill of all {:.1f}B.".format(total / 1e9, total / 1e9),
-                 ha="center", fontsize=8.8, color=theme.secondary, linespacing=1.6)
+        # outlined, not filled: the filled circles are the panel badges
+        ax.text(0.105, y, str(i), ha="center", va="center", fontsize=9.5, fontweight="bold",
+                color=tint["blue"], zorder=4,
+                bbox=dict(boxstyle="circle,pad=0.30", facecolor=theme.surface,
+                          edgecolor=tint["blue"], linewidth=1.4))
+        ax.text(0.195, y, text, ha="left", va="center", fontsize=8.8, color=theme.ink,
+                linespacing=1.45)
+        y -= 0.118
+    ax.add_patch(patches.FancyBboxPatch(
+        (0.06, 0.030), 0.88, 0.110, boxstyle="round,pad=0,rounding_size=0.015",
+        linewidth=0, facecolor=tint["blue"], alpha=0.10, zorder=1))
+    ax.text(0.5, 0.085, f"The capacity of {total / 1e9:.1f}B parameters,\n"
+            f"the arithmetic of {active / 1e9:.1f}B, and the memory bill of all {total / 1e9:.1f}B.",
+            ha="center", va="center", fontsize=8.8, color=theme.ink, linespacing=1.45, zorder=2)
 
-    fig.suptitle("Mixture-of-Experts, end to end", fontsize=16, fontweight="bold",
-                 color=theme.ink, y=0.976)
-    fig.text(0.5, 0.952,
-             "OLMoE-1B-7B — every number on this page is measured in this post",
-             ha="center", fontsize=10.5, color=theme.secondary)
-    fig.text(0.5, 0.936,
-             "every matrix is given as rows x width, the way post 1 describes the word table",
-             ha="center", fontsize=9, style="italic", color=theme.muted)
+    # ======== closing banner ===================================================
+    ax = panel_axes([0.012, 0.012, 0.976, 0.062], "green", None, "")
+    ax.text(0.5, 0.64, f"A {total / 1e9:.1f}-billion-parameter model that mostly declines to run.",
+            ha="center", va="center", fontsize=15, fontweight="bold", color=theme.ink)
+    ax.text(0.5, 0.27, f"All {total / 1e9:.1f}B parameters are held in memory; about "
+            f"{active / 1e9:.1f}B take part in any one token.",
+            ha="center", va="center", fontsize=10, color=theme.secondary)
+
     return save_both(fig, SLUG, "moe-architecture", theme)
 
 
@@ -1217,7 +1299,7 @@ def make_figures(
     written = []
     for theme in THEMES:
         with styled(theme):
-            written.append(figure_architecture(model, chosen, kept, theme))
+            written.append(figure_architecture(model, chosen, kept, curve, theme))
             written.append(figure_block(model, chosen, theme))
             written.append(figure_router_flow(model, logits, theme))
             written.append(figure_where_the_weights_are(counts, theme))
