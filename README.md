@@ -5,9 +5,10 @@ Companion code for the *LLM Architecture Refresh* blog series at
 
 Every post makes claims about how modern LLMs work. Every claim here has a
 receipt: a small program you can run on a laptop that prints the number the post
-is asserting. Nothing is bigger than it needs to be — most demos use toy tensors
-(`d_model=64`, 8 tokens, 2 experts) because a synthetic tensor makes the same
-point as a 7B checkpoint, in one second instead of ten minutes.
+is asserting. Nothing is bigger than it needs to be: where a synthetic tensor makes
+the same point as a real checkpoint, the demo uses toy tensors and runs in seconds.
+Demos 04 and 05 load real trained models, because what they measure (outlier
+features, perplexity, what a router learns) only exists after training.
 
 ## Requirements
 
@@ -33,6 +34,10 @@ uv sync --extra cuda
 Demos that require CUDA detect its absence and print a skip notice instead of
 crashing, so a full run on a Mac always completes.
 
+Two demos download a checkpoint from Hugging Face on first run: `demo04` uses
+Qwen2.5-0.5B (about 1 GB), and `demo05` uses OLMoE-1B-7B (about 13 GB on disk, and
+about 13 GiB of memory in bfloat16, so plan for a 24 GiB machine).
+
 ## Forcing a device
 
 ```bash
@@ -51,6 +56,8 @@ speedup" is actually just measuring Python dispatch overhead.
 | `demo01` | Attention & RoPE | Attention in 5 lines matched against PyTorch's fused kernel; softmax saturation without `1/sqrt(d_k)`; causal masking; RoPE scores depending only on relative offset |
 | `demo02` | KV cache | Cached and uncached generation producing identical tokens; the 284x repeated-work multiplier without a cache; the cache outgrowing the weights at 128k context; prefill at 256 FLOP/byte vs decode at 0.5; and the batch sweep where KV traffic overtakes weight traffic |
 | `demo03` | Flash Attention | Online softmax matching `torch.softmax` to 1e-7; tiled attention reproducing the fused kernel exactly while sliding-window attention misses by 0.6; the n^2 score matrix reaching 512 GiB at 128k context; and ~47% of causal tiles skipped outright |
+| `demo04` | Quantization | INT8 and NF4 implemented by hand on Qwen2.5-0.5B; activations carrying 10–85x outlier channels where weights carry 4–7x; NF4's codebook derived to within 6e-08 of bitsandbytes'; a 2.09x real shrink rather than 4x; and perplexity moving 0.21% while the worst token's prediction moves 68x the average |
+| `demo05` | Mixture-of-experts | OLMoE-1B-7B's parameters derived tensor by tensor, 93.1% of them experts and 17.0% active per token; a router score shown to be exactly a dot product; expert choice depending on the kind of text, against a noise floor; one token needing 8 of 64 experts while 256 tokens need 60.9; and how many GPUs a token must reach under expert parallelism |
 
 More land as the series is written.
 
@@ -62,9 +69,20 @@ src/llmrefresher/
 ├── report.py      fixed-width console output, paste-ready for the posts
 ├── plotting.py    shared matplotlib style; every figure in light and dark
 ├── toy_model.py   small Llama-shaped LM (RMSNorm, RoPE, SwiGLU, GQA, KV cache)
+├── quantizers.py  hand-written INT8, INT4 and NF4 formats (demo04)
 └── demos/         one module per post, each with a main()
+tests/             unit tests for the demo arithmetic that needs no model
 figures/           generated plots, copied into the blog's assets
 outputs/           captured stdout, so post text always matches a real run
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+The tests cover logic whose results a post quotes but which can be checked without
+downloading a model, each against a hand-built case whose answer is known.
 ```
 
 ## A note on benchmarks

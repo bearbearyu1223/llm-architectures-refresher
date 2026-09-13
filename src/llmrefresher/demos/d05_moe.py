@@ -1,42 +1,47 @@
 """Demo 05 — Mixture-of-experts: what the router learns, and what sparsity costs.
 
-Claims from the post, each with a receipt:
+Companion to post 5 of LLM Architecture Refresh. Each section prints the numbers
+one section of the post quotes, and is tagged ``[post §N]`` in the output.
 
-1. In an MoE model the experts *are* the MLP, replicated. 93% of OLMoE's weights
-   sit in its 1024 experts, and a single token touches 8 of every 64 of them —
-   so 17% of the parameters do the work while 100% of them occupy memory.
-2. The router that makes that choice is the smallest part of the model: one
-   2048x64 matrix per layer, 2.1M parameters against 6.9B, 0.03% of the weights
-   deciding how the other 93% get used.
-3. Routing is a softmax over 64 experts, a top-8 cut, and a weighted sum. OLMoE
-   sets ``norm_topk_prob=False``, so the eight kept weights are *not*
-   renormalized — they sum to well under 1, and that shortfall is a scale the
-   layer's output actually carries.
-4. The router does specialize, measurably: expert usage differs between prose,
-   code and mathematics, and the difference grows with depth. Whether that is
-   *semantic* specialization is contested — see the post's §4.
-5. Active parameters predict speed and total parameters predict the memory bill.
-   Forcing top-64 routing on the same weights leaves memory untouched and makes
-   the forward pass several times slower.
-6. Sparsity is a per-token property and it does not survive batching. One token
-   needs 8 experts; a few hundred tokens together need all 64. That is why an
-   MoE saves compute without saving memory.
+1. Where the parameters are. 93.1% of OLMoE's 6.92B parameters are experts. A
+   token uses 8 of each layer's 64, so 1.179B parameters (17.0%) do its
+   arithmetic while all of them occupy memory. Every count is also derived from
+   tensor shapes, and the two derivations are asserted to agree. Why 64 and 8:
+   8 x 1,024 is exactly the 8,192-wide FFN of the dense model of this shape.
+2. The router is one 64-row x 2,048-wide matrix per layer, 2.10M parameters
+   (0.030%). A router score is exactly a row dotted with the token's vector,
+   checked against the model for all 64 experts; fp32 shifts the scores but not
+   the choice of experts at layer 0.
+3. Routing is softmax, top-8, weighted sum. ``norm_topk_prob=False``, so the kept
+   weights sum to 0.4281 rather than 1 for the token walked through.
+4. Expert usage depends on the kind of text, measured against a noise floor of
+   two halves of one passage (0.216 against 0.554), and more so with depth.
+   Whether that is *semantic* specialization is contested; the post says so.
+5. Top-64 against top-8 on the same weights: about 2x the time, zero extra bytes.
+   The only wall-clock number here, so the only one that moves between runs.
+6. Per-token sparsity does not survive batching: 256 tokens together need 60.9
+   of the 64 experts.
+7. Split across 8 GPUs, one token's 8 experts land on 5.54 of them on average.
+8. Nothing balances load for free: the busiest expert takes 5.71x an even share.
 
-Like demo 04 this needs a *trained* model — a router with random weights routes
-nothing in particular. OLMoE-1B-7B is used because it is the smallest fully open
-MoE that fits on a 24 GB laptop, and because its 64-expert top-8 layers are the
-plain form of the mechanism: no shared expert, no upcycling, no GQA.
+Like demo 04 this needs a *trained* model; a router with random weights routes
+nothing in particular. OLMoE-1B-7B is the smallest fully open MoE that fits on a
+24 GiB laptop, and its layers are the plain form of the mechanism: no shared
+expert, not upcycled from a dense model.
 
-Precision note: this demo runs in bfloat16, not the fp32 that demo 04 used.
-6.92B parameters is 25.8 GiB in fp32 and does not fit in 24 GB of unified memory;
-in bf16 it is 12.9 GiB and does. Every claim here is a count or a ratio, both of
-which survive the change.
+Precision: bfloat16, the precision OLMoE was released in. fp32 would be 25.8 GiB
+and does not fit. Parameter counts are unaffected; routing numbers come from a
+bf16 forward pass, and section 2 checks the router step against fp32.
 
-Run: ``uv run demo05``
+The routing arithmetic that does not need a model (expert_union, gpu_spread,
+_usage_from_idx, _tv) is unit-tested in tests/test_d05_helpers.py.
+
+Run: ``uv run demo05 > outputs/demo05.txt 2>/dev/null``
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -151,6 +156,102 @@ def _cfg(model) -> tuple[int, int, int]:
     return c.num_experts, c.num_experts_per_tok, c.num_hidden_layers
 
 
+@dataclass(frozen=True)
+class Census:
+    """Every parameter in the model, by role, counted once.
+
+    Five parts of this demo need these numbers, and they used to compute them
+    separately. That is how the router came to be missing from one copy of the
+    active count while the others had it, so they all read from here now.
+    """
+
+    experts: int
+    router: int
+    attention: int
+    norms: int
+    embed: int
+    head: int
+    n_exp: int
+    top_k: int
+    layers: int
+
+    @property
+    def total(self) -> int:
+        return self.experts + self.router + self.attention + self.norms + self.embed + self.head
+
+    @property
+    def per_expert(self) -> int:
+        return self.experts // (self.n_exp * self.layers)
+
+    @property
+    def active(self) -> int:
+        # The router is active: it scores every expert for every token. The
+        # embedding table is not: a token is looked up in it, which multiplies
+        # by nothing. The LM head is a full multiply, so it counts.
+        return (self.per_expert * self.top_k * self.layers + self.attention + self.router
+                + self.norms + self.head)
+
+    def by_role(self) -> dict[str, int]:
+        return {"experts": self.experts, "router": self.router, "attention": self.attention,
+                "embed + head": self.embed + self.head, "norms": self.norms}
+
+
+def _census(model) -> Census:
+    roles = {"experts": 0, "router": 0, "attention": 0, "norms": 0, "embed": 0, "head": 0}
+    for name, p in model.named_parameters():
+        if ".experts." in name:
+            role = "experts"
+        elif ".mlp.gate." in name:
+            role = "router"
+        elif ".self_attn." in name:
+            role = "attention"
+        elif "embed_tokens" in name:
+            role = "embed"
+        elif "lm_head" in name:
+            role = "head"
+        else:
+            role = "norms"
+        roles[role] += p.numel()
+    n_exp, top_k, layers = _cfg(model)
+    census = Census(**roles, n_exp=n_exp, top_k=top_k, layers=layers)
+    assert census.total == sum(p.numel() for p in model.parameters())
+    return census
+
+
+# ---------------------------------------------------------------------------
+# Pure routing arithmetic. No model needed, so these are unit-tested.
+# ---------------------------------------------------------------------------
+
+
+def expert_union(idx: torch.Tensor, window: int) -> float:
+    """Mean distinct experts needed by `window` consecutive tokens.
+
+    `idx` is (layers, tokens, top_k) of chosen experts. Averages over every
+    disjoint window and every layer, so the result does not depend on where the
+    passage happens to start.
+    """
+    layers, n_tokens, _ = idx.shape
+    counts = [
+        len(torch.unique(idx[layer, start:start + window]))
+        for start in range(0, n_tokens - window + 1, window)
+        for layer in range(layers)
+    ]
+    return sum(counts) / len(counts)
+
+
+def gpu_spread(idx: torch.Tensor, n_exp: int, n_gpus: int) -> tuple[float, float]:
+    """(mean GPUs a token must reach, share of tokens reaching all of them).
+
+    Experts are dealt to GPUs in contiguous blocks, as expert parallelism does.
+    """
+    per_gpu = n_exp // n_gpus
+    gpus = idx // per_gpu
+    hit = torch.zeros(*gpus.shape[:2], n_gpus, dtype=torch.bool)
+    hit.scatter_(2, gpus, True)
+    distinct = hit.sum(dim=-1).float()
+    return distinct.mean().item(), (distinct == n_gpus).float().mean().item()
+
+
 # ---------------------------------------------------------------------------
 # 1. Where the parameters are
 # ---------------------------------------------------------------------------
@@ -158,21 +259,9 @@ def _cfg(model) -> tuple[int, int, int]:
 
 def where_the_parameters_are(rep: Report, model) -> None:
     """Census by role, so 'the experts are the MLP' is a number, not a claim."""
-    buckets = {"experts": 0, "router": 0, "attention": 0, "embed + head": 0, "norms": 0}
-    for name, p in model.named_parameters():
-        n = p.numel()
-        if ".experts." in name:
-            buckets["experts"] += n
-        elif ".mlp.gate." in name:
-            buckets["router"] += n
-        elif ".self_attn." in name:
-            buckets["attention"] += n
-        elif "embed_tokens" in name or "lm_head" in name:
-            buckets["embed + head"] += n
-        else:
-            buckets["norms"] += n
-
-    total = sum(buckets.values())
+    census = _census(model)
+    buckets = census.by_role()
+    total = census.total
 
     def count(n: int) -> str:
         # A row that rounds to 0.000B tells the reader nothing; the router and
@@ -190,13 +279,7 @@ def where_the_parameters_are(rep: Report, model) -> None:
     rows.append(["TOTAL", count(total), "100.0%"])
     rep.table(["role", "parameters", "share"], rows)
 
-    n_exp, top_k, layers = _cfg(model)
-    per_expert = buckets["experts"] // (n_exp * layers)
-    active_experts = per_expert * top_k * layers
-    # The router is active: it scores all experts for every token. The embedding
-    # table is not: a token is looked up in it, which multiplies by nothing.
-    active = (active_experts + buckets["attention"] + buckets["router"] + buckets["norms"]
-              + buckets["embed + head"] // 2)
+    n_exp, top_k, per_expert, active = census.n_exp, census.top_k, census.per_expert, census.active
 
     rep.blank()
     rep.kv("experts per layer", n_exp)
@@ -329,6 +412,10 @@ def derive_the_census(rep: Report, model, tok) -> None:
     rep.blank()
     rep.table(["part", "parameters"], [[k, f"{v:,}"] for k, v in active_parts]
               + [["embedding table, a lookup", "not counted"], ["active total", f"{active:,}"]])
+    # Two independent routes to the same numbers: shapes read tensor by tensor
+    # here, and names bucketed in _census. If they ever disagree, stop.
+    census = _census(model)
+    assert (active, total) == (census.active, census.total), "census derivations disagree"
     rep.kv("active share of total", f"{100 * active / total:.2f}%")
     rep.kv("active if the lookup is counted", f"{(active + embed) / 1e9:.2f}B")
 
@@ -452,7 +539,7 @@ def the_router_is_tiny(rep: Report, model, tok, ids: torch.Tensor) -> None:
     all_x = captured["x"][0].float()
     sel_bf16 = torch.topk(out.router_logits[0].reshape(-1, n_exp).float(), top_k, dim=-1).indices
     sel_fp32 = torch.topk(all_x @ W.float().T, top_k, dim=-1).indices
-    same = sum(set(a.tolist()) == set(b.tolist()) for a, b in zip(sel_bf16, sel_fp32))
+    same = sum(set(a.tolist()) == set(b.tolist()) for a, b in zip(sel_bf16, sel_fp32, strict=True))
     rep.kv("fp32 dot products, largest shift", f"{(fp32 - from_model.float()).abs().max():.4f}")
     rep.kv("tokens picking the same 8 in fp32", f"{same} of {ids.shape[1]}")
     rep.takeaway(
@@ -504,7 +591,7 @@ def one_token_routed(
         ["rank", "expert", "logit", "softmax weight"],
         [
             [i + 1, int(e), f"{row[e]:+.4f}", f"{w:.4f}"]
-            for i, (w, e) in enumerate(zip(top_w.tolist(), top_e.tolist()))
+            for i, (w, e) in enumerate(zip(top_w.tolist(), top_e.tolist(), strict=True))
         ],
     )
     kept = top_w.sum().item()
@@ -673,22 +760,24 @@ def two_bills(rep: Report, model, ids: torch.Tensor, device: torch.device) -> di
     # This is a timing experiment only -- with norm_topk_prob=False, routing to
     # all 64 experts changes what the model computes, so the top-64 row is a
     # measurement of cost, never of quality.
-    timings = {}
-    for k in (top_k, n_exp):
+    def set_k(k: int) -> None:
         model.config.num_experts_per_tok = k
         for m in model.modules():
             if hasattr(m, "top_k"):
                 m.top_k = k
-        with torch.no_grad():
-            timings[k] = benchmark_ms(
-                lambda: model(ids), device=device, warmup=2, repeats=5
-            )
-    model.config.num_experts_per_tok = top_k
-    for m in model.modules():
-        if hasattr(m, "top_k"):
-            m.top_k = top_k
 
-    active_frac = top_k / n_exp
+    # Every later section routes top-8. If the benchmark raised while top-64 was
+    # set, they would silently measure a different model, so restore in finally.
+    # More repeats do not steady the ratio: 5 trials each at 5 and at 10 repeats
+    # gave standard deviations of 0.021 and 0.027. Run-to-run drift is the machine.
+    timings = {}
+    try:
+        for k in (top_k, n_exp):
+            set_k(k)
+            with torch.no_grad():
+                timings[k] = benchmark_ms(lambda: model(ids), device=device, warmup=2, repeats=5)
+    finally:
+        set_k(top_k)
     rep.table(
         ["experts per token", "forward (ms)", "vs top-8"],
         [
@@ -723,14 +812,7 @@ def batch_collapse(rep: Report, model, logits: torch.Tensor) -> list[tuple[int, 
     curve = []
     rows = []
     for n in sizes:
-        # Average over every disjoint window of this size, so the number is not
-        # an artifact of where the passage happens to start.
-        per_layer = []
-        for start in range(0, n_tokens - n + 1, n):
-            window = idx[:, start : start + n, :]
-            for layer in range(layers):
-                per_layer.append(len(torch.unique(window[layer])))
-        touched = sum(per_layer) / len(per_layer)
+        touched = expert_union(idx, n)
         curve.append((n, touched))
         rows.append(
             [n, f"{touched:.1f}", f"{100 * touched / n_exp:.0f}%", f"{n * top_k}"]
@@ -764,22 +846,10 @@ def experts_across_gpus(rep: Report, model, logits: torch.Tensor) -> list[tuple[
     idx = _topk_idx(logits, top_k)
     rows, curve = [], []
     for g in (2, 4, 8, 16):
-        per_gpu = n_exp // g
-        gpus = idx // per_gpu                       # which GPU each choice lands on
-        hit = torch.zeros(*gpus.shape[:2], g, dtype=torch.bool)
-        hit.scatter_(2, gpus, True)
-        distinct = hit.sum(dim=-1).float()          # GPUs touched, per (layer, token)
-        all_of_them = (distinct == g).float().mean()
-        curve.append((g, distinct.mean().item()))
-        rows.append(
-            [
-                g,
-                per_gpu,
-                f"{distinct.mean():.2f}",
-                f"{100 * distinct.mean() / g:.0f}%",
-                f"{100 * all_of_them:.0f}%",
-            ]
-        )
+        mean_gpus, share_all = gpu_spread(idx, n_exp, g)
+        curve.append((g, mean_gpus))
+        rows.append([g, n_exp // g, f"{mean_gpus:.2f}", f"{100 * mean_gpus / g:.0f}%",
+                     f"{100 * share_all:.0f}%"])
     rep.table(
         ["GPUs", "experts each", "GPUs per token", "of all", "tokens needing all"],
         rows,
@@ -845,15 +915,8 @@ def figure_block(model, chosen: list[int], theme: Theme) -> Path:
     section 3's table. The active share is computed, not typed.
     """
     n_exp, top_k, layers = _cfg(model)
-    roles = {"experts": 0, "router": 0, "attention": 0, "head": 0, "norms": 0, "embed": 0}
-    for name, p in model.named_parameters():
-        k = (".experts." in name and "experts") or (".mlp.gate." in name and "router") \
-            or (".self_attn." in name and "attention") or ("lm_head" in name and "head") \
-            or ("embed_tokens" in name and "embed") or "norms"
-        roles[k] += p.numel()
-    total = sum(roles.values())
-    active = (roles["experts"] * top_k // n_exp + roles["attention"] + roles["router"]
-              + roles["norms"] + roles["head"])
+    census = _census(model)
+    total, active = census.total, census.active
 
     fig = plt.figure(figsize=(12.0, 7.6))
     blue, orange = theme.series[0], theme.series[1]
@@ -942,6 +1005,7 @@ def figure_block(model, chosen: list[int], theme: Theme) -> Path:
     for (label, on), ly in zip(
         [("selected experts\n(for this token)", True), ("skipped experts\n(still in memory)", False)],
         (0.500, 0.380),
+        strict=True,
     ):
         ax.add_patch(patches.FancyBboxPatch(
             (0.815, ly), 0.030, 0.045, boxstyle="round,pad=0.001,rounding_size=0.005",
@@ -980,25 +1044,9 @@ def figure_architecture(
     vocab = model.config.vocab_size
 
     # ---- every figure number, derived rather than typed ---------------------
-    roles = {"experts": 0, "router": 0, "attention": 0, "head": 0, "embed": 0, "norms": 0}
-    for name, p in model.named_parameters():
-        n = p.numel()
-        if ".experts." in name:
-            roles["experts"] += n
-        elif ".mlp.gate." in name:
-            roles["router"] += n
-        elif ".self_attn." in name:
-            roles["attention"] += n
-        elif "lm_head" in name:
-            roles["head"] += n
-        elif "embed_tokens" in name:
-            roles["embed"] += n
-        else:
-            roles["norms"] += n
-    total = sum(roles.values())
-    per_expert = roles["experts"] // (n_exp * layers)
-    active = (per_expert * top_k * layers + roles["attention"] + roles["router"]
-              + roles["norms"] + roles["head"])
+    census = _census(model)
+    roles = {"experts": census.experts, "router": census.router}
+    total, per_expert, active = census.total, census.per_expert, census.active
     many_tokens, many_experts = curve[-1]
 
     fig = plt.figure(figsize=(13.5, 17.0))
@@ -1146,6 +1194,7 @@ def figure_architecture(
     for (label, on), ly in zip(
         [("selected experts\n(for this token)", True), ("skipped experts\n(still in memory)", False)],
         (0.640, 0.520),
+        strict=True,
     ):
         ax.add_patch(patches.FancyBboxPatch(
             (0.850, ly), 0.030, 0.042, boxstyle="round,pad=0.001,rounding_size=0.005",
@@ -1329,10 +1378,10 @@ def figure_router_flow(model, logits: torch.Tensor, theme: Theme,
     # Exact proportion is impossible (2,048 is 256x 8), and the subtitle says so.
     widths = [(0.200, 12), (0.100, 6), (0.100, 6), (0.030, 2)]   # (drawn, columns)
     lefts = [0.015, 0.375, 0.635, 0.895]
-    xs = [l + w / 2 for l, (w, _) in zip(lefts, widths)]
-    rights = [l + w for l, (w, _) in zip(lefts, widths)]
+    xs = [l + w / 2 for l, (w, _) in zip(lefts, widths, strict=True)]
+    rights = [l + w for l, (w, _) in zip(lefts, widths, strict=True)]
     fills = [theme.ramp[1], theme.ramp[2], theme.ramp[4], theme.ramp[5]]
-    for x, (w, cols), fill in zip(xs, widths, fills):
+    for x, (w, cols), fill in zip(xs, widths, fills, strict=True):
         grid(ax_flow, x, 0.60, cols, 4, w, 0.30, fill)
     pad = 0.012
     caption(ax_flow, xs[0], "token vectors", f"n tokens × {hid:,} wide")
@@ -1384,7 +1433,7 @@ def figure_router_flow(model, logits: torch.Tensor, theme: Theme,
                   label=f"the {n_exp - top_k} discarded, together {1 - kept:.4f}"),
         ],
         loc="upper right", fontsize=9.5, labelcolor=theme.ink, frameon=False,
-        title=f"kept weights are not rescaled to sum to 1",
+        title="kept weights are not rescaled to sum to 1",
         title_fontsize=9,
     )
     ax_bar.get_legend().get_title().set_color(theme.secondary)
@@ -1552,19 +1601,7 @@ def main() -> None:
     rep.kv("dtype", "bfloat16")
     rep.kv("routing passage", f"{ids.shape[1]} tokens")
 
-    counts = {"experts": 0, "router": 0, "attention": 0, "embed + head": 0, "norms": 0}
-    for name, p in model.named_parameters():
-        n = p.numel()
-        if ".experts." in name:
-            counts["experts"] += n
-        elif ".mlp.gate." in name:
-            counts["router"] += n
-        elif ".self_attn." in name:
-            counts["attention"] += n
-        elif "embed_tokens" in name or "lm_head" in name:
-            counts["embed + head"] += n
-        else:
-            counts["norms"] += n
+    counts = _census(model).by_role()
 
     rep.section("1. Where the parameters actually are               [post §1]")
     where_the_parameters_are(rep, model)
