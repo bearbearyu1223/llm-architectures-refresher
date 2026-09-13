@@ -197,6 +197,24 @@ device memory : 17.2 GB
   >> One token is routed independently at every layer, so it visits 16
      separate committees of 8 on its way through the model.
 
+  Layer 0's MoE output for ' harbour', built from the formula:
+
+  expert  weight p_e  |FFN_e(x)|  |p_e FFN_e(x)|
+  ------------------------------------------------
+  5           0.1164      0.8041          0.0936
+  14          0.0864      0.6428          0.0555
+  41          0.0669      1.5089          0.1010
+  18          0.0597      0.6144          0.0367
+  6           0.0356      1.8434          0.0655
+  17          0.0243      0.9634          0.0234
+  28          0.0196      0.7652          0.0150
+  9           0.0195      0.8227          0.0160
+
+  |y|, sum of the 8 rows (fp32)      0.2074
+  |y|, the model's own block (fp32)  0.2074
+  largest difference, any coordinate 0.0e+00
+  layer output == h_mid + y? (bf16)  yes
+
 --------------------------------------------------------------------------
 4. What the router learns                          [post §4]
 --------------------------------------------------------------------------
@@ -247,11 +265,11 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         430.0     1.00x
-  64                        933.6     2.17x
+  8                         431.4     1.00x
+  64                        932.6     2.16x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.17x
+  measured wall-clock ratio          2.16x
     below 8x because attention, norms and the LM head are unchanged
 
   >> Turning every expert on costs 2.2x the time and 0 extra bytes of
@@ -274,6 +292,14 @@ device memory : 17.2 GB
   64                         53.9    84%                512
   128                        58.0    91%               1024
   256                        60.9    95%               2048
+
+  Computing all 356 tokens at once, layer 0 makes one call per expert:
+
+  experts called                     64 of 64
+  tokens per call, fewest            1
+  tokens per call, median            39
+  tokens per call, most              254
+  tokens x 8 routing slots           2,848
 
   >> One token needs 8 experts; 256 tokens together need 61. Sparsity is a
      property of a token, not of a batch — which is why an MoE saves
@@ -315,8 +341,41 @@ device memory : 17.2 GB
      penalty during training is what keeps one expert from swallowing the
      traffic and the rest from starving.
 
+  What training minimizes, on the 94-token passage:
+
+  tokens scored                      93 (each predicts the next)
+  L_CE, cross-entropy                2.7381
+
+  sum of f_i over experts            8.0000
+  sum of P_i over experts            1.0000
+  L_LB if routing were even          8.0000
+  L_LB by hand, all layers pooled    8.1675
+  L_LB, transformers' own function   8.1675
+  L_LB by hand, mean of per-layer    10.5038
+  L_RZ, router z-loss (paper)        11.5881
+
+  term           coefficient    value  contribution
+  ---------------------------------------------------
+  L_CE                     1   2.7381        2.7381
+  L_LB (pooled)         0.01   8.1675        0.0817
+  L_RZ                 0.001  11.5881        0.0116
+  total                                      2.8314
+
 --------------------------------------------------------------------------
-9. Figures
+9. What training updates                          [post §9]
+--------------------------------------------------------------------------
+  One token, ' harbour', backpropagated through layer 0's MoE block:
+
+  router rows with nonzero gradient  64 of 64
+  experts with nonzero gradient      8 of 64
+    which ones                       5, 6, 9, 14, 17, 18, 28, 41
+    the router's top 8, sorted       5, 6, 9, 14, 17, 18, 28, 41
+
+  dL/dW_r, largest entry (autograd)  0.1680
+  dL/dW_r, by hand vs autograd       max difference 1.5e-08
+
+--------------------------------------------------------------------------
+10. Figures
 --------------------------------------------------------------------------
   wrote figures/05-mixture-of-experts/moe-architecture-light.png
   wrote figures/05-mixture-of-experts/moe-block-light.png

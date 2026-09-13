@@ -820,6 +820,18 @@ def batch_collapse(rep: Report, model, logits: torch.Tensor) -> list[tuple[int, 
     rep.table(
         ["tokens together", "experts needed", "of 64", "expert-slots used"], rows
     )
+
+    # How the batch is computed: one call per expert, on the tokens routed to it.
+    per_expert = torch.bincount(idx[0].flatten().cpu(), minlength=n_exp)
+    called = per_expert[per_expert > 0]
+    rep.blank()
+    rep.note(f"Computing all {n_tokens} tokens at once, layer 0 makes one call per expert:")
+    rep.blank()
+    rep.kv("experts called", f"{len(called)} of {n_exp}")
+    rep.kv("tokens per call, fewest", int(called.min()))
+    rep.kv("tokens per call, median", int(called.median()))
+    rep.kv("tokens per call, most", int(called.max()))
+    rep.kv(f"tokens x {top_k} routing slots", f"{int(per_expert.sum()):,}")
     rep.takeaway(
         f"One token needs {top_k} experts; {curve[-1][0]} tokens together need "
         f"{curve[-1][1]:.0f}. Sparsity is a property of a token, not of a batch — "
@@ -897,6 +909,191 @@ def load_balance(rep: Report, model, logits: torch.Tensor) -> torch.Tensor:
         "traffic and the rest from starving."
     )
     return usage
+
+
+# ---------------------------------------------------------------------------
+# The mathematics, checked against the model
+# ---------------------------------------------------------------------------
+
+
+def _capture_layer0(model, ids: torch.Tensor, **forward_kwargs):
+    """One forward pass, keeping what layer 0's MoE sub-layer sees and returns.
+
+    h_mid is the residual stream after attention, x is h_mid after the layer norm
+    (what the router and experts read), y is the MoE output, and h_out is the
+    layer's output, which should be h_mid + y.
+    """
+    layer = model.model.layers[0]
+    cap = {}
+    hooks = [
+        layer.post_attention_layernorm.register_forward_pre_hook(
+            lambda mod, a: cap.__setitem__("h_mid", a[0].detach())),
+        layer.mlp.register_forward_pre_hook(lambda mod, a: cap.__setitem__("x", a[0].detach())),
+        layer.mlp.register_forward_hook(lambda mod, a, o: cap.__setitem__("y", o.detach())),
+        layer.register_forward_hook(
+            lambda mod, a, o: cap.__setitem__("h_out", (o[0] if isinstance(o, tuple) else o).detach())),
+    ]
+    try:
+        with torch.no_grad():
+            out = model(ids, output_router_logits=True, **forward_kwargs)
+    finally:
+        for h in hooks:
+            h.remove()
+    return out, cap
+
+
+def _expert_ffn(gate_up: torch.Tensor, down: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """FFN_e(x) = W_down (SiLU(W_gate x) * W_up x). gate_up stores W_gate and W_up stacked."""
+    gate, up = torch.nn.functional.linear(x, gate_up).chunk(2, dim=-1)
+    return torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, down)
+
+
+def the_layer_by_hand(rep: Report, model, tok, ids: torch.Tensor, pos: int = 1) -> None:
+    """Rebuild one MoE sub-layer's output from the formula, and check it.
+
+    The comparison is made in fp32 on a CPU copy of layer 0's MoE block, so that
+    the formula is tested against the model's own code with no bf16 rounding in
+    the way. The residual addition is checked in bf16 on the real model.
+    """
+    import copy
+
+    n_exp, top_k, _ = _cfg(model)
+    _, cap = _capture_layer0(model, ids)
+    block32 = copy.deepcopy(model.model.layers[0].mlp).float().cpu()
+    x = cap["x"][0, pos].float().cpu()
+
+    z = block32.gate.weight @ x
+    p = torch.softmax(z, dim=-1)
+    top_p, top_e = torch.topk(p, top_k)
+    contributions = {int(e): p[e] * _expert_ffn(block32.experts.gate_up_proj[e],
+                                                  block32.experts.down_proj[e], x)
+                     for e in top_e}
+    y_formula = sum(contributions.values())
+    with torch.no_grad():
+        y_model = block32(x[None, None])[0, 0]
+
+    rep.note(f"Layer 0's MoE output for {tok.decode(ids[0, pos:pos + 1])!r}, built from the formula:")
+    rep.blank()
+    rep.table(
+        ["expert", "weight p_e", "|FFN_e(x)|", "|p_e FFN_e(x)|"],
+        [[e, f"{p[e]:.4f}",
+          f"{(contributions[e] / p[e]).norm():.4f}", f"{contributions[e].norm():.4f}"]
+         for e in top_e.tolist()],
+    )
+    rep.blank()
+    rep.kv("|y|, sum of the 8 rows (fp32)", f"{y_formula.norm():.4f}")
+    rep.kv("|y|, the model's own block (fp32)", f"{y_model.norm():.4f}")
+    rep.kv("largest difference, any coordinate", f"{(y_formula - y_model).abs().max():.1e}")
+    rep.kv("layer output == h_mid + y? (bf16)",
+           torch.equal(cap["h_out"][0, pos], cap["h_mid"][0, pos] + cap["y"][0, pos]))
+
+
+def what_training_minimizes(rep: Report, model, ids: torch.Tensor) -> None:
+    """The three terms of OLMoE's training loss, computed on the passage.
+
+    Cross-entropy comes from the model with labels. The load-balancing term is
+    computed by hand and compared with transformers' own function on identical
+    fp32 inputs. The router z-loss is the OLMoE paper's formula; transformers
+    does not compute it, so it is shown for scale only.
+    """
+    from transformers.models.olmoe.modeling_olmoe import load_balancing_loss_func
+
+    n_exp, top_k, layers = _cfg(model)
+    out, _ = _capture_layer0(model, ids, labels=ids)
+    logits32 = tuple(r.float() for r in out.router_logits)
+    pooled = torch.cat(logits32, dim=0)                     # (layers x tokens, experts)
+    ce = out.loss.item() - model.config.router_aux_loss_coef * out.aux_loss.item()
+
+    def lb(router_logits: torch.Tensor) -> tuple[float, torch.Tensor, torch.Tensor]:
+        probs = torch.softmax(router_logits, dim=-1)
+        chosen = torch.topk(probs, top_k, dim=-1).indices
+        f = torch.nn.functional.one_hot(chosen, n_exp).float().mean(dim=0).sum(dim=0)
+        P = probs.mean(dim=0)
+        return (n_exp * (f * P).sum()).item(), f, P
+
+    lb_pooled, f, P = lb(pooled)
+    lb_library = load_balancing_loss_func(logits32, n_exp, top_k).item()
+    lb_per_layer = sum(lb(r)[0] for r in logits32) / layers
+    z_loss = (torch.logsumexp(pooled, dim=-1) ** 2).mean().item()
+    alpha, beta = model.config.router_aux_loss_coef, 0.001
+
+    rep.kv("tokens scored", f"{ids.shape[1] - 1} (each predicts the next)")
+    rep.kv("L_CE, cross-entropy", f"{ce:.4f}")
+    rep.blank()
+    rep.kv("sum of f_i over experts", f"{f.sum():.4f}")
+    rep.kv("sum of P_i over experts", f"{P.sum():.4f}")
+    rep.kv("L_LB if routing were even", f"{float(top_k):.4f}")
+    rep.kv("L_LB by hand, all layers pooled", f"{lb_pooled:.4f}")
+    rep.kv("L_LB, transformers' own function", f"{lb_library:.4f}")
+    rep.kv("L_LB by hand, mean of per-layer", f"{lb_per_layer:.4f}")
+    rep.kv("L_RZ, router z-loss (paper)", f"{z_loss:.4f}")
+    rep.blank()
+    rep.table(
+        ["term", "coefficient", "value", "contribution"],
+        [
+            ["L_CE", "1", f"{ce:.4f}", f"{ce:.4f}"],
+            ["L_LB (pooled)", f"{alpha}", f"{lb_pooled:.4f}", f"{alpha * lb_pooled:.4f}"],
+            ["L_RZ", f"{beta}", f"{z_loss:.4f}", f"{beta * z_loss:.4f}"],
+            ["total", "", "", f"{ce + alpha * lb_pooled + beta * z_loss:.4f}"],
+        ],
+    )
+
+
+def what_gets_a_gradient(rep: Report, model, tok, ids: torch.Tensor, pos: int = 1) -> None:
+    """Backpropagate through one MoE sub-layer and see what receives gradient.
+
+    First on the real bf16 block: which router rows and which experts get a
+    nonzero gradient from one token. Then the router gradient derived by hand,
+    compared with autograd in fp32 on the same numbers.
+    """
+    n_exp, top_k, _ = _cfg(model)
+    _, cap = _capture_layer0(model, ids)
+    block = model.model.layers[0].mlp
+    x = cap["x"][0, pos]
+    # A fixed direction to differentiate along, so the result does not depend on
+    # the rest of the network: L = v . y. Drawn on CPU so every backend agrees.
+    v = torch.randn(x.numel(), generator=torch.Generator().manual_seed(0))
+
+    params = [block.gate.weight, block.experts.gate_up_proj, block.experts.down_proj]
+    try:
+        for prm in params:
+            prm.requires_grad_(True)
+        with torch.enable_grad():
+            y = block(x[None, None])[0, 0]
+            (y.float() * v.to(y.device)).sum().backward()
+        router_rows = int((block.gate.weight.grad.float().abs().sum(dim=-1) > 0).sum())
+        experts_hit = (block.experts.gate_up_proj.grad.float().abs().sum(dim=(1, 2)) > 0).nonzero().flatten().tolist()
+    finally:
+        for prm in params:
+            prm.grad = None
+            prm.requires_grad_(False)
+
+    chosen = torch.topk(block.gate.weight.float() @ x.float(), top_k).indices.tolist()
+    rep.note(f"One token, {tok.decode(ids[0, pos:pos + 1])!r}, backpropagated through layer 0's MoE block:")
+    rep.blank()
+    rep.kv("router rows with nonzero gradient", f"{router_rows} of {n_exp}")
+    rep.kv("experts with nonzero gradient", f"{len(experts_hit)} of {n_exp}")
+    rep.kv("  which ones", ", ".join(str(e) for e in experts_hit))
+    rep.kv("  the router's top 8, sorted", ", ".join(str(e) for e in sorted(chosen)))
+
+    # The router gradient by hand: dL/dz_j = sum over chosen e of g_e p_e (d_ej - p_j),
+    # with g_e = v . FFN_e(x), and dL/dW_r = (dL/dz) x^T. Against autograd, in fp32.
+    x32 = x.float().cpu()
+    W = block.gate.weight.detach().float().cpu().clone().requires_grad_(True)
+    gate_up = block.experts.gate_up_proj.detach()
+    down = block.experts.down_proj.detach()
+    ffn = {e: _expert_ffn(gate_up[e].float().cpu(), down[e].float().cpu(), x32) for e in chosen}
+    with torch.enable_grad():
+        p = torch.softmax(W @ x32, dim=-1)
+        (sum(p[e] * ffn[e] for e in chosen) * v).sum().backward()
+    with torch.no_grad():
+        pd = p.detach()
+        dz = sum((v @ ffn[e]) * pd[e] * (torch.nn.functional.one_hot(torch.tensor(e), n_exp).float() - pd)
+                 for e in chosen)
+        by_hand = torch.outer(dz, x32)
+    rep.blank()
+    rep.kv("dL/dW_r, largest entry (autograd)", f"{W.grad.abs().max():.4f}")
+    rep.kv("dL/dW_r, by hand vs autograd", f"max difference {(by_hand - W.grad).abs().max():.1e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1621,6 +1818,8 @@ def main() -> None:
     chosen, kept = one_token_routed(rep, model, tok, logits, ids)
     rep.blank()
     routing_depth_profile(rep, model, logits, tok, ids)
+    rep.blank()
+    the_layer_by_hand(rep, model, tok, ids)
 
     rep.section("4. What the router learns                          [post §4]")
     usage, halves = what_the_router_learns(rep, model, tok)
@@ -1648,8 +1847,15 @@ def main() -> None:
     rep.kv("routing slots per layer", f"{long_ids.shape[1] * top_k}")
     rep.blank()
     load_balance(rep, model, long_logits)
+    rep.blank()
+    rep.note("What training minimizes, on the 94-token passage:")
+    rep.blank()
+    what_training_minimizes(rep, model, ids)
 
-    rep.section("9. Figures")
+    rep.section("9. What training updates                          [post §9]")
+    what_gets_a_gradient(rep, model, tok, ids)
+
+    rep.section("10. Figures")
     make_figures(rep, model, counts, usage, halves, curve, chosen, kept, logits)
 
 
