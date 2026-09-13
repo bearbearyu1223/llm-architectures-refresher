@@ -307,7 +307,8 @@ def derive_the_census(rep: Report, model, tok) -> None:
     total = sum(p.numel() for p in params.values())
 
     def shape(name: str) -> str:
-        return "(" + ", ".join(str(d) for d in params[name].shape) + ")"
+        return str(tuple(params[name].shape)).replace(" ", "") if params[name].dim() == 1 \
+            else "(" + ", ".join(str(d) for d in params[name].shape) + ")"
 
     def n(name: str) -> int:
         return params[name].numel()
@@ -418,6 +419,54 @@ def derive_the_census(rep: Report, model, tok) -> None:
     assert (active, total) == (census.active, census.total), "census derivations disagree"
     rep.kv("active share of total", f"{100 * active / total:.2f}%")
     rep.kv("active if the lookup is counted", f"{(active + embed) / 1e9:.2f}B")
+
+
+def what_the_final_norm_does(rep: Report, model, tok, ids: torch.Tensor, pos: int = 1) -> None:
+    """RMSNorm, applied by hand to a real token, and why the model needs it.
+
+    Mirrors the model's own arithmetic (x * rsqrt(mean(x^2) + eps), then the
+    learned per-dimension scale) so the comparison is exact, and measures how far
+    the residual stream's size drifts between the first layer and the final norm.
+    """
+    import copy
+
+    norm = model.model.norm
+    cap = {}
+    hooks = [
+        norm.register_forward_pre_hook(lambda mod, a: cap.__setitem__("h", a[0].detach())),
+        model.model.layers[0].register_forward_pre_hook(lambda mod, a: cap.__setitem__("h0", a[0].detach())),
+    ]
+    try:
+        with torch.no_grad():
+            model(ids)
+    finally:
+        for h in hooks:
+            h.remove()
+
+    h = cap["h"][0, pos].float().cpu()
+    eps = norm.variance_epsilon
+    gamma = norm.weight.detach().float().cpu()
+    rms_in = h.pow(2).mean().sqrt()
+    unit = h * torch.rsqrt(h.pow(2).mean() + eps)
+    by_hand = gamma * unit
+    with torch.no_grad():
+        from_model = copy.deepcopy(norm).float().cpu()(h[None])[0]
+
+    def rms_per_token(x: torch.Tensor) -> torch.Tensor:
+        return x[0].float().pow(2).mean(dim=-1).sqrt()
+
+    rep.note(f"The final norm, applied to {tok.decode(ids[0, pos:pos + 1])!r} after the last layer:")
+    rep.blank()
+    rep.kv("gamma, one scale per dimension", f"shape {tuple(norm.weight.shape)}")
+    rep.kv("epsilon", f"{eps:.0e}")
+    rep.kv("RMS of the vector coming in", f"{rms_in:.4f}")
+    rep.kv("after dividing by its RMS", f"{unit.pow(2).mean().sqrt():.4f}")
+    rep.kv("after multiplying by gamma", f"{by_hand.pow(2).mean().sqrt():.4f}")
+    rep.kv("gamma smallest / median / largest", f"{gamma.min():.4f} / {gamma.median():.4f} / {gamma.max():.4f}")
+    rep.kv("formula by hand == model's norm?", f"{'yes' if torch.equal(by_hand, from_model) else 'no'} (fp32)")
+    rep.blank()
+    rep.kv("median token RMS entering layer 0", f"{rms_per_token(cap['h0']).median():.4f}")
+    rep.kv("median entering the final norm", f"{rms_per_token(cap['h']).median():.4f}")
 
 
 def why_this_many_experts(rep: Report, model) -> None:
@@ -1804,6 +1853,8 @@ def main() -> None:
     where_the_parameters_are(rep, model)
     rep.blank()
     derive_the_census(rep, model, tok)
+    rep.blank()
+    what_the_final_norm_does(rep, model, tok, ids)
     rep.blank()
     rep.note("Why 64 experts and 8 per token, rather than 8 and 2?")
     rep.blank()

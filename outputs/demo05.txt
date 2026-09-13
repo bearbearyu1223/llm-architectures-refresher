@@ -39,11 +39,11 @@ device memory : 17.2 GB
   tensor                             shape   parameters
   -------------------------------------------------------
   q, k, v, o projections  4 x (2048, 2048)   16,777,216
-  q_norm, k_norm                2 x (2048)        4,096
+  q_norm, k_norm               2 x (2048,)        4,096
   router                        (64, 2048)      131,072
   experts: gate_up_proj   (64, 2048, 2048)  268,435,456
   experts: down_proj      (64, 2048, 1024)  134,217,728
-  two layer norms               2 x (2048)        4,096
+  two layer norms              2 x (2048,)        4,096
   one layer                                 419,569,664
 
   The tensors outside the layers:
@@ -52,7 +52,7 @@ device memory : 17.2 GB
   ------------------------------------------
   embed_tokens  (50304, 2048)  103,022,592
   lm_head       (50304, 2048)  103,022,592
-  final norm           (2048)        2,048
+  final norm          (2048,)        2,048
 
   tokens the tokenizer defines       50,280
   rows in each table                 50,304
@@ -85,6 +85,19 @@ device memory : 17.2 GB
   active total                  1,178,994,688
   active share of total              17.04%
   active if the lookup is counted    1.28B
+
+  The final norm, applied to ' harbour' after the last layer:
+
+  gamma, one scale per dimension     shape (2048,)
+  epsilon                            1e-05
+  RMS of the vector coming in        0.2170
+  after dividing by its RMS          0.9999
+  after multiplying by gamma         1.6627
+  gamma smallest / median / largest  0.1328 / 2.2344 / 2.6094
+  formula by hand == model's norm?   yes (fp32)
+
+  median token RMS entering layer 0  0.0045
+  median entering the final norm     0.2796
 
   Why 64 experts and 8 per token, rather than 8 and 2?
 
@@ -265,14 +278,14 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         431.4     1.00x
-  64                        932.6     2.16x
+  8                         448.6     1.00x
+  64                        943.5     2.10x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.16x
+  measured wall-clock ratio          2.10x
     below 8x because attention, norms and the LM head are unchanged
 
-  >> Turning every expert on costs 2.2x the time and 0 extra bytes of
+  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 
