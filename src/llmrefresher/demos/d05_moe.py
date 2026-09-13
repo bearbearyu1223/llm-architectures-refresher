@@ -755,91 +755,131 @@ def load_balance(rep: Report, model, logits: torch.Tensor) -> torch.Tensor:
 
 
 def figure_block(model, chosen: list[int], theme: Theme) -> Path:
-    """Where an MoE layer differs from a dense one: the MLP, replicated.
+    """Dense block beside MoE block, in the architecture figure's visual language.
 
-    The expert grid draws all ``n_exp`` experts and lights exactly the ``top_k``
-    that the demo's own routing chose, so the picture cannot contradict the
-    number in the caption.
+    The two columns share their rows -- attention, the feed-forward part, the next
+    block -- so the only difference the eye finds is the one being claimed: one FFN
+    becomes a router, many experts and a weighted sum. The expert grid, legend and
+    tints match panel 2 of the architecture figure, and the lit experts are the ones
+    this demo actually routed, so the two figures agree with each other and with
+    section 3's table. The active share is computed, not typed.
     """
     n_exp, top_k, layers = _cfg(model)
-    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(10.5, 5.4))
+    roles = {"experts": 0, "router": 0, "attention": 0, "head": 0, "norms": 0, "embed": 0}
+    for name, p in model.named_parameters():
+        k = (".experts." in name and "experts") or (".mlp.gate." in name and "router") \
+            or (".self_attn." in name and "attention") or ("lm_head" in name and "head") \
+            or ("embed_tokens" in name and "embed") or "norms"
+        roles[k] += p.numel()
+    total = sum(roles.values())
+    active = (roles["experts"] * top_k // n_exp + roles["attention"] + roles["router"]
+              + roles["norms"] + roles["head"])
 
-    def box(ax, x, y, w, h, label, fill, ink=None, fs=10):
-        ax.add_patch(
-            patches.FancyBboxPatch(
-                (x, y), w, h,
-                boxstyle="round,pad=0.012,rounding_size=0.02",
-                linewidth=1.1, edgecolor=theme.axis, facecolor=fill,
-            )
-        )
-        ax.text(x + w / 2, y + h / 2, label, ha="center", va="center",
-                fontsize=fs, color=ink or ink_for(fill), zorder=3)
+    fig = plt.figure(figsize=(12.0, 7.6))
+    blue, orange = theme.series[0], theme.series[1]
 
-    def arrow(ax, x1, y1, x2, y2):
-        ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
-                    arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.3))
-
-    for ax in (ax_l, ax_r):
+    def panel(rect, color, title):
+        ax = fig.add_axes(rect)
         ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off"); ax.grid(False)
+        for fc, a, lw in ((color, 0.07, 0), ("none", 0.55, 1.3)):
+            ax.add_patch(patches.FancyBboxPatch(
+                (0.004, 0.004), 0.992, 0.992, boxstyle="round,pad=0,rounding_size=0.025",
+                linewidth=lw, edgecolor=color, facecolor=fc, alpha=a, zorder=0))
+        ax.text(0.5, 0.945, title, ha="center", va="center", fontsize=14,
+                fontweight="bold", color=theme.ink)
+        return ax
 
-    # Dense block
-    ax_l.set_title("Dense block", color=theme.ink)
-    box(ax_l, 0.22, 0.80, 0.56, 0.10, "attention", theme.ramp[1])
-    arrow(ax_l, 0.5, 0.80, 0.5, 0.66)
-    box(ax_l, 0.22, 0.50, 0.56, 0.16, "one FFN\n(all tokens, every time)", theme.ramp[4])
-    arrow(ax_l, 0.5, 0.50, 0.5, 0.36)
-    box(ax_l, 0.22, 0.24, 0.56, 0.10, "next block", theme.ramp[0])
-    ax_l.text(0.5, 0.12, "every parameter runs for every token",
-              ha="center", fontsize=9.5, color=theme.secondary)
+    def box(ax, x, y, w, h, title, body, fill, *, ec=None, lw=1.0, fs=9.0):
+        ax.add_patch(patches.FancyBboxPatch(
+            (x, y), w, h, boxstyle="round,pad=0.004,rounding_size=0.012",
+            linewidth=lw, edgecolor=ec or theme.axis, facecolor=fill, zorder=2))
+        ink = ink_for(fill)
+        if body:
+            ax.text(x + w / 2, y + h / 2 + 0.018, title, ha="center", va="center",
+                    fontsize=fs + 1, fontweight="bold", color=ink, zorder=3)
+            ax.text(x + w / 2, y + h / 2 - 0.022, body, ha="center", va="center",
+                    fontsize=fs, color=ink, zorder=3, linespacing=1.35)
+        else:
+            ax.text(x + w / 2, y + h / 2, title, ha="center", va="center",
+                    fontsize=fs + 1, fontweight="bold", color=ink, zorder=3)
 
-    # MoE block
-    ax_r.set_title(f"MoE block ({n_exp} experts, top-{top_k})", color=theme.ink)
-    box(ax_r, 0.22, 0.80, 0.56, 0.10, "attention", theme.ramp[1])
-    arrow(ax_r, 0.5, 0.80, 0.5, 0.72)
-    box(ax_r, 0.36, 0.62, 0.28, 0.09, "router", theme.series[1], ink="#ffffff")
+    def arrow(ax, x, y1, y2):
+        ax.annotate("", xy=(x, y2), xytext=(x, y1), zorder=1,
+                    arrowprops=dict(arrowstyle="-|>", color=theme.secondary, lw=1.2,
+                                    shrinkA=0, shrinkB=0))
 
-    # Fan-out: stub down, then a horizontal bus, then one vertical drop into the
-    # grid. Never a horizontal arrow into a box top -- that renders as a single
-    # line struck through every box it passes.
-    bus_y = 0.545
-    ax_r.plot([0.5, 0.5], [0.62, bus_y], color=theme.secondary, lw=1.3)
-    ax_r.plot([0.10, 0.90], [bus_y, bus_y], color=theme.secondary, lw=1.3)
-    for x in (0.10, 0.30, 0.50, 0.70, 0.90):
-        arrow(ax_r, x, bus_y, x, 0.495)
+    # Shared row geometry, so the two columns line up row for row.
+    ATTN = (0.790, 0.090)        # (bottom, height)
+    FF_TOP, FF_BOTTOM = 0.735, 0.225
+    NEXT = (0.105, 0.075)
 
-    # All 64 experts, with the 8 this demo actually routed to filled in.
-    cols, rows_n = 16, n_exp // 16
-    cell_w, cell_h, gap = 0.0445, 0.050, 0.0095
-    x0 = 0.5 - (cols * cell_w + (cols - 1) * gap) / 2
-    y0 = 0.455
+    # ======== dense ==========================================================
+    ax = panel([0.010, 0.02, 0.300, 0.96], blue, "Dense block")
+    box(ax, 0.12, ATTN[0], 0.76, ATTN[1], "Attention", "", theme.ramp[1])
+    arrow(ax, 0.5, ATTN[0], FF_TOP)
+    box(ax, 0.12, FF_BOTTOM, 0.76, FF_TOP - FF_BOTTOM, "One FFN",
+        "every token passes\nthrough all of it", theme.ramp[4], fs=9.5)
+    arrow(ax, 0.5, FF_BOTTOM, NEXT[0] + NEXT[1])
+    box(ax, 0.12, NEXT[0], 0.76, NEXT[1], "Next block", "", theme.ramp[0])
+    ax.text(0.5, 0.045, "every parameter runs for every token", ha="center",
+            fontsize=9.5, color=theme.secondary)
+
+    # ======== MoE ============================================================
+    ax = panel([0.325, 0.02, 0.665, 0.96], orange, f"MoE block ({n_exp} experts, top-{top_k})")
+    # One centre line for the whole MoE column: the grid's, which sits left of the
+    # panel centre to leave room for the legend.
+    cx = 0.43
+    box(ax, cx - 0.30, ATTN[0], 0.60, ATTN[1], "Attention", "", theme.ramp[1])
+    arrow(ax, cx, ATTN[0], 0.735)
+    box(ax, cx - 0.17, 0.655, 0.34, 0.080, "Router",
+        f"scores all {n_exp} experts, keeps {top_k}", orange, ec=orange, fs=8.6)
+
+    bus = 0.620
+    ax.plot([cx, cx], [0.655, bus], color=theme.secondary, lw=1.2, zorder=1)
+    ax.plot([0.115, 0.745], [bus, bus], color=theme.secondary, lw=1.2, zorder=1)
+    for x in (0.115, 0.2725, 0.43, 0.5875, 0.745):
+        arrow(ax, x, bus, 0.592)
+
+    cols = 16
+    cw, ch, gx, gy = 0.0345, 0.052, 0.0072, 0.013
+    x0 = 0.43 - (cols * cw + (cols - 1) * gx) / 2
+    y0 = 0.582
     for e in range(n_exp):
         r, c = divmod(e, cols)
-        x = x0 + c * (cell_w + gap)
-        y = y0 - r * (cell_h + gap) - cell_h
+        x = x0 + c * (cw + gx)
+        y = y0 - r * (ch + gy) - ch
         on = e in chosen
-        ax_r.add_patch(patches.FancyBboxPatch(
-            (x, y), cell_w, cell_h,
-            boxstyle="round,pad=0.0015,rounding_size=0.008",
-            linewidth=1.0 if on else 0.7,
-            edgecolor=theme.series[1] if on else theme.axis,
+        ax.add_patch(patches.FancyBboxPatch(
+            (x, y), cw, ch, boxstyle="round,pad=0.001,rounding_size=0.006",
+            linewidth=1.0 if on else 0.7, zorder=2,
+            edgecolor=theme.ramp[5] if on else theme.axis,
             facecolor=theme.ramp[5] if on else theme.surface))
-        ax_r.text(x + cell_w / 2, y + cell_h / 2, str(e), ha="center", va="center",
-                  fontsize=6.2, fontweight="bold" if on else "normal",
-                  color=ink_for(theme.ramp[5]) if on else theme.muted)
+        ax.text(x + cw / 2, y + ch / 2, str(e), ha="center", va="center", fontsize=6.4,
+                zorder=3, fontweight="bold" if on else "normal",
+                color=ink_for(theme.ramp[5]) if on else theme.muted)
+    grid_bottom = y0 - (n_exp // cols) * (ch + gy)
 
-    grid_bottom = y0 - rows_n * (cell_h + gap)
-    ax_r.text(0.5, grid_bottom - 0.028,
-              f"one box per expert — {n_exp} of them, each an entire feed-forward network",
-              ha="center", fontsize=9.5, color=theme.ink)
-    ax_r.text(0.5, grid_bottom - 0.075,
-              f"filled = the {top_k} this token was routed to · the other "
-              f"{n_exp - top_k} stay resident and idle",
-              ha="center", fontsize=9.5, color=theme.secondary)
-    ax_r.text(0.5, grid_bottom - 0.145,
-              "all parameters in memory · 17% of them multiply",
-              ha="center", fontsize=9.5, color=theme.ink)
+    for (label, on), ly in zip(
+        [("selected experts\n(for this token)", True), ("skipped experts\n(still in memory)", False)],
+        (0.500, 0.380),
+    ):
+        ax.add_patch(patches.FancyBboxPatch(
+            (0.815, ly), 0.030, 0.045, boxstyle="round,pad=0.001,rounding_size=0.005",
+            linewidth=1.0, edgecolor=theme.ramp[5] if on else theme.axis,
+            facecolor=theme.ramp[5] if on else theme.surface, zorder=2))
+        ax.text(0.858, ly + 0.022, label, ha="left", va="center", fontsize=8.4,
+                color=theme.secondary, linespacing=1.3)
 
-    fig.tight_layout()
+    COMB_H = 0.052
+    arrow(ax, 0.43, grid_bottom + 0.004, FF_BOTTOM + COMB_H)
+    box(ax, 0.20, FF_BOTTOM, 0.46, COMB_H, "Weighted combination", "",
+        theme.ramp[4], fs=8.4)
+    arrow(ax, 0.43, FF_BOTTOM, NEXT[0] + NEXT[1])
+    box(ax, 0.20, NEXT[0], 0.46, NEXT[1], "Next block", "", theme.ramp[0])
+    ax.text(0.5, 0.045,
+            f"every parameter is in memory  ·  {100 * active / total:.0f}% of them run for any one token",
+            ha="center", fontsize=9.5, color=theme.secondary)
+
     return save_both(fig, SLUG, "moe-block", theme)
 
 
