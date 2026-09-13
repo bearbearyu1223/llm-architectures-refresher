@@ -46,12 +46,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import torch
 
 from ..device import benchmark_ms, get_device
-from ..plotting import THEMES, Theme, ink_for, save_both, styled
+from ..plotting import THEMES, Theme, ink_for, save_both, sequential_cmap, styled
 from ..report import Report
 
 SLUG = "05-mixture-of-experts"
@@ -1695,6 +1696,208 @@ def figure_architecture(
     return save_both(fig, SLUG, "moe-architecture", theme)
 
 
+def figure_token_flow(logits: torch.Tensor, token_text: str, n_exp: int, top_k: int,
+                      hid: int, theme: Theme, layer: int = 0, pos: int = 1) -> Path:
+    """One token through one MoE layer, top to bottom, with the math beside each step.
+
+    Three lanes, kept apart so nothing crosses: formulas on the left, the data in
+    the middle, this token's real numbers on the right. The steps are the ones in
+    section 3's two formula blocks, in order, and every number is computed from the
+    same logits section 3's table prints.
+    """
+    z = logits[layer, pos]
+    p = torch.softmax(z, dim=-1)
+    top_w, top_e = torch.topk(p, top_k)
+    chosen = [int(e) for e in top_e.tolist()]
+    kept = top_w.sum().item()
+    zmin_e = int(torch.argmin(z))
+
+    W, H = 12.0, 15.0
+    fig = plt.figure(figsize=(W, H))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, W); ax.set_ylim(0, H); ax.axis("off"); ax.grid(False)
+
+    L_RIGHT = 4.05            # left lane: text right-aligned here
+    C_LEFT, C_RIGHT = 4.55, 9.15
+    CX = (C_LEFT + C_RIGHT) / 2
+    R_LEFT = 9.55             # right lane: text left-aligned here
+    SKIP_X = 9.35             # residual line, between centre and right lanes
+    FEED_X = 4.35             # x feeding the experts, between left and centre lanes
+    orange = theme.series[1]
+    arrow_kw = {"arrowstyle": "-|>", "color": theme.secondary, "lw": 1.3, "shrinkA": 0, "shrinkB": 0}
+
+    def arrow(x1, y1, x2, y2):
+        ax.annotate("", xy=(x2, y2), xytext=(x1, y1), arrowprops=arrow_kw, zorder=1)
+
+    def line(xs, ys, **kw):
+        ax.plot(xs, ys, color=kw.pop("color", theme.secondary), lw=1.3, zorder=1,
+                solid_capstyle="butt", **kw)
+
+    def badge(x, y, n):
+        # Outlined, so they cannot be confused with the filled expert boxes.
+        ax.add_patch(patches.Circle((x, y), 0.19, facecolor=theme.surface,
+                                    edgecolor=orange, lw=1.6, zorder=3))
+        ax.text(x, y, str(n), ha="center", va="center", fontsize=11,
+                fontweight="bold", color=orange, zorder=4)
+
+    def step(y, n, title, math):
+        badge(0.55, y + 0.16, n)
+        ax.text(L_RIGHT, y + 0.16, title, ha="right", va="center", fontsize=12.5,
+                fontweight="bold", color=theme.ink)
+        ax.text(L_RIGHT, y - 0.30, math, ha="right", va="center", fontsize=14,
+                color=theme.ink)
+
+    def describe(y, name, lines):
+        ax.text(R_LEFT, y + 0.17, name, ha="left", va="center", fontsize=12,
+                fontweight="bold", color=theme.ink)
+        ax.text(R_LEFT, y - 0.02, lines, ha="left", va="top", fontsize=10.5,
+                color=theme.secondary, linespacing=1.45)
+
+    def strip(y, cells, width, fill, h=0.34, values=None):
+        x0 = CX - width / 2
+        cw = width / cells
+        for i in range(cells):
+            fc = fill if values is None else values[i]
+            ax.add_patch(patches.Rectangle((x0 + i * cw, y - h / 2), cw, h, facecolor=fc,
+                                           edgecolor=theme.surface if values is not None else theme.axis,
+                                           lw=0.5, zorder=2))
+        return x0, x0 + width
+
+    # Widths ordered like the numbers they stand for: 2,048 > 64. Not to scale.
+    WIDE, MID = 4.4, 3.2
+    y = H - 0.75
+    ax.text(W / 2, y + 0.25, f"One token through one MoE layer: {token_text!r}, layer {layer}",
+            ha="center", va="center", fontsize=14, fontweight="bold", color=theme.ink)
+    ax.text(W / 2, y - 0.12, "the math on the left, the data in the middle, this token's "
+            "numbers on the right  ·  strip widths in order, not to scale",
+            ha="center", va="center", fontsize=9.5, color=theme.secondary)
+
+    # ---- h_mid ----------------------------------------------------------------
+    y_h = H - 1.75
+    strip(y_h, 32, WIDE, theme.ramp[0])
+    describe(y_h, "$h_{mid}$", f"the residual stream after\nattention: {hid:,} numbers")
+
+    # ---- step 1: normalize -----------------------------------------------------
+    y_x = y_h - 1.55
+    arrow(CX, y_h - 0.19, CX, y_x + 0.19)
+    step((y_h + y_x) / 2, 1, "normalize", r"$x = \mathrm{RMSNorm}(h_{mid})$")
+    strip(y_x, 32, WIDE, theme.ramp[1])
+    describe(y_x, "$x$", f"{hid:,} numbers, rescaled\nto a standard size")
+
+    # ---- step 2: score ---------------------------------------------------------
+    y_z = y_x - 1.55
+    arrow(CX, y_x - 0.19, CX, y_z + 0.19)
+    step((y_x + y_z) / 2, 2, f"score all {n_exp} experts", r"$z = W_r\,x$")
+    ax.text(CX + 0.12, (y_x + y_z) / 2, f"$W_r$: {n_exp} rows, each {hid:,} wide",
+            ha="left", va="center", fontsize=10.5, color=theme.secondary)
+    cmap = sequential_cmap(theme)
+    zn = ((z - z.min()) / (z.max() - z.min())).tolist()
+    strip(y_z, n_exp, MID, None, values=[mcolors.to_hex(cmap(v)) for v in zn])
+    describe(y_z, "$z$, the logits",
+             f"{n_exp} raw scores, any sign;\ndarker cells score higher\nhighest $z_{{{chosen[0]}}}$ = {z[chosen[0]]:+.4f}"
+             f"\nlowest $z_{{{zmin_e}}}$ = {z[zmin_e]:+.4f}".replace("-", "\u2212"))
+
+    # ---- step 3: softmax -------------------------------------------------------
+    y_p = y_z - 1.85
+    arrow(CX, y_z - 0.19, CX, y_p + 0.42)
+    step((y_z + y_p) / 2 + 0.05, 3, "turn scores into probabilities",
+         rf"$p_e = e^{{z_e}} \,/\, \sum_{{j=1}}^{{{n_exp}}} e^{{z_j}}$")
+    x0 = CX - MID / 2
+    cw = MID / n_exp
+    top = set(chosen)
+    peak = p.max().item()
+    for i in range(n_exp):
+        hgt = 0.80 * p[i].item() / peak
+        ax.add_patch(patches.Rectangle((x0 + i * cw + cw * 0.12, y_p - 0.40), cw * 0.76, hgt,
+                                       facecolor=theme.ramp[5] if i in top else theme.ramp[1],
+                                       edgecolor="none", zorder=2))
+    line([x0, x0 + MID], [y_p - 0.40, y_p - 0.40], color=theme.axis)
+    describe(y_p + 0.2, "$p$, the probabilities",
+             f"all {n_exp} sum to 1\nlargest $p_{{{chosen[0]}}}$ = {top_w[0]:.4f}")
+
+    # ---- step 4: keep the top k -----------------------------------------------
+    y_k = y_p - 1.05
+    y_bus = y_k - 0.62
+    arrow(CX, y_p - 0.40, CX, y_k + 0.21)
+    kw_ = 3.3
+    ax.add_patch(patches.FancyBboxPatch((CX - kw_ / 2, y_k - 0.21), kw_, 0.42,
+                                        boxstyle="round,pad=0,rounding_size=0.08",
+                                        facecolor=theme.surface, edgecolor=theme.series[0], lw=1.3, zorder=2))
+    ax.text(CX, y_k, r"$\mathcal{K}$ = {" + ", ".join(str(e) for e in chosen) + "}",
+            ha="center", va="center", fontsize=11, color=theme.ink, zorder=3)
+    step(y_k + 0.05, 4, f"keep the top {top_k}", rf"$\mathcal{{K}}$ = the {top_k} largest $p_e$")
+    describe(y_k + 0.05, r"$\mathcal{K}$, the chosen experts",
+             f"picks which experts run;\nthe other {n_exp - top_k} are skipped")
+
+    # ---- step 5: run the chosen experts ---------------------------------------
+    bw, gap = 0.565, 0.035
+    row_w = top_k * bw + (top_k - 1) * gap
+    bx = [CX - row_w / 2 + i * (bw + gap) + bw / 2 for i in range(top_k)]
+    y_e = y_bus - 0.85
+    # x feeds every chosen expert: from the x strip, down the lane left of centre.
+    line([CX - WIDE / 2, FEED_X], [y_x, y_x])
+    line([FEED_X, FEED_X], [y_x, y_bus])
+    ax.text(FEED_X - 0.07, (y_z + y_p) / 2 - 0.1, "the same $x$ goes to every chosen expert",
+            rotation=90, ha="right", va="center", fontsize=9.5, color=theme.secondary)
+    line([FEED_X, bx[-1]], [y_bus, y_bus])
+    for cx_ in bx:
+        arrow(cx_, y_bus, cx_, y_e + 0.30)
+    for cx_, e in zip(bx, chosen, strict=True):
+        ax.add_patch(patches.FancyBboxPatch((cx_ - bw / 2, y_e - 0.30), bw, 0.60,
+                                            boxstyle="round,pad=0,rounding_size=0.06",
+                                            facecolor=theme.ramp[5], edgecolor=theme.ramp[5], zorder=2))
+        ax.text(cx_, y_e, f"$\\mathrm{{FFN}}_{{{e}}}$", ha="center", va="center", fontsize=10,
+                color=ink_for(theme.ramp[5]), zorder=3)
+    step(y_e, 5, "run each chosen expert",
+         r"$\mathrm{FFN}_e(x) = W_{down}\,(\mathrm{SiLU}(W_{gate}\,x) \odot W_{up}\,x)$")
+    describe(y_e + 0.1, "8 expert outputs", f"each {hid:,} numbers")
+
+    # ---- step 6: scale by the weight ------------------------------------------
+    y_w = y_e - 1.25
+    for cx_, w in zip(bx, top_w.tolist(), strict=True):
+        arrow(cx_, y_e - 0.30, cx_, y_w + 0.20)
+        ax.add_patch(patches.FancyBboxPatch((cx_ - bw / 2, y_w - 0.20), bw, 0.40,
+                                            boxstyle="round,pad=0,rounding_size=0.05",
+                                            facecolor=theme.surface, edgecolor=orange, lw=1.1, zorder=2))
+        ax.text(cx_, y_w, f"×{w:.4f}", ha="center", va="center", fontsize=7.8,
+                color=theme.ink, zorder=3)
+    step(y_w, 6, "weight each by its probability", r"$p_e \cdot \mathrm{FFN}_e(x)$")
+    describe(y_w + 0.1, "the weights",
+             f"sum to {kept:.4f}, not 1:\nOLMoE does not rescale them")
+
+    # ---- step 7: add them up ---------------------------------------------------
+    y_sum = y_w - 1.35
+    y_mbus = y_w - 0.62
+    for cx_ in bx:
+        line([cx_, cx_], [y_w - 0.20, y_mbus])
+    line([bx[0], bx[-1]], [y_mbus, y_mbus])
+    arrow(CX, y_mbus, CX, y_sum + 0.24)
+    ax.add_patch(patches.Circle((CX, y_sum), 0.24, facecolor=theme.surface,
+                                edgecolor=theme.secondary, lw=1.3, zorder=2))
+    ax.text(CX, y_sum, r"$\Sigma$", ha="center", va="center", fontsize=13, color=theme.ink, zorder=3)
+    step(y_sum, 7, "add the eight together",
+         r"$y = \sum_{e \in \mathcal{K}}\; p_e \cdot \mathrm{FFN}_e(x)$")
+    describe(y_sum + 0.1, "$y$", f"{hid:,} numbers: the MoE output")
+
+    # ---- step 8: residual ------------------------------------------------------
+    y_plus = y_sum - 1.20
+    arrow(CX, y_sum - 0.24, CX, y_plus + 0.22)
+    ax.add_patch(patches.Circle((CX, y_plus), 0.22, facecolor=theme.surface,
+                                edgecolor=theme.secondary, lw=1.3, zorder=2))
+    ax.text(CX, y_plus, "+", ha="center", va="center", fontsize=15, color=theme.ink, zorder=3)
+    # h_mid skips the whole block, down the lane right of centre.
+    line([CX + WIDE / 2, SKIP_X], [y_h, y_h])
+    line([SKIP_X, SKIP_X], [y_h, y_plus])
+    arrow(SKIP_X, y_plus, CX + 0.22, y_plus)
+    step(y_plus, 8, "add back into the stream", r"$h_{out} = h_{mid} + y$")
+    y_o = y_plus - 1.05
+    arrow(CX, y_plus - 0.22, CX, y_o + 0.19)
+    strip(y_o, 32, WIDE, theme.ramp[0])
+    describe(y_o, "$h_{out}$", f"{hid:,} numbers, on to layer {layer + 1}")
+
+    return save_both(fig, SLUG, "token-flow", theme)
+
+
 def figure_router_flow(model, logits: torch.Tensor, theme: Theme,
                        layer: int = 0, pos: int = 1) -> Path:
     """The router as a shape walkthrough, then the same token's real numbers.
@@ -1864,7 +2067,6 @@ def figure_specialization(
     what sampling noise looks like, and they are in the figure so the reader can
     tell the cross-domain rows apart from it by eye rather than on trust.
     """
-    from ..plotting import sequential_cmap
 
     last = usage["prose"].shape[0] - 1
     rows = [
@@ -1932,7 +2134,7 @@ def figure_batch_collapse(
 
 def make_figures(
     rep: Report, model, counts: dict, usage: dict, halves: dict,
-    curve: list, chosen: list[int], kept: float, logits: torch.Tensor,
+    curve: list, chosen: list[int], kept: float, logits: torch.Tensor, token_text: str,
 ) -> None:
     n_exp, top_k, _ = _cfg(model)
     written = []
@@ -1940,6 +2142,8 @@ def make_figures(
         with styled(theme):
             written.append(figure_architecture(model, chosen, kept, curve, theme))
             written.append(figure_block(model, chosen, theme))
+            written.append(figure_token_flow(logits, token_text, n_exp, top_k,
+                                             model.config.hidden_size, theme))
             written.append(figure_router_flow(model, logits, theme))
             written.append(figure_where_the_weights_are(counts, theme))
             written.append(figure_specialization(usage, halves, theme))
@@ -2034,7 +2238,8 @@ def main() -> None:
     what_the_final_norm_does(rep, model, tok, ids)
 
     rep.section("Figures")
-    make_figures(rep, model, counts, usage, halves, curve, chosen, kept, logits)
+    make_figures(rep, model, counts, usage, halves, curve, chosen, kept, logits,
+                 tok.decode(ids[0, 1:2]))
 
 
 if __name__ == "__main__":
