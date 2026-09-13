@@ -276,6 +276,9 @@ class ModelSpec:
     n_kv_heads: int
     head_dim: int
     n_params: float  # in billions
+    # FFN width. Only needed for memory accounting that includes the forward
+    # pass itself; None where it has not been checked against a real config.
+    d_ff: int | None = None
 
     def kv_bytes(self, seq: int, batch: int = 1, bytes_per_elem: int = 2) -> int:
         """2 (K and V) x layers x kv_heads x head_dim x seq x batch x dtype."""
@@ -293,6 +296,7 @@ class ModelSpec:
             n_kv_heads=self.n_heads,
             head_dim=self.head_dim,
             n_params=self.n_params,
+            d_ff=self.d_ff,
         )
 
     def as_mqa(self) -> "ModelSpec":
@@ -304,8 +308,10 @@ class ModelSpec:
             n_kv_heads=1,
             head_dim=self.head_dim,
             n_params=self.n_params,
+            d_ff=self.d_ff,
         )
 
 
-LLAMA3_8B = ModelSpec("Llama-3-8B", n_layers=32, n_heads=32, n_kv_heads=8, head_dim=128, n_params=8.03)
+LLAMA3_8B = ModelSpec("Llama-3-8B", n_layers=32, n_heads=32, n_kv_heads=8, head_dim=128, n_params=8.03,
+                      d_ff=14_336)
 LLAMA3_70B = ModelSpec("Llama-3-70B", n_layers=80, n_heads=64, n_kv_heads=8, head_dim=128, n_params=70.6)

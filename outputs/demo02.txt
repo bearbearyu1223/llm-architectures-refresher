@@ -7,7 +7,52 @@ platform      : Darwin 24.6.0 (arm64)
 device memory : 17.2 GB
 
 --------------------------------------------------------------------------
-0. Why caching is valid at all
+1. What each generation step needs                    [post §1]
+--------------------------------------------------------------------------
+  Generating from a 3-token prompt. At each step the model needs the
+  new token's query, and the key and value of every token so far:
+
+  step       sequence so far  needs     and     and  predicts
+  -------------------------------------------------------------
+  1            [The cat sat]     Q3  K1..K3  V1..V3      "on"
+  2         [The cat sat on]     Q4  K1..K4  V1..V4     "the"
+  3     [The cat sat on the]     Q5  K1..K5  V1..V5     "mat"
+
+  Add up what that table asks for. Keys, step by step: 3 + 4 + 5 = 12.
+  But only K1..K5 ever appear, so most of those are repeats:
+
+  tensor  needed over 3 steps  distinct vectors  repeat reads
+  -------------------------------------------------------------
+  Q                         3                 3             0
+  K                        12                 5             7
+  V                        12                 5             7
+
+  The last column is the whole argument. Zero for Q: nothing is ever
+  asked for twice, so a cache would have nothing to hand back. For K
+  and V it is 7 — and without a cache every one of those is a key
+  or value vector being computed a second time, from a token that has
+  not changed since the first time.
+
+  Now run that same count against a training step. Teacher forcing hands
+  the model the whole real sequence at once, so there is one pass over all
+  5 positions instead of 3 passes over growing prefixes:
+
+                       K vectors computed  of them, redundant
+  -------------------------------------------------------------
+  generation, 3 steps                  12                   7
+  training, 1 pass                      5                   0
+
+  Zero in the second column, so there is nothing for a cache to hand back.
+  That is why there is no KV cache during training — not that it would be
+  expensive or awkward, but that it would have no work to save.
+
+  >> Every step recomputes keys and values the previous step already had.
+     Q is used once and never again — which is why the thing is a KV cache
+     and not a QKV cache. Training recomputes nothing, so it caches
+     nothing.
+
+--------------------------------------------------------------------------
+2. Why caching is valid at all                        [post §1]
 --------------------------------------------------------------------------
   Run the model on 4 tokens, then on those same 4 plus 2 more,
   and compare what each run stored for the first 4 positions.
@@ -41,40 +86,44 @@ device memory : 17.2 GB
   V           yes                         every later query averages it
   Q            no  position i's query is used at step i and never again
 
-  >> K and V are reused by every future token, and never change once written — so they are worth storing. Q is used once and discarded, which is why it is a KV cache and not a QKV cache.
+  >> K and V are reused by every future token, and never change once
+     written — so they are worth storing. Q is used once and discarded,
+     which is why it is a KV cache and not a QKV cache.
 
 --------------------------------------------------------------------------
-1. The cache changes nothing about the output
+3. The cache changes nothing about the output         [post §2]
 --------------------------------------------------------------------------
   generated shape                    (2, 40)
   token ids identical                yes
   first 8 new tokens (cached)        [228, 432, 131, 158, 24, 111, 281, 506]
   first 8 new tokens (uncached)      [228, 432, 131, 158, 24, 111, 281, 506]
 
-  >> The cache is a memoization of keys and values already computed. It is exact — if your cached and uncached outputs differ, you have a bug.
+  >> The cache is a memoization of keys and values already computed. It is
+     exact — if your cached and uncached outputs differ, you have a bug.
 
 --------------------------------------------------------------------------
-2. Without a cache, generation is quadratic
+4. Without a cache, generation is quadratic           [post §3]
 --------------------------------------------------------------------------
   prompt: 64 tokens; model: 7.8M params
 
   tokens generated  cached (ms)  uncached (ms)  speedup
   -------------------------------------------------------
-  64                    54.8871       103.8737    1.89x
-  128                   94.5282       234.0838    2.48x
-  256                  171.5285       620.7546    3.62x
-  512                  306.6524      1956.7814    6.38x
+  64                    53.2560        95.1145    1.79x
+  128                   91.2011       226.0272    2.48x
+  256                  157.3080       614.0565    3.90x
+  512                  294.0122      1929.5501    6.56x
 
-  8x more tokens costs (cached)      5.6x
-  8x more tokens costs (uncached)    18.8x
+  8x more tokens costs (cached)      5.5x
+  8x more tokens costs (uncached)    20.3x
   tokens processed at n=512 (cached) 576
   tokens processed at n=512 (uncached) 163584
   wasted work multiplier             284x
 
-  >> Cached generation scales roughly linearly in tokens. Uncached scales quadratically, because every step redoes the whole prefix.
+  >> Cached generation scales roughly linearly in tokens. Uncached scales
+     quadratically, because every step redoes the whole prefix.
 
 --------------------------------------------------------------------------
-3. How big the cache actually gets
+5. How big the cache actually gets                    [post §4]
 --------------------------------------------------------------------------
   What one token costs, in Llama-3-8B (fp16):
 
@@ -108,15 +157,21 @@ device memory : 17.2 GB
   Llama-3-8B (GQA)         8  0.50 GiB  1.00 GiB   4.00 GiB  16.00 GiB
   as MQA                   1  0.06 GiB  0.12 GiB   0.50 GiB   2.00 GiB
 
-  So does caching cost memory? Yes — at 128k context:
+  So does caching cost memory? Yes. At 128k context, without a cache
+  every step re-runs all tokens through each layer, and the largest
+  moment in that pass is the FFN, not the keys and values:
 
-  approach             K/V memory held                           for how long
-  -----------------------------------------------------------------------------
-  with a cache               16.00 GiB  all 32 layers, the whole conversation
-  without a cache             0.50 GiB  one layer, freed as the pass moves on
-    + its activations         1.00 GiB                         also transient
+  approach                 memory held                 made of
+  --------------------------------------------------------------
+  with a cache               16.00 GiB    K/V, 32 layers, kept
+  without: attention step     3.50 GiB  residual, Q, K, V, out
+  without: FFN step           8.00 GiB      residual, gate, up
 
-  memory held, cached vs not         10.7x more
+  peak without a cache, at least     8.00 GiB
+  memory held, cached vs not         at most 2.0x
+  gate and up are 14,336 numbers per token. This is a floor, not
+  a peak: it counts only tensors every implementation must hold at
+  once, so a real run holds at least this much.
 
   And what that memory buys. A request costs roughly in proportion to
   how many tokens the model pushes through itself:
@@ -146,20 +201,50 @@ device memory : 17.2 GB
 
   GQA vs MHA cache reduction         4.0x
 
-  >> At long context the KV cache is larger than the model. It scales with batch AND sequence, while the weights are fixed — so it, not the checkpoint, is what caps concurrent users.
+  >> At long context the KV cache is larger than the model. It scales with
+     batch AND sequence, while the weights are fixed — so it, not the
+     checkpoint, is what caps concurrent users.
 
 --------------------------------------------------------------------------
-4. Prefill vs decode
+6. Shrinking it: GQA, MQA, and what you give up       [post §5]
+--------------------------------------------------------------------------
+  Same model at three K/V-head counts. 12 query heads throughout;
+  cache measured after a 512-token prefill, batch 1, fp32.
+
+  variant  kv heads  q per kv  params  cache @512       vs MHA  ms/decode step
+  ------------------------------------------------------------------------------
+  MHA            12         1   68.9M    24.0 MiB            —          4.4801
+  GQA             4         3   62.6M     8.0 MiB   3x smaller          5.3314
+  MQA             1        12   60.3M     2.0 MiB  12x smaller          5.0594
+
+  cache, MHA -> MQA                  12x smaller
+  decode step, MHA -> MQA            1.13x the time
+
+  Note the direction of that second number. Fewer K/V heads means
+  fewer parameters, yet the step gets slightly *slower* — because
+  this implementation expands with repeat_interleave, which allocates
+  the wide tensor it needs, and the smaller n_kv_heads is the more
+  there is to expand. Production kernels take the shared K/V directly
+  and never build it (PyTorch exposes this as SDPA's enable_gqa).
+
+  >> Cache size tracks n_kv_heads exactly — 12x less storage from MHA to
+     MQA. Per-step time does not follow it: the expansion happens after
+     the cache read, so you store 4 heads and still compute against 12.
+     Sharing K/V heads is a memory decision that the compute side barely
+     notices.
+
+--------------------------------------------------------------------------
+7. Prefill vs decode, against the ridge point         [post §6]
 --------------------------------------------------------------------------
   toy model parameters               62.6M
   weight bytes (fp32)                0.23 GiB
 
   phase    tokens/pass  ms/pass  ms/token    tokens/s
   -----------------------------------------------------
-  prefill          512  33.8788    0.0662  15112.7181
-  decode             1   5.7932    5.7932    172.6159
+  prefill          512  33.2827    0.0650  15383.3830
+  decode             1   5.9741    5.9741    167.3897
 
-  per-token cost, decode / prefill   87.6x
+  per-token cost, decode / prefill   91.9x
   Both passes read the same weights. Prefill amortizes that read over
   512 tokens; decode pays it for one.
 
@@ -169,43 +254,245 @@ device memory : 17.2 GB
   ---------------------------------------------------------
   prefill     512         64.1 G      0.23 GiB   256.0000
   decode        1        0.125 G      0.23 GiB     0.5000
-  Modern accelerators need ~100-300 FLOP/byte to saturate their ALUs.
+
+  That 100-300 figure is the roofline ridge point — peak dense fp16
+  throughput divided by HBM bandwidth. Vendor datasheet numbers:
+
+  accelerator     dense fp16  HBM bandwidth    ridge point
+  ----------------------------------------------------------
+  A100 40GB SXM  312 TFLOP/s     1,555 GB/s  201 FLOP/byte
+  A100 80GB SXM  312 TFLOP/s     2,039 GB/s  153 FLOP/byte
+  H100 SXM       989 TFLOP/s     3,350 GB/s  295 FLOP/byte
+  H200 SXM       989 TFLOP/s     4,800 GB/s  206 FLOP/byte
+
+  ridge point, across these four     153-295 FLOP/byte
+
+  So place both phases against the narrowest of those ridges:
+
+  phase    FLOP/byte  vs ridge (153)                      verdict
+  -----------------------------------------------------------------
+  prefill      256.0           1.67x  at or above — compute-bound
+  decode         0.5         0.0033x  far below — bandwidth-bound
+
+  decode is short of the ridge by    306x
+
+  >> Decode sits two to three orders of magnitude under the ridge point,
+     so the ALUs idle waiting on memory no matter what kernel you write.
+     That is not an implementation problem — it is the shape of the
+     workload.
+
+--------------------------------------------------------------------------
+8. The batch sweep, and where it stops working        [post §7]
+--------------------------------------------------------------------------
 
   decode step with a 32-token prefix (KV traffic at batch 32: 0.016 GiB vs 0.23 GiB of weights):
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       4.3755           1.00x       229               1.0x
-  2       4.6257           1.06x       432               1.9x
-  4       4.9239           1.13x       812               3.6x
-  8       6.1775           1.41x      1295               5.7x
-  16      6.7945           1.55x      2355              10.3x
-  32      8.3636           1.91x      3826              16.7x
+  1       4.0877           1.00x       245               1.0x
+  2       4.2822           1.05x       467               1.9x
+  4       4.7538           1.16x       841               3.4x
+  8       5.7299           1.40x      1396               5.7x
+  16      6.7227           1.64x      2380               9.7x
+  32      7.9395           1.94x      4031              16.5x
 
   decode step with a 512-token prefix (KV traffic at batch 32: 0.250 GiB vs 0.23 GiB of weights):
 
   batch  ms/step  latency vs b=1  tokens/s  throughput vs b=1
   -------------------------------------------------------------
-  1       5.8571           1.00x       171               1.0x
-  2       7.2173           1.23x       277               1.6x
-  4       9.7919           1.67x       409               2.4x
-  8      15.4096           2.63x       519               3.0x
-  16     23.0585           3.94x       694               4.1x
-  32     40.9820           7.00x       781               4.6x
+  1       5.4192           1.00x       185               1.0x
+  2       6.6778           1.23x       299               1.6x
+  4       9.0227           1.66x       443               2.4x
+  8      14.7052           2.71x       544               2.9x
+  16     23.3800           4.31x       684               3.7x
+  32     40.8957           7.55x       782               4.2x
 
-  throughput gain at batch 32, 32-tok prefix 16.7x
-  throughput gain at batch 32, 512-tok prefix 4.6x
+  throughput gain at batch 32, 32-tok prefix 16.5x
+  throughput gain at batch 32, 512-tok prefix 4.2x
 
-  >> With a short prefix, 32x the work costs far less than 32x the time: the weight read was the bottleneck and the extra sequences rode along free. With a long prefix the gain shrinks, because KV traffic scales with batch while weight traffic does not. That is the whole economics of serving.
+  Why: weight traffic is flat in batch, KV traffic is linear in it.
+  Per decode step, with the 512-token prefix:
+
+  batch  weight bytes   KV bytes      total  KV share  bound by
+  ---------------------------------------------------------------
+  1         0.233 GiB  0.008 GiB  0.241 GiB        3%   weights
+  2         0.233 GiB  0.016 GiB  0.249 GiB        6%   weights
+  4         0.233 GiB  0.031 GiB  0.265 GiB       12%   weights
+  8         0.233 GiB  0.062 GiB  0.296 GiB       21%   weights
+  16        0.233 GiB  0.125 GiB  0.358 GiB       35%   weights
+  32        0.233 GiB  0.250 GiB  0.483 GiB       52%  KV cache
+
+  KV overtakes weights at batch (32-tok prefix) 478
+  KV overtakes weights at batch (512-tok prefix) 30
+
+  That crossover is the whole story of the second sweep: past it,
+  the term batching cannot amortize is the majority of the traffic.
+
+  >> With a short prefix, 32x the work costs far less than 32x the time:
+     the weight read was the bottleneck and the extra sequences rode along
+     free. With a long prefix the gain shrinks, because KV traffic scales
+     with batch while weight traffic does not. That is the whole economics
+     of serving.
 
 --------------------------------------------------------------------------
-5. Figures
+9. How compute scales alongside it                      [post §7]
+--------------------------------------------------------------------------
+  Per decode step at batch B there are three terms, and only the
+  first of them is shared:
+
+  term                  scales as            shared across users?
+  -----------------------------------------------------------------
+  weight reads     15.0 GiB, flat  yes — one copy feeds everybody
+  weight matmuls   2 x params x B      no — one pass per sequence
+  KV cache reads  128 KiB x S x B     no — one cache per sequence
+
+  Batching amortizes the first and multiplies the other two. So the
+  plateau in the sweep above could be either of them — bandwidth or
+  arithmetic. Which one arrives first is what this section settles.
+
+  Start with attention over the cache, which is the part that reads
+  KV. Its FLOPs and its bytes both scale with B and with S, so those
+  cancel and its arithmetic intensity is a constant of the design:
+
+  variant           kv heads  q heads per kv head  FLOP/byte
+  ------------------------------------------------------------
+  as MHA                  32                    1        1.0
+  Llama-3-8B (GQA)         8                    4        4.0
+  as MQA                   1                   32       32.0
+
+  That column is the grouping ratio, and nothing else. Sharing K/V
+  heads does not only shrink the cache — it raises the arithmetic
+  intensity of every read from it, by the same factor.
+
+  Now solve for the batch where the matmuls take longer than the
+  bytes take to arrive — where decode stops being memory-bound:
+
+  accelerator    ridge  S=128   S=1k   S=8k  S=32k
+  --------------------------------------------------
+  A100 80GB SXM    153    181  never  never  never
+  H100 SXM         295    424  never  never  never
+
+  At a short context the answer is a real batch size, and it lands
+  near the ridge point — no coincidence: the weight term's intensity
+  is 2B/bytes, which in fp16 is just B. Past a thousand tokens of
+  context the answer is 'never': the KV read is only 4 FLOP/byte, so
+  every user you add brings more bytes than arithmetic, and the gap
+  to the ridge widens rather than closes.
+
+  >> Compute does scale with users — it never amortizes, exactly like KV
+     traffic. But at any real context length the cache read binds first
+     and keeps binding, so decode stays memory-bound however many users
+     you add. Compute binds on the other phase: prefill is compute-bound
+     from batch 1, which is what caps how fast new prompts can be
+     admitted.
+
+--------------------------------------------------------------------------
+10. Sizing a real deployment                          [post §8]
+--------------------------------------------------------------------------
+  Serving Llama-3.1-8B to 1,000 concurrent users at 128k context, fp16.
+  Same layer shapes as Llama-3-8B; only the context window differs.
+
+  what            per user      x 1,000 users
+  ---------------------------------------------
+  KV cache       16.00 GiB          15.62 TiB
+  model weights          —  14.96 GiB per GPU
+
+  The cache is three orders of magnitude larger than the model. So the
+  fleet is sized by cache, and the weights are a rounding error:
+
+  accelerator       HBM  usable for KV  users/GPU  GPUs needed  tok/s per user
+  ------------------------------------------------------------------------------
+  A100 80GB SXM   80 GB         50 GiB        3.1          320              29
+  H100 SXM        80 GB         50 GiB        3.1          320              48
+  H200 SXM       141 GB        101 GiB        6.3          159              38
+
+  Those last two columns answer different questions. Capacity sets the
+  fleet size: the A100 and the H100 need the same 320 cards because
+  they hold the same 80 GB. Bandwidth sets the token rate, and there
+  the H100 is worth 1.6x the A100 for an identical bill of materials.
+
+  The H200 row is the one to think about. Twice the capacity halves the
+  fleet — and each user gets *slower*, because a card holding twice as
+  many caches re-reads twice as much of them on every step:
+
+  card             bytes per step           =    bandwidth      step  tok/s
+  ---------------------------------------------------------------------------
+  H100 SXM  16.00 x 3.131 + 14.96   65.06 GiB  3,120 GiB/s  20.85 ms     48
+  H200 SXM  16.00 x 6.327 + 14.96  116.19 GiB  4,470 GiB/s  25.99 ms     38
+
+  raw HBM, H100 -> H200              +76%
+  usable for KV                      +102%
+  bytes moved per step               +79%
+  bandwidth                          +43%
+
+  Usable capacity outruns raw capacity, because the weights and the
+  headroom come off once whatever the card. Bytes per step then lags
+  usable capacity, because the weight read is shared. And bandwidth
+  grows slowest of all — which is the whole of why the step got longer.
+  Capacity buys density, not speed; only bandwidth buys speed.
+
+  Those columns are three chained formulas. Worked through for H100 SXM:
+
+  column                               arithmetic     result
+  ------------------------------------------------------------
+  usable for KV   74.51 GiB x 0.90 - 14.96 - 2.00  50.10 GiB
+  users/GPU                         50.10 / 16.00      3.131
+  GPUs needed                 ceil(1,000 / 3.131)        320
+  bytes per step            16.00 x 3.131 + 14.96  65.06 GiB
+  step time               65.06 GiB / 3,120 GiB/s   20.85 ms
+  tok/s per user                     1 / 20.85 ms       48.0
+
+  Two facts do the work in the last three rows. Every decode step
+  re-reads each resident user's *whole* cache, because attention at any
+  step attends over every earlier position — that is the multiplication
+  by users/GPU. And one step emits one token for every resident user at
+  once, so a single user sees 1/step while the card sees users/step.
+
+  Assumes 90% of HBM is reachable before weights, minus
+  2 GiB of activation headroom. Real stacks land lower.
+
+  Now the speed, on one H100 SXM holding 3.1 users' caches.
+  Every decode step re-reads all of them:
+
+  per decode step         bytes or time             share
+  ---------------------------------------------------------
+  KV cache read                50.1 GiB               77%
+  weight read                  15.0 GiB               23%
+  time, memory-bound            20.9 ms                 —
+  time, if compute-bound        0.27 ms  1.3% of the step
+
+  tokens/s per user                  48
+  tokens/s per GPU                   150
+  tokens/s across 320 GPUs           47,958
+
+  Compute is a rounding error on the step — the 'never' column of the
+  previous section, seen from the deployment end.
+
+  What actually moves the GPU count:
+
+  lever                             cache/user  users/GPU  H100 SXMs needed
+  ---------------------------------------------------------------------------
+  baseline — fp16 cache, full 128k   16.00 GiB        3.1               320
+  quantize the KV cache to fp8        8.00 GiB        6.3               160
+  cap context at 32k                  4.00 GiB       12.5                80
+  both                                2.00 GiB       25.0                40
+
+  >> A 15 GiB model needs a fleet sized by 15.6 TiB of cache. Both levers
+     that matter shrink the cache rather than adding compute — which is
+     the whole argument of this post, arriving as a purchase order.
+
+--------------------------------------------------------------------------
+11. Figures
 --------------------------------------------------------------------------
   wrote figures/02-kv-cache/why-cache-light.png
   wrote figures/02-kv-cache/cache-vs-nocache-light.png
   wrote figures/02-kv-cache/cache-size-light.png
+  wrote figures/02-kv-cache/roofline-light.png
   wrote figures/02-kv-cache/batch-sweep-light.png
+  wrote figures/02-kv-cache/traffic-crossover-light.png
   wrote figures/02-kv-cache/why-cache-dark.png
   wrote figures/02-kv-cache/cache-vs-nocache-dark.png
   wrote figures/02-kv-cache/cache-size-dark.png
+  wrote figures/02-kv-cache/roofline-dark.png
   wrote figures/02-kv-cache/batch-sweep-dark.png
+  wrote figures/02-kv-cache/traffic-crossover-dark.png

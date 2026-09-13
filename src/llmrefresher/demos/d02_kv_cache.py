@@ -376,30 +376,54 @@ def cache_arithmetic(rep: Report) -> dict[str, list]:
         ],
     )
 
-    # The cache is not free memory — it is bought memory. Without it you still
-    # compute the same K and V every step, but you discard them immediately, so
-    # they exist one layer at a time instead of all layers at once.
+    # The cache is not free memory -- it is bought memory. Without it you still
+    # compute the same K and V every step and discard them as each layer finishes.
+    # But the K and V are not the biggest thing the uncached path holds: every
+    # step re-runs all ctx tokens through each layer, and that pass has its own
+    # working memory. An earlier version counted only one layer's K/V plus the
+    # hidden states and reported 10.7x, which left out the FFN's intermediates.
+    #
+    # The peak depends on the implementation, so this reports a floor instead:
+    # only tensors that any implementation must hold at the same moment. gate and
+    # up must both exist to be multiplied, and the residual must survive for the
+    # add. No assumption about attention is needed: a stored n x n score matrix,
+    # or vocabulary scores for every position, could only raise the peak.
+    assert spec.d_ff is not None, "memory floor needs the FFN width"
     ctx = 131_072
     cached_bytes = spec.kv_bytes(ctx, bytes_per_elem=bytes_per)
-    one_layer = 2 * spec.n_kv_heads * spec.head_dim * ctx * bytes_per
-    hidden = ctx * (spec.n_heads * spec.head_dim) * bytes_per
-    uncached_peak = one_layer + hidden
+    d_model = spec.n_heads * spec.head_dim
+    per_number = ctx * bytes_per
+    residual = per_number * d_model
+    queries = per_number * spec.n_heads * spec.head_dim
+    keys = values = per_number * spec.n_kv_heads * spec.head_dim
+    attn_out = per_number * d_model
+    gate = up = per_number * spec.d_ff
+    attention_step = residual + queries + keys + values + attn_out
+    ffn_step = residual + gate + up
+    uncached_floor = max(attention_step, ffn_step)
 
     rep.blank()
-    rep.note(f"So does caching cost memory? Yes — at {ctx // 1024}k context:")
+    rep.note(f"So does caching cost memory? Yes. At {ctx // 1024}k context, without a cache")
+    rep.note("every step re-runs all tokens through each layer, and the largest")
+    rep.note("moment in that pass is the FFN, not the keys and values:")
     rep.blank()
     rep.table(
-        ["approach", "K/V memory held", "for how long"],
+        ["approach", "memory held", "made of"],
         [
             ["with a cache", f"{_gib(cached_bytes):.2f} GiB",
-             f"all {spec.n_layers} layers, the whole conversation"],
-            ["without a cache", f"{_gib(one_layer):.2f} GiB",
-             "one layer, freed as the pass moves on"],
-            ["  + its activations", f"{_gib(hidden):.2f} GiB", "also transient"],
+             f"K/V, {spec.n_layers} layers, kept"],
+            ["without: attention step", f"{_gib(attention_step):.2f} GiB",
+             "residual, Q, K, V, out"],
+            ["without: FFN step", f"{_gib(ffn_step):.2f} GiB",
+             "residual, gate, up"],
         ],
     )
     rep.blank()
-    rep.kv("memory held, cached vs not", f"{cached_bytes / uncached_peak:.1f}x more")
+    rep.kv("peak without a cache, at least", f"{_gib(uncached_floor):.2f} GiB")
+    rep.kv("memory held, cached vs not", f"at most {cached_bytes / uncached_floor:.1f}x")
+    rep.note(f"gate and up are {spec.d_ff:,} numbers per token. This is a floor, not")
+    rep.note("a peak: it counts only tensors every implementation must hold at")
+    rep.note("once, so a real run holds at least this much.")
 
     # And what that memory buys, at shapes a real deployment actually sees.
     # A model's cost is roughly proportional to how many tokens it pushes through
