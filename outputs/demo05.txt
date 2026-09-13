@@ -13,7 +13,7 @@ device memory : 17.2 GB
   routing passage                    94 tokens
 
 --------------------------------------------------------------------------
-1. Where the parameters actually are               [post §1]
+1. Where the parameters are                         [post §1]
 --------------------------------------------------------------------------
   role          parameters   share
   ----------------------------------
@@ -34,44 +34,6 @@ device memory : 17.2 GB
   >> 93% of the weights are experts, and a token touches 8 of 64 of them.
      The model is mostly a thing it declines to use.
 
-  One layer's weight tensors, as stored in the checkpoint:
-
-  tensor                             shape   parameters
-  -------------------------------------------------------
-  q, k, v, o projections  4 x (2048, 2048)   16,777,216
-  q_norm, k_norm               2 x (2048,)        4,096
-  router                        (64, 2048)      131,072
-  experts: gate_up_proj   (64, 2048, 2048)  268,435,456
-  experts: down_proj      (64, 2048, 1024)  134,217,728
-  two layer norms              2 x (2048,)        4,096
-  one layer                                 419,569,664
-
-  The tensors outside the layers:
-
-  tensor                shape   parameters
-  ------------------------------------------
-  embed_tokens  (50304, 2048)  103,022,592
-  lm_head       (50304, 2048)  103,022,592
-  final norm          (2048,)        2,048
-
-  tokens the tokenizer defines       50,280
-  rows in each table                 50,304
-  rows no token can select           24
-  rows, as a multiple of 128         393 x 128
-  embedding and LM head tied?        no
-
-  Each role across all 16 layers, plus what sits outside them:
-
-  role            per layer           x 16      outside          total
-  ----------------------------------------------------------------------
-  experts       402,653,184  6,442,450,944               6,442,450,944
-  attention      16,781,312    268,500,992                 268,500,992
-  router            131,072      2,097,152                   2,097,152
-  norms               4,096         65,536        2,048         67,584
-  embed + head                              206,045,184    206,045,184
-  TOTAL                                                  6,919,161,856
-  equals the checkpoint's count?     yes
-
   What one token's arithmetic uses:
 
   part                             parameters
@@ -85,49 +47,6 @@ device memory : 17.2 GB
   active total                  1,178,994,688
   active share of total              17.04%
   active if the lookup is counted    1.28B
-
-  Layer 0's attention on ' harbour', step by step:
-
-  step                              result                 parameters
-  ---------------------------------------------------------------------
-  x, the normalized input    2,048 numbers
-  q = W_q x                  2,048 numbers  2,048 x 2,048 = 4,194,304
-  q = q_norm(q)              2,048 numbers                      2,048
-  k = W_k x, then k_norm     2,048 numbers          4,194,304 + 2,048
-  v = W_v x                  2,048 numbers  2,048 x 2,048 = 4,194,304
-  split q, k, v into heads  16 heads x 128             0 (no weights)
-  attention in each head    16 heads x 128             0 (no weights)
-  join the heads             2,048 numbers             0 (no weights)
-  output = W_o (joined)      2,048 numbers  2,048 x 2,048 = 4,194,304
-  attention, total                                         16,781,312
-  equals the census, per layer?      yes
-
-
-  Expert 5, the router's first choice, on the same token (layer 0):
-
-  step                            result                 parameters
-  -------------------------------------------------------------------
-  x, the normalized input  2,048 numbers
-  gate_up_proj[5] x        2,048 numbers  2,048 x 2,048 = 4,194,304
-    first half: gate       1,024 numbers
-    second half: up        1,024 numbers
-  x_mix = SiLU(gate) * up  1,024 numbers             0 (no weights)
-  down_proj[5] x_mix       2,048 numbers  2,048 x 1,024 = 2,097,152
-  one expert, total                                       6,291,456
-  gate == first half of gate_up rows? yes
-
-  The final norm, applied to ' harbour' after the last layer:
-
-  gamma, one scale per dimension     shape (2048,)
-  epsilon                            1e-05
-  RMS of the vector coming in        0.2170
-  after dividing by its RMS          0.9999
-  after multiplying by gamma         1.6627
-  gamma smallest / median / largest  0.1328 / 2.2344 / 2.6094
-  formula by hand == model's norm?   yes (fp32)
-
-  median token RMS entering layer 0  0.0045
-  median entering the final norm     0.2796
 
   Why 64 experts and 8 per token, rather than 8 and 2?
 
@@ -158,7 +77,7 @@ device memory : 17.2 GB
      buying.
 
 --------------------------------------------------------------------------
-2. The router is the smallest part of the model    [post §2]
+2. The router, which is smaller than you would guess [post §2]
 --------------------------------------------------------------------------
   How big the router is, from one row up. Shape of each: (64, 2048)
 
@@ -192,7 +111,7 @@ device memory : 17.2 GB
      93% are spent on every token.
 
 --------------------------------------------------------------------------
-3. One token, routed                               [post §3]
+3. One token, routed                                [post §3]
 --------------------------------------------------------------------------
   token                              1 = ' harbour'
   layer                              0
@@ -259,7 +178,7 @@ device memory : 17.2 GB
   layer output == h_mid + y? (bf16)  yes
 
 --------------------------------------------------------------------------
-4. What the router learns                          [post §4]
+4. What the router learns                           [post §4]
 --------------------------------------------------------------------------
   passage  tokens
   -----------------
@@ -300,7 +219,7 @@ device memory : 17.2 GB
      and the gap widens with depth.
 
 --------------------------------------------------------------------------
-5. Two bills: memory and time                      [post §5]
+5. Two bills: memory and time                       [post §5]
 --------------------------------------------------------------------------
   weights resident (bf16)            12.89 GiB
     every expert must be in memory; the router picks at run time,
@@ -308,19 +227,19 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         421.2     1.00x
-  64                        929.1     2.21x
+  8                         426.1     1.00x
+  64                        915.5     2.15x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.21x
+  measured wall-clock ratio          2.15x
     below 8x because attention, norms and the LM head are unchanged
 
-  >> Turning every expert on costs 2.2x the time and 0 extra bytes of
+  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 
 --------------------------------------------------------------------------
-6. Sparsity does not survive a batch               [post §6]
+6. Sparsity does not survive a batch                [post §6]
 --------------------------------------------------------------------------
   passage                            356 tokens
 
@@ -349,7 +268,7 @@ device memory : 17.2 GB
      arithmetic but not memory.
 
 --------------------------------------------------------------------------
-7. Experts across GPUs                             [post §7]
+7. When the model spans many GPUs                   [post §7]
 --------------------------------------------------------------------------
   passage                            356 tokens
 
@@ -365,7 +284,7 @@ device memory : 17.2 GB
      decides how much.
 
 --------------------------------------------------------------------------
-8. Nothing balances the load for free              [post §8]
+8. Nothing balances the load for free               [post §8]
 --------------------------------------------------------------------------
   passage                            356 tokens
   routing slots per layer            2848
@@ -405,7 +324,7 @@ device memory : 17.2 GB
   total                                      2.8314
 
 --------------------------------------------------------------------------
-9. What training updates                          [post §9]
+9. How an MoE is trained                            [post §9]
 --------------------------------------------------------------------------
   One token, ' harbour', backpropagated through layer 0's MoE block:
 
@@ -418,7 +337,91 @@ device memory : 17.2 GB
   dL/dW_r, by hand vs autograd       max difference 1.5e-08
 
 --------------------------------------------------------------------------
-10. Figures
+Appendix: counting every parameter                  [post appendix]
+--------------------------------------------------------------------------
+  One layer's weight tensors, as stored in the checkpoint:
+
+  tensor                             shape   parameters
+  -------------------------------------------------------
+  q, k, v, o projections  4 x (2048, 2048)   16,777,216
+  q_norm, k_norm               2 x (2048,)        4,096
+  router                        (64, 2048)      131,072
+  experts: gate_up_proj   (64, 2048, 2048)  268,435,456
+  experts: down_proj      (64, 2048, 1024)  134,217,728
+  two layer norms              2 x (2048,)        4,096
+  one layer                                 419,569,664
+
+  The tensors outside the layers:
+
+  tensor                shape   parameters
+  ------------------------------------------
+  embed_tokens  (50304, 2048)  103,022,592
+  lm_head       (50304, 2048)  103,022,592
+  final norm          (2048,)        2,048
+
+  tokens the tokenizer defines       50,280
+  rows in each table                 50,304
+  rows no token can select           24
+  rows, as a multiple of 128         393 x 128
+  embedding and LM head tied?        no
+
+  Each role across all 16 layers, plus what sits outside them:
+
+  role            per layer           x 16      outside          total
+  ----------------------------------------------------------------------
+  experts       402,653,184  6,442,450,944               6,442,450,944
+  attention      16,781,312    268,500,992                 268,500,992
+  router            131,072      2,097,152                   2,097,152
+  norms               4,096         65,536        2,048         67,584
+  embed + head                              206,045,184    206,045,184
+  TOTAL                                                  6,919,161,856
+  equals the checkpoint's count?     yes
+
+  Layer 0's attention on ' harbour', step by step:
+
+  step                              result                 parameters
+  ---------------------------------------------------------------------
+  x, the normalized input    2,048 numbers
+  q = W_q x                  2,048 numbers  2,048 x 2,048 = 4,194,304
+  q = q_norm(q)              2,048 numbers                      2,048
+  k = W_k x, then k_norm     2,048 numbers          4,194,304 + 2,048
+  v = W_v x                  2,048 numbers  2,048 x 2,048 = 4,194,304
+  split q, k, v into heads  16 heads x 128             0 (no weights)
+  attention in each head    16 heads x 128             0 (no weights)
+  join the heads             2,048 numbers             0 (no weights)
+  output = W_o (joined)      2,048 numbers  2,048 x 2,048 = 4,194,304
+  attention, total                                         16,781,312
+  equals the census, per layer?      yes
+
+
+  Expert 5, the router's first choice, on the same token (layer 0):
+
+  step                            result                 parameters
+  -------------------------------------------------------------------
+  x, the normalized input  2,048 numbers
+  gate_up_proj[5] x        2,048 numbers  2,048 x 2,048 = 4,194,304
+    first half: gate       1,024 numbers
+    second half: up        1,024 numbers
+  x_mix = SiLU(gate) * up  1,024 numbers             0 (no weights)
+  down_proj[5] x_mix       2,048 numbers  2,048 x 1,024 = 2,097,152
+  one expert, total                                       6,291,456
+  gate == first half of gate_up rows? yes
+
+  The final norm, applied to ' harbour' after the last layer:
+
+  gamma, one scale per dimension     shape (2048,)
+  epsilon                            1e-05
+  RMS of the vector coming in        0.2170
+  after dividing by its RMS          0.9999
+  after multiplying by gamma         1.6627
+  gamma smallest / median / largest  0.1328 / 2.2344 / 2.6094
+  formula by hand == model's norm?   yes (fp32)
+
+  median token RMS entering layer 0  0.0045
+  median entering the final norm     0.2796
+
+--------------------------------------------------------------------------
+Figures
 --------------------------------------------------------------------------
   wrote figures/05-mixture-of-experts/moe-architecture-light.png
   wrote figures/05-mixture-of-experts/moe-block-light.png

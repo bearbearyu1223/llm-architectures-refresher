@@ -1,39 +1,41 @@
 """Demo 05 — Mixture-of-experts: what the router learns, and what sparsity costs.
 
-Companion to post 5 of LLM Architecture Refresh. Each section prints the numbers
-one section of the post quotes, and is tagged ``[post §N]`` in the output.
+Companion to post 5 of LLM Architecture Refresh. Each section below prints the
+numbers one section of the post quotes, and its title and ``[post §N]`` tag match
+the post's heading.
 
-1. Where the parameters are. 93.1% of OLMoE's 6.92B parameters are experts. A
-   token uses 8 of each layer's 64, so 1.179B parameters (17.0%) do its
-   arithmetic while all of them occupy memory. Every count is also derived from
-   tensor shapes, and the two derivations are asserted to agree. Why 64 and 8:
-   8 x 1,024 is exactly the 8,192-wide FFN of the dense model of this shape.
-2. The router is one 64-row x 2,048-wide matrix per layer, 2.10M parameters
-   (0.030%). A router score is exactly a row dotted with the token's vector,
-   checked against the model for all 64 experts; fp32 shifts the scores but not
-   the choice of experts at layer 0.
-3. Routing is softmax, top-8, weighted sum. ``norm_topk_prob=False``, so the kept
-   weights sum to 0.4281 rather than 1 for the token walked through.
-4. Expert usage depends on the kind of text, measured against a noise floor of
-   two halves of one passage (0.216 against 0.554), and more so with depth.
-   Whether that is *semantic* specialization is contested; the post says so.
-5. Top-64 against top-8 on the same weights: about 2x the time, zero extra bytes.
-   The only wall-clock number here, so the only one that moves between runs.
-6. Per-token sparsity does not survive batching: 256 tokens together need 60.9
-   of the 64 experts.
-7. Split across 8 GPUs, one token's 8 experts land on 5.54 of them on average.
-8. Nothing balances load for free: the busiest expert takes 5.71x an even share.
+1. Where the parameters are: 93.1% of OLMoE's 6.92B parameters are experts; one
+   token uses 1.179B (17.0%). Why 64 experts and 8 per token: 8 x 1,024 is the
+   8,192-wide FFN of the dense model of this shape.
+2. The router, which is smaller than you would guess: 64 rows x 2,048 per layer,
+   2.10M parameters. A router score is exactly a row dotted with the token's
+   vector; fp32 shifts the scores but not the choices at layer 0.
+3. One token, routed: softmax, top-8, weighted sum; the kept weights sum to
+   0.4281 because OLMoE does not renormalize. The whole layer rebuilt from its
+   equations matches the model's block exactly.
+4. What the router learns: expert usage differs by kind of text against a
+   same-text noise floor (0.554 against 0.216), more so with depth.
+5. Two bills: top-64 against top-8 costs about 2x the time and no memory. The
+   only wall-clock number, so the only one that moves between runs.
+6. Sparsity does not survive a batch: 256 tokens need 60.9 of 64 experts, and a
+   batch is computed as one call per expert.
+7. When the model spans many GPUs: at 8 GPUs a token reaches 5.54 of them.
+8. Nothing balances the load for free: the busiest expert takes 5.71x an even
+   share; OLMoE's three-term loss computed, load balancing matched against
+   transformers' own function.
+9. How an MoE is trained: one token's backward pass reaches all 64 router rows
+   and exactly the 8 chosen experts; the router gradient matches autograd.
 
-Like demo 04 this needs a *trained* model; a router with random weights routes
-nothing in particular. OLMoE-1B-7B is the smallest fully open MoE that fits on a
-24 GiB laptop, and its layers are the plain form of the mechanism: no shared
-expert, not upcycled from a dense model.
+Appendix, counting every parameter: every tensor's shape and count, derived from
+the checkpoint and asserted equal to the census; attention and one expert traced
+step by step; the final RMSNorm applied by hand.
 
-Precision: bfloat16, the precision OLMoE was released in. fp32 would be 25.8 GiB
-and does not fit. Parameter counts are unaffected; routing numbers come from a
-bf16 forward pass, and section 2 checks the router step against fp32.
+A trained model is needed: a router with random weights routes nothing in
+particular. OLMoE-1B-7B is the smallest fully open MoE that fits in 24 GiB, with
+no shared expert and no upcycling. It runs in bfloat16, the precision it was
+released in; fp32 would be 25.8 GiB.
 
-The routing arithmetic that does not need a model (expert_union, gpu_spread,
+The routing arithmetic that needs no model (expert_union, gpu_spread,
 _usage_from_idx, _tv) is unit-tested in tests/test_d05_helpers.py.
 
 Run: ``uv run demo05 > outputs/demo05.txt 2>/dev/null``
@@ -408,17 +410,30 @@ def derive_the_census(rep: Report, model, tok) -> None:
         ("LM head, a full multiply", head),
     ]
     active = sum(v for _, v in active_parts)
-    rep.blank()
-    rep.note("What one token's arithmetic uses:")
-    rep.blank()
-    rep.table(["part", "parameters"], [[k, f"{v:,}"] for k, v in active_parts]
-              + [["embedding table, a lookup", "not counted"], ["active total", f"{active:,}"]])
     # Two independent routes to the same numbers: shapes read tensor by tensor
-    # here, and names bucketed in _census. If they ever disagree, stop.
+    # here, and names bucketed in _census, which section 1 prints. If they ever
+    # disagree, stop.
     census = _census(model)
     assert (active, total) == (census.active, census.total), "census derivations disagree"
-    rep.kv("active share of total", f"{100 * active / total:.2f}%")
-    rep.kv("active if the lookup is counted", f"{(active + embed) / 1e9:.2f}B")
+
+
+def what_one_token_uses(rep: Report, model) -> None:
+    """The active count, part by part, with why each part is or is not counted."""
+    c = _census(model)
+    parts = [
+        (f"{c.top_k} of {c.n_exp} experts, x {c.layers} layers", c.per_expert * c.top_k * c.layers),
+        ("attention, all of it", c.attention),
+        ("router, scores all experts", c.router),
+        ("norms", c.norms),
+        ("LM head, a full multiply", c.head),
+    ]
+    assert sum(v for _, v in parts) == c.active
+    rep.note("What one token's arithmetic uses:")
+    rep.blank()
+    rep.table(["part", "parameters"], [[k, f"{v:,}"] for k, v in parts]
+              + [["embedding table, a lookup", "not counted"], ["active total", f"{c.active:,}"]])
+    rep.kv("active share of total", f"{100 * c.active / c.total:.2f}%")
+    rep.kv("active if the lookup is counted", f"{(c.active + c.embed) / 1e9:.2f}B")
 
 
 def what_the_final_norm_does(rep: Report, model, tok, ids: torch.Tensor, pos: int = 1) -> None:
@@ -1948,53 +1963,49 @@ def main() -> None:
 
     counts = _census(model).by_role()
 
-    rep.section("1. Where the parameters actually are               [post §1]")
+    rep.section("1. Where the parameters are                         [post §1]")
     where_the_parameters_are(rep, model)
     rep.blank()
-    derive_the_census(rep, model, tok)
-    rep.blank()
-    each_tensor_step_by_step(rep, model, tok, ids)
-    rep.blank()
-    what_the_final_norm_does(rep, model, tok, ids)
+    what_one_token_uses(rep, model)
     rep.blank()
     rep.note("Why 64 experts and 8 per token, rather than 8 and 2?")
     rep.blank()
     why_this_many_experts(rep, model)
 
-    rep.section("2. The router is the smallest part of the model    [post §2]")
+    rep.section("2. The router, which is smaller than you would guess [post §2]")
     the_router_is_tiny(rep, model, tok, ids)
 
     logits = route(model, ids)
 
-    rep.section("3. One token, routed                               [post §3]")
+    rep.section("3. One token, routed                                [post §3]")
     chosen, kept = one_token_routed(rep, model, tok, logits, ids)
     rep.blank()
     routing_depth_profile(rep, model, logits, tok, ids)
     rep.blank()
     the_layer_by_hand(rep, model, tok, ids)
 
-    rep.section("4. What the router learns                          [post §4]")
+    rep.section("4. What the router learns                           [post §4]")
     usage, halves = what_the_router_learns(rep, model, tok)
 
-    rep.section("5. Two bills: memory and time                      [post §5]")
+    rep.section("5. Two bills: memory and time                       [post §5]")
     two_bills(rep, model, ids, device)
 
-    # Sections 6 and 7 both climb with sample size, so they get a longer
-    # passage: on 94 tokens they would report a property of the passage.
+    # Sections 6 to 8 climb with sample size, so they get a longer passage: on
+    # 94 tokens they would report a property of the passage.
     long_ids = tok(LONG_PROSE, return_tensors="pt").input_ids.to(device)
     long_logits = route(model, long_ids)
 
-    rep.section("6. Sparsity does not survive a batch               [post §6]")
+    rep.section("6. Sparsity does not survive a batch                [post §6]")
     rep.kv("passage", f"{long_ids.shape[1]} tokens")
     rep.blank()
     curve = batch_collapse(rep, model, long_logits)
 
-    rep.section("7. Experts across GPUs                             [post §7]")
+    rep.section("7. When the model spans many GPUs                   [post §7]")
     rep.kv("passage", f"{long_ids.shape[1]} tokens")
     rep.blank()
     experts_across_gpus(rep, model, long_logits)
 
-    rep.section("8. Nothing balances the load for free              [post §8]")
+    rep.section("8. Nothing balances the load for free               [post §8]")
     rep.kv("passage", f"{long_ids.shape[1]} tokens")
     rep.kv("routing slots per layer", f"{long_ids.shape[1] * top_k}")
     rep.blank()
@@ -2004,10 +2015,17 @@ def main() -> None:
     rep.blank()
     what_training_minimizes(rep, model, ids)
 
-    rep.section("9. What training updates                          [post §9]")
+    rep.section("9. How an MoE is trained                            [post §9]")
     what_gets_a_gradient(rep, model, tok, ids)
 
-    rep.section("10. Figures")
+    rep.section("Appendix: counting every parameter                  [post appendix]")
+    derive_the_census(rep, model, tok)
+    rep.blank()
+    each_tensor_step_by_step(rep, model, tok, ids)
+    rep.blank()
+    what_the_final_norm_does(rep, model, tok, ids)
+
+    rep.section("Figures")
     make_figures(rep, model, counts, usage, halves, curve, chosen, kept, logits)
 
 
