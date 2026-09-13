@@ -86,28 +86,42 @@ device memory : 17.2 GB
   active share of total              17.04%
   active if the lookup is counted    1.28B
 
-  Attention's projections on ' harbour', layer 0 (the query path):
+  Every weight in layer 0's attention, and what it computes:
 
-  step                          shape                 parameters
+  computes                     weight   rows x width  parameters
   ----------------------------------------------------------------
-  x = RMSNorm(h), the input   (2048,)
-  W_q x                       (2048,)  2,048 x 2,048 = 4,194,304
-  q_norm(W_q x)               (2048,)                      2,048
-  split into 16 heads        (16,128)                       none
-  same for keys (W_k, k_norm)        4,196,352 parameters
-  values (W_v) and output (W_o)      2 x 4,194,304 = 8,388,608
+  query = W_q x                   W_q  2,048 x 2,048   4,194,304
+  query = RMSNorm(query)       q_norm   2,048 scales       2,048
+  key = W_k x                     W_k  2,048 x 2,048   4,194,304
+  key = RMSNorm(key)           k_norm   2,048 scales       2,048
+  value = W_v x                   W_v  2,048 x 2,048   4,194,304
+  output = W_o (heads joined)     W_o  2,048 x 2,048   4,194,304
+  total                                               16,781,312
+  equals the census, per layer?      yes
+
+  One token's query path, measured on ' harbour':
+
+  step                                 result
+  ---------------------------------------------
+  x, the normalized input       2,048 numbers
+  W_q x                         2,048 numbers
+  after q_norm                  2,048 numbers
+  split into heads             16 heads x 128
+  attention runs in each head
+  the heads' results, joined    2,048 numbers
+  after W_o                     2,048 numbers
 
   Expert 5, the router's first choice, on the same token (layer 0):
 
-  step                             shape                 parameters
+  step                            result                 parameters
   -------------------------------------------------------------------
-  x = RMSNorm(h_mid), the input  (2048,)
-  gate_up_proj[5] x              (2048,)  2,048 x 2,048 = 4,194,304
-    first half: gate             (1024,)
-    second half: up              (1024,)
-  SiLU(gate) * up                (1024,)                       none
-  down_proj[5] (that)            (2048,)  2,048 x 1,024 = 2,097,152
-  one expert                                              6,291,456
+  x, the normalized input  2,048 numbers
+  gate_up_proj[5] x        2,048 numbers  2,048 x 2,048 = 4,194,304
+    first half: gate       1,024 numbers
+    second half: up        1,024 numbers
+  x_mix = SiLU(gate) * up  1,024 numbers             0 (no weights)
+  down_proj[5] x_mix       2,048 numbers  2,048 x 1,024 = 2,097,152
+  one expert, total                                       6,291,456
   gate == first half of gate_up rows? yes
 
   The final norm, applied to ' harbour' after the last layer:
@@ -302,8 +316,8 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         420.8     1.00x
-  64                        923.2     2.19x
+  8                         420.2     1.00x
+  64                        919.7     2.19x
 
   expert FLOPs ratio (64/8)          8x
   measured wall-clock ratio          2.19x

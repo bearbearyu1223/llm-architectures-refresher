@@ -1160,36 +1160,71 @@ def each_tensor_step_by_step(rep: Report, model, tok, ids: torch.Tensor, pos: in
     head_dim = hid // heads
     _, cap = _capture_layer0(model, ids)
 
-    # attention reads the residual stream after the input norm
+    # Attention reads the residual stream after the input norm. Capture that, and
+    # the joined heads going into W_o, so every shape below is measured.
     cap_in = {}
-    hook = layer.input_layernorm.register_forward_hook(lambda mod, a, o: cap_in.__setitem__("x", o.detach()))
+    hooks = [
+        layer.input_layernorm.register_forward_hook(lambda mod, a, o: cap_in.__setitem__("x", o.detach())),
+        attn.o_proj.register_forward_pre_hook(lambda mod, a: cap_in.__setitem__("joined", a[0].detach())),
+        attn.o_proj.register_forward_hook(lambda mod, a, o: cap_in.__setitem__("out", o.detach())),
+    ]
     try:
         with torch.no_grad():
             model(ids)
     finally:
-        hook.remove()
+        for h in hooks:
+            h.remove()
     x_attn = cap_in["x"][0, pos]
     with torch.no_grad():
         q = attn.q_proj(x_attn)
         q_normed = attn.q_norm(q)
         q_heads = q_normed.view(heads, head_dim)
 
-    def fmt(shape) -> str:
-        return str(tuple(shape)).replace(" ", "")
+    def numbers(t_: torch.Tensor) -> str:
+        return f"{t_.numel():,} numbers" if t_.dim() == 1 else f"{t_.shape[0]} heads x {t_.shape[1]}"
 
-    rep.note(f"Attention's projections on {tok.decode(ids[0, pos:pos + 1])!r}, layer 0 (the query path):")
+    # Table 1: every weight attention owns, what it computes, and its count. The
+    # total must equal the census's attention row, or the two views disagree.
+    weights = [
+        ("W_q", "query = W_q x", attn.q_proj.weight),
+        ("q_norm", "query = RMSNorm(query)", attn.q_norm.weight),
+        ("W_k", "key = W_k x", attn.k_proj.weight),
+        ("k_norm", "key = RMSNorm(key)", attn.k_norm.weight),
+        ("W_v", "value = W_v x", attn.v_proj.weight),
+        ("W_o", "output = W_o (heads joined)", attn.o_proj.weight),
+    ]
+
+    def dims(w: torch.Tensor) -> str:
+        return f"{w.shape[0]:,} x {w.shape[1]:,}" if w.dim() == 2 else f"{w.shape[0]:,} scales"
+
+    attn_total = sum(w.numel() for _, _, w in weights)
+    census_attn = _census(model).attention // model.config.num_hidden_layers
+    rep.note("Every weight in layer 0's attention, and what it computes:")
     rep.blank()
     rep.table(
-        ["step", "shape", "parameters"],
+        ["computes", "weight", "rows x width", "parameters"],
+        [[what, name, dims(w), f"{w.numel():,}"] for name, what, w in weights]
+        + [["total", "", "", f"{attn_total:,}"]],
+    )
+    rep.kv("equals the census, per layer?", attn_total == census_attn)
+
+    # Table 2: one token's query, measured at each step. Shapes only; the
+    # parameters are all in table 1.
+    rep.blank()
+    rep.note(f"One token's query path, measured on {tok.decode(ids[0, pos:pos + 1])!r}:")
+    rep.blank()
+    rep.table(
+        ["step", "result"],
         [
-            ["x = RMSNorm(h), the input", fmt(x_attn.shape), ""],
-            ["W_q x", fmt(q.shape), f"{hid:,} x {hid:,} = {hid * hid:,}"],
-            ["q_norm(W_q x)", fmt(q_normed.shape), f"{hid:,}"],
-            [f"split into {heads} heads", fmt(q_heads.shape), "none"],
+            ["x, the normalized input", numbers(x_attn)],
+            ["W_q x", numbers(q)],
+            ["after q_norm", numbers(q_normed)],
+            ["split into heads", numbers(q_heads)],
+            ["attention runs in each head", ""],
+            ["the heads' results, joined", numbers(cap_in["joined"][0, pos])],
+            ["after W_o", numbers(cap_in["out"][0, pos])],
         ],
     )
-    rep.kv("same for keys (W_k, k_norm)", f"{hid * hid + hid:,} parameters")
-    rep.kv("values (W_v) and output (W_o)", f"2 x {hid * hid:,} = {2 * hid * hid:,}")
 
     x = cap["x"][0, pos].float()
     expert = int(torch.topk(block.gate.weight.float() @ x, 1).indices)
@@ -1208,15 +1243,15 @@ def each_tensor_step_by_step(rep: Report, model, tok, ids: torch.Tensor, pos: in
     rep.note(f"Expert {expert}, the router's first choice, on the same token (layer 0):")
     rep.blank()
     rep.table(
-        ["step", "shape", "parameters"],
+        ["step", "result", "parameters"],
         [
-            ["x = RMSNorm(h_mid), the input", fmt(x.shape), ""],
-            [f"gate_up_proj[{expert}] x", fmt(both.shape), f"{rows_gu:,} x {width_gu:,} = {gate_up.numel():,}"],
-            ["  first half: gate", fmt(gate.shape), ""],
-            ["  second half: up", fmt(up.shape), ""],
-            ["SiLU(gate) * up", fmt(mixed.shape), "none"],
-            [f"down_proj[{expert}] (that)", fmt(result.shape), f"{rows_dn:,} x {width_dn:,} = {down.numel():,}"],
-            ["one expert", "", f"{gate_up.numel() + down.numel():,}"],
+            ["x, the normalized input", numbers(x), ""],
+            [f"gate_up_proj[{expert}] x", numbers(both), f"{rows_gu:,} x {width_gu:,} = {gate_up.numel():,}"],
+            ["  first half: gate", numbers(gate), ""],
+            ["  second half: up", numbers(up), ""],
+            ["x_mix = SiLU(gate) * up", numbers(mixed), "0 (no weights)"],
+            [f"down_proj[{expert}] x_mix", numbers(result), f"{rows_dn:,} x {width_dn:,} = {down.numel():,}"],
+            ["one expert, total", "", f"{gate_up.numel() + down.numel():,}"],
         ],
     )
     rep.kv("gate == first half of gate_up rows?", torch.equal(gate_alone, gate))
