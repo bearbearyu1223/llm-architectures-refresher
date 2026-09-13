@@ -1145,6 +1145,83 @@ def what_gets_a_gradient(rep: Report, model, tok, ids: torch.Tensor, pos: int = 
     rep.kv("dL/dW_r, by hand vs autograd", f"max difference {(by_hand - W.grad).abs().max():.1e}")
 
 
+def each_tensor_step_by_step(rep: Report, model, tok, ids: torch.Tensor, pos: int = 1) -> None:
+    """What each weight tensor in a layer computes, with shapes, on a real token.
+
+    The census counts parameters; this shows the operation each count belongs to.
+    It runs layer 0's attention projections and one chosen expert on ' harbour'
+    step by step, printing each intermediate shape next to the matrix doing the
+    work, and checks that the gate projection is the first half of gate_up_proj.
+    """
+    layer = model.model.layers[0]
+    attn, block = layer.self_attn, layer.mlp
+    hid = model.config.hidden_size
+    heads = model.config.num_attention_heads
+    head_dim = hid // heads
+    _, cap = _capture_layer0(model, ids)
+
+    # attention reads the residual stream after the input norm
+    cap_in = {}
+    hook = layer.input_layernorm.register_forward_hook(lambda mod, a, o: cap_in.__setitem__("x", o.detach()))
+    try:
+        with torch.no_grad():
+            model(ids)
+    finally:
+        hook.remove()
+    x_attn = cap_in["x"][0, pos]
+    with torch.no_grad():
+        q = attn.q_proj(x_attn)
+        q_normed = attn.q_norm(q)
+        q_heads = q_normed.view(heads, head_dim)
+
+    def fmt(shape) -> str:
+        return str(tuple(shape)).replace(" ", "")
+
+    rep.note(f"Attention's projections on {tok.decode(ids[0, pos:pos + 1])!r}, layer 0 (the query path):")
+    rep.blank()
+    rep.table(
+        ["step", "shape", "parameters"],
+        [
+            ["x = RMSNorm(h), the input", fmt(x_attn.shape), ""],
+            ["W_q x", fmt(q.shape), f"{hid:,} x {hid:,} = {hid * hid:,}"],
+            ["q_norm(W_q x)", fmt(q_normed.shape), f"{hid:,}"],
+            [f"split into {heads} heads", fmt(q_heads.shape), "none"],
+        ],
+    )
+    rep.kv("same for keys (W_k, k_norm)", f"{hid * hid + hid:,} parameters")
+    rep.kv("values (W_v) and output (W_o)", f"2 x {hid * hid:,} = {2 * hid * hid:,}")
+
+    x = cap["x"][0, pos].float()
+    expert = int(torch.topk(block.gate.weight.float() @ x, 1).indices)
+    gate_up = block.experts.gate_up_proj[expert].float()
+    down = block.experts.down_proj[expert].float()
+    with torch.no_grad():
+        both = torch.nn.functional.linear(x, gate_up)
+        gate, up = both.chunk(2, dim=-1)
+        mixed = torch.nn.functional.silu(gate) * up
+        result = torch.nn.functional.linear(mixed, down)
+        gate_alone = torch.nn.functional.linear(x, gate_up[: gate.numel()])
+    rows_gu, width_gu = gate_up.shape
+    rows_dn, width_dn = down.shape
+
+    rep.blank()
+    rep.note(f"Expert {expert}, the router's first choice, on the same token (layer 0):")
+    rep.blank()
+    rep.table(
+        ["step", "shape", "parameters"],
+        [
+            ["x = RMSNorm(h_mid), the input", fmt(x.shape), ""],
+            [f"gate_up_proj[{expert}] x", fmt(both.shape), f"{rows_gu:,} x {width_gu:,} = {gate_up.numel():,}"],
+            ["  first half: gate", fmt(gate.shape), ""],
+            ["  second half: up", fmt(up.shape), ""],
+            ["SiLU(gate) * up", fmt(mixed.shape), "none"],
+            [f"down_proj[{expert}] (that)", fmt(result.shape), f"{rows_dn:,} x {width_dn:,} = {down.numel():,}"],
+            ["one expert", "", f"{gate_up.numel() + down.numel():,}"],
+        ],
+    )
+    rep.kv("gate == first half of gate_up rows?", torch.equal(gate_alone, gate))
+
+
 # ---------------------------------------------------------------------------
 # Figures
 # ---------------------------------------------------------------------------
@@ -1853,6 +1930,8 @@ def main() -> None:
     where_the_parameters_are(rep, model)
     rep.blank()
     derive_the_census(rep, model, tok)
+    rep.blank()
+    each_tensor_step_by_step(rep, model, tok, ids)
     rep.blank()
     what_the_final_norm_does(rep, model, tok, ids)
     rep.blank()

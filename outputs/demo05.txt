@@ -86,6 +86,30 @@ device memory : 17.2 GB
   active share of total              17.04%
   active if the lookup is counted    1.28B
 
+  Attention's projections on ' harbour', layer 0 (the query path):
+
+  step                          shape                 parameters
+  ----------------------------------------------------------------
+  x = RMSNorm(h), the input   (2048,)
+  W_q x                       (2048,)  2,048 x 2,048 = 4,194,304
+  q_norm(W_q x)               (2048,)                      2,048
+  split into 16 heads        (16,128)                       none
+  same for keys (W_k, k_norm)        4,196,352 parameters
+  values (W_v) and output (W_o)      2 x 4,194,304 = 8,388,608
+
+  Expert 5, the router's first choice, on the same token (layer 0):
+
+  step                             shape                 parameters
+  -------------------------------------------------------------------
+  x = RMSNorm(h_mid), the input  (2048,)
+  gate_up_proj[5] x              (2048,)  2,048 x 2,048 = 4,194,304
+    first half: gate             (1024,)
+    second half: up              (1024,)
+  SiLU(gate) * up                (1024,)                       none
+  down_proj[5] (that)            (2048,)  2,048 x 1,024 = 2,097,152
+  one expert                                              6,291,456
+  gate == first half of gate_up rows? yes
+
   The final norm, applied to ' harbour' after the last layer:
 
   gamma, one scale per dimension     shape (2048,)
@@ -278,14 +302,14 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         448.6     1.00x
-  64                        943.5     2.10x
+  8                         420.8     1.00x
+  64                        923.2     2.19x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.10x
+  measured wall-clock ratio          2.19x
     below 8x because attention, norms and the LM head are unchanged
 
-  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
+  >> Turning every expert on costs 2.2x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 
