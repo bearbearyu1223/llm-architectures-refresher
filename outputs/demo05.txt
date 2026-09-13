@@ -117,12 +117,33 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 2. The router is the smallest part of the model    [post §2]
 --------------------------------------------------------------------------
-  router matrices                    16 (one per layer)
-  shape of each                      (64, 2048)
-  router parameters                  2.10M
-  as a share of the model            0.030%
-  router bytes (bf16)                4.0 MiB
-  everything else (bf16)             12.88 GiB
+  How big the router is, from one row up. Shape of each: (64, 2048)
+
+  step                                      result
+  --------------------------------------------------------------
+  one row: a number per model dimension      2,048  parameters
+  x 64 rows, one per expert                131,072   per layer
+  x 16 layers                            2,097,152  parameters
+  x 2 bytes each (bfloat16)              4,194,304       bytes
+  / 1,048,576 bytes in a MiB                   4.0         MiB
+
+  all parameters in the model        6,919,161,856
+  router share of them               0.030%
+  everything else, x 2 bytes         13,834,129,408 bytes
+    / 1,073,741,824 bytes in a GiB   12.88 GiB
+
+  What a score is: token 1 = ' harbour', layer 0.
+
+  expert  row . token vector, by hand  router score, from model
+  ---------------------------------------------------------------
+  5                           +1.8984                   +1.8984
+  14                          +1.6016                   +1.6016
+  41                          +1.3516                   +1.3516
+
+  token vector length                2,048 numbers
+  all 64 scores identical?           yes
+  fp32 dot products, largest shift   0.0058
+  tokens picking the same 8 in fp32  94 of 94
 
   >> One matrix per layer, 0.03% of the parameters, decides how the other
      93% are spent on every token.
@@ -226,11 +247,11 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         434.3     1.00x
-  64                        930.2     2.14x
+  8                         444.1     1.00x
+  64                        931.3     2.10x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.14x
+  measured wall-clock ratio          2.10x
     below 8x because attention, norms and the LM head are unchanged
 
   >> Turning every expert on costs 2.1x the time and 0 extra bytes of

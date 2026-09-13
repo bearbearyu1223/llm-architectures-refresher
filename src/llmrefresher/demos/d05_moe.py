@@ -384,23 +384,80 @@ def why_this_many_experts(rep: Report, model) -> None:
 # ---------------------------------------------------------------------------
 
 
-def the_router_is_tiny(rep: Report, model) -> None:
-    router = [p for n, p in model.named_parameters() if ".mlp.gate." in n]
-    total = sum(p.numel() for p in model.parameters())
-    n_router = sum(p.numel() for p in router)
-    n_exp, top_k, layers = _cfg(model)
+def the_router_is_tiny(rep: Report, model, tok, ids: torch.Tensor) -> None:
+    """The router's size, multiplied out, and a check of what its scores are.
 
-    rep.kv("router matrices", f"{len(router)} (one per layer)")
-    rep.kv("shape of each", tuple(router[0].shape))
-    rep.kv("router parameters", f"{n_router / 1e6:.2f}M")
-    rep.kv("as a share of the model", f"{100 * n_router / total:.3f}%")
-    rep.kv("router bytes (bf16)", f"{n_router * 2 / MIB:.1f} MiB")
-    # Everything that is not the router -- experts, attention, embeddings. Not
-    # labelled "expert bytes": that would assert more than the number measures.
-    rep.kv("everything else (bf16)", f"{(total - n_router) * 2 / GIB:.2f} GiB")
+    The size walk goes from one row to the byte count, each step printed, so every
+    number in the section has a visible input. The check then captures the vector
+    that actually enters layer 0's MoE block and dots each router row with it by
+    hand: the model's router scores should be exactly those dot products.
+    """
+    n_exp, top_k, layers = _cfg(model)
+    hid = model.config.hidden_size
+    routers = [p for n, p in model.named_parameters() if ".mlp.gate." in n]
+    total = sum(p.numel() for p in model.parameters())
+    per_layer = routers[0].numel()
+    n_router = sum(p.numel() for p in routers)
+    bytes_per = 2  # bfloat16
+    assert len(routers) == layers and tuple(routers[0].shape) == (n_exp, hid)
+
+    rep.note(f"How big the router is, from one row up. Shape of each: {tuple(routers[0].shape)}")
+    rep.blank()
+    rep.table(
+        ["step", "result", ""],
+        [
+            ["one row: a number per model dimension", f"{hid:,}", "parameters"],
+            [f"x {n_exp} rows, one per expert", f"{per_layer:,}", "per layer"],
+            [f"x {layers} layers", f"{n_router:,}", "parameters"],
+            [f"x {bytes_per} bytes each (bfloat16)", f"{n_router * bytes_per:,}", "bytes"],
+            [f"/ {MIB:,} bytes in a MiB", f"{n_router * bytes_per / MIB:.1f}", "MiB"],
+        ],
+    )
+    rep.blank()
+    rep.kv("all parameters in the model", f"{total:,}")
+    rep.kv("router share of them", f"{100 * n_router / total:.3f}%")
+    rep.kv("everything else, x 2 bytes", f"{(total - n_router) * bytes_per:,} bytes")
+    rep.kv("  / 1,073,741,824 bytes in a GiB", f"{(total - n_router) * bytes_per / GIB:.2f} GiB")
+
+    # What a router score is. Capture the token's vector at the input of layer 0's
+    # MoE block -- after attention and the layer norm, which is what the router sees.
+    pos = 1
+    captured = {}
+    block = model.model.layers[0].mlp
+    hook = block.register_forward_pre_hook(lambda mod, args: captured.__setitem__("x", args[0].detach()))
+    with torch.no_grad():
+        out = model(ids, output_router_logits=True)
+    hook.remove()
+    x = captured["x"][0, pos]
+    W = block.gate.weight
+    by_hand = torch.stack([torch.dot(W[e], x) for e in range(n_exp)])
+    from_model = out.router_logits[0].reshape(-1, n_exp)[pos]
+    top = torch.topk(torch.softmax(from_model.float(), dim=-1), 3).indices.tolist()
+
+    rep.blank()
+    rep.note(f"What a score is: token {pos} = {tok.decode(ids[0, pos:pos + 1])!r}, layer 0.")
+    rep.blank()
+    rep.table(
+        ["expert", "row . token vector, by hand", "router score, from model"],
+        [[e, f"{by_hand[e].float():+.4f}", f"{from_model[e].float():+.4f}"] for e in top],
+    )
+    rep.blank()
+    rep.kv("token vector length", f"{x.numel():,} numbers")
+    rep.kv(f"all {n_exp} scores identical?", torch.equal(by_hand, from_model))
+
+    # The same dot product in fp32, from the same stored numbers. bf16 holds values
+    # between 1 and 2 in steps of 1/128, so scores move; the question is whether the
+    # choice of experts does.
+    fp32 = torch.stack([torch.dot(W[e].float(), x.float()) for e in range(n_exp)])
+    all_x = captured["x"][0].float()
+    sel_bf16 = torch.topk(out.router_logits[0].reshape(-1, n_exp).float(), top_k, dim=-1).indices
+    sel_fp32 = torch.topk(all_x @ W.float().T, top_k, dim=-1).indices
+    same = sum(set(a.tolist()) == set(b.tolist()) for a, b in zip(sel_bf16, sel_fp32))
+    rep.kv("fp32 dot products, largest shift", f"{(fp32 - from_model.float()).abs().max():.4f}")
+    rep.kv("tokens picking the same 8 in fp32", f"{same} of {ids.shape[1]}")
     rep.takeaway(
-        "One matrix per layer, 0.03% of the parameters, decides how the other "
-        "93% are spent on every token."
+        f"One matrix per layer, {100 * n_router / total:.2f}% of the parameters, decides how the "
+        "other 93% are spent on every token."
     )
 
 
@@ -1519,7 +1576,7 @@ def main() -> None:
     why_this_many_experts(rep, model)
 
     rep.section("2. The router is the smallest part of the model    [post §2]")
-    the_router_is_tiny(rep, model)
+    the_router_is_tiny(rep, model, tok, ids)
 
     logits = route(model, ids)
 
