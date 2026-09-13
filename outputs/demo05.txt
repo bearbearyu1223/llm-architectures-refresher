@@ -46,6 +46,20 @@ device memory : 17.2 GB
   two layer norms               2 x (2048)        4,096
   one layer                                 419,569,664
 
+  The tensors outside the layers:
+
+  tensor                shape   parameters
+  ------------------------------------------
+  embed_tokens  (50304, 2048)  103,022,592
+  lm_head       (50304, 2048)  103,022,592
+  final norm           (2048)        2,048
+
+  tokens the tokenizer defines       50,280
+  rows in each table                 50,304
+  rows no token can select           24
+  rows, as a multiple of 128         393 x 128
+  embedding and LM head tied?        no
+
   Each role across all 16 layers, plus what sits outside them:
 
   role            per layer           x 16      outside          total
@@ -56,7 +70,6 @@ device memory : 17.2 GB
   norms               4,096         65,536        2,048         67,584
   embed + head                              206,045,184    206,045,184
   TOTAL                                                  6,919,161,856
-  embedding and LM head tied?        no
   equals the checkpoint's count?     yes
 
   What one token's arithmetic uses:
@@ -213,14 +226,14 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         409.1     1.00x
-  64                        965.6     2.36x
+  8                         434.3     1.00x
+  64                        930.2     2.14x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.36x
+  measured wall-clock ratio          2.14x
     below 8x because attention, norms and the LM head are unchanged
 
-  >> Turning every expert on costs 2.4x the time and 0 extra bytes of
+  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 

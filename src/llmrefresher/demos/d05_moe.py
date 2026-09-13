@@ -212,7 +212,7 @@ def where_the_parameters_are(rep: Report, model) -> None:
     )
 
 
-def derive_the_census(rep: Report, model) -> None:
+def derive_the_census(rep: Report, model, tok) -> None:
     """Every census number, multiplied out from the tensor shapes.
 
     Reads the shapes from layer 0 rather than from the config, so the arithmetic
@@ -268,6 +268,30 @@ def derive_the_census(rep: Report, model) -> None:
     head = n("lm_head.weight")
     final_norm = n("model.norm.weight")
     tied = params["model.embed_tokens.weight"].data_ptr() == params["lm_head.weight"].data_ptr()
+
+    # The tables have one row per token id, but not one row per token: the
+    # tokenizer defines fewer tokens than the tables have rows. OLMo's training
+    # code pads the embedding to the next multiple of 128 for throughput, so the
+    # extra rows exist and are counted, but no token can ever select them.
+    rows = params["model.embed_tokens.weight"].shape[0]
+    tokens = len(tok)
+    rep.blank()
+    rep.note("The tensors outside the layers:")
+    rep.blank()
+    rep.table(
+        ["tensor", "shape", "parameters"],
+        [
+            ["embed_tokens", shape("model.embed_tokens.weight"), f"{embed:,}"],
+            ["lm_head", shape("lm_head.weight"), f"{head:,}"],
+            ["final norm", shape("model.norm.weight"), f"{final_norm:,}"],
+        ],
+    )
+    rep.blank()
+    rep.kv("tokens the tokenizer defines", f"{tokens:,}")
+    rep.kv("rows in each table", f"{rows:,}")
+    rep.kv("rows no token can select", f"{rows - tokens:,}")
+    rep.kv("rows, as a multiple of 128", f"{rows // 128} x 128" if rows % 128 == 0 else "not a multiple")
+    rep.kv("embedding and LM head tied?", tied)
     role_total = {
         "experts": per_layer["experts"] * layers,
         "attention": per_layer["attention"] * layers,
@@ -289,7 +313,6 @@ def derive_the_census(rep: Report, model) -> None:
             ["TOTAL", "", "", "", f"{sum(role_total.values()):,}"],
         ],
     )
-    rep.kv("embedding and LM head tied?", tied)
     rep.kv("equals the checkpoint's count?", sum(role_total.values()) == total)
 
     per_expert = per_layer["experts"] // n_exp
@@ -1489,7 +1512,7 @@ def main() -> None:
     rep.section("1. Where the parameters actually are               [post §1]")
     where_the_parameters_are(rep, model)
     rep.blank()
-    derive_the_census(rep, model)
+    derive_the_census(rep, model, tok)
     rep.blank()
     rep.note("Why 64 experts and 8 per token, rather than 8 and 2?")
     rep.blank()
