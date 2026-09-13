@@ -86,30 +86,22 @@ device memory : 17.2 GB
   active share of total              17.04%
   active if the lookup is counted    1.28B
 
-  Every weight in layer 0's attention, and what it computes:
+  Layer 0's attention on ' harbour', step by step:
 
-  computes                     weight   rows x width  parameters
-  ----------------------------------------------------------------
-  query = W_q x                   W_q  2,048 x 2,048   4,194,304
-  query = RMSNorm(query)       q_norm   2,048 scales       2,048
-  key = W_k x                     W_k  2,048 x 2,048   4,194,304
-  key = RMSNorm(key)           k_norm   2,048 scales       2,048
-  value = W_v x                   W_v  2,048 x 2,048   4,194,304
-  output = W_o (heads joined)     W_o  2,048 x 2,048   4,194,304
-  total                                               16,781,312
+  step                              result                 parameters
+  ---------------------------------------------------------------------
+  x, the normalized input    2,048 numbers
+  q = W_q x                  2,048 numbers  2,048 x 2,048 = 4,194,304
+  q = q_norm(q)              2,048 numbers                      2,048
+  k = W_k x, then k_norm     2,048 numbers          4,194,304 + 2,048
+  v = W_v x                  2,048 numbers  2,048 x 2,048 = 4,194,304
+  split q, k, v into heads  16 heads x 128             0 (no weights)
+  attention in each head    16 heads x 128             0 (no weights)
+  join the heads             2,048 numbers             0 (no weights)
+  output = W_o (joined)      2,048 numbers  2,048 x 2,048 = 4,194,304
+  attention, total                                         16,781,312
   equals the census, per layer?      yes
 
-  One token's query path, measured on ' harbour':
-
-  step                                 result
-  ---------------------------------------------
-  x, the normalized input       2,048 numbers
-  W_q x                         2,048 numbers
-  after q_norm                  2,048 numbers
-  split into heads             16 heads x 128
-  attention runs in each head
-  the heads' results, joined    2,048 numbers
-  after W_o                     2,048 numbers
 
   Expert 5, the router's first choice, on the same token (layer 0):
 
@@ -316,11 +308,11 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         420.2     1.00x
-  64                        919.7     2.19x
+  8                         421.2     1.00x
+  64                        929.1     2.21x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.19x
+  measured wall-clock ratio          2.21x
     below 8x because attention, norms and the LM head are unchanged
 
   >> Turning every expert on costs 2.2x the time and 0 extra bytes of

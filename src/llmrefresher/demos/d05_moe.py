@@ -1176,55 +1176,42 @@ def each_tensor_step_by_step(rep: Report, model, tok, ids: torch.Tensor, pos: in
             h.remove()
     x_attn = cap_in["x"][0, pos]
     with torch.no_grad():
-        q = attn.q_proj(x_attn)
-        q_normed = attn.q_norm(q)
-        q_heads = q_normed.view(heads, head_dim)
+        q = attn.q_norm(attn.q_proj(x_attn))
+        k = attn.k_norm(attn.k_proj(x_attn))
+        v = attn.v_proj(x_attn)
+    joined = cap_in["joined"][0, pos]
+    out = cap_in["out"][0, pos]
 
     def numbers(t_: torch.Tensor) -> str:
         return f"{t_.numel():,} numbers" if t_.dim() == 1 else f"{t_.shape[0]} heads x {t_.shape[1]}"
 
-    # Table 1: every weight attention owns, what it computes, and its count. The
-    # total must equal the census's attention row, or the two views disagree.
-    weights = [
-        ("W_q", "query = W_q x", attn.q_proj.weight),
-        ("q_norm", "query = RMSNorm(query)", attn.q_norm.weight),
-        ("W_k", "key = W_k x", attn.k_proj.weight),
-        ("k_norm", "key = RMSNorm(key)", attn.k_norm.weight),
-        ("W_v", "value = W_v x", attn.v_proj.weight),
-        ("W_o", "output = W_o (heads joined)", attn.o_proj.weight),
+    def matrix(w: torch.Tensor) -> str:
+        return f"{w.shape[0]:,} x {w.shape[1]:,} = {w.numel():,}"
+
+    # One table, in forward-pass order. Each row is a step, the size it produces,
+    # and the parameters its weight adds; steps with no weight add 0. The column
+    # sums to the census's attention row, which is what this receipt exists for.
+    no_weights = "0 (no weights)"
+    rows = [
+        ["x, the normalized input", numbers(x_attn), ""],
+        ["q = W_q x", numbers(q), matrix(attn.q_proj.weight)],
+        ["q = q_norm(q)", numbers(q), f"{attn.q_norm.weight.numel():,}"],
+        ["k = W_k x, then k_norm", numbers(k),
+         f"{attn.k_proj.weight.numel():,} + {attn.k_norm.weight.numel():,}"],
+        ["v = W_v x", numbers(v), matrix(attn.v_proj.weight)],
+        ["split q, k, v into heads", numbers(q.view(heads, head_dim)), no_weights],
+        ["attention in each head", numbers(joined.view(heads, head_dim)), no_weights],
+        ["join the heads", numbers(joined), no_weights],
+        ["output = W_o (joined)", numbers(out), matrix(attn.o_proj.weight)],
     ]
-
-    def dims(w: torch.Tensor) -> str:
-        return f"{w.shape[0]:,} x {w.shape[1]:,}" if w.dim() == 2 else f"{w.shape[0]:,} scales"
-
-    attn_total = sum(w.numel() for _, _, w in weights)
+    attn_total = sum(w.numel() for w in (attn.q_proj.weight, attn.q_norm.weight, attn.k_proj.weight,
+                                         attn.k_norm.weight, attn.v_proj.weight, attn.o_proj.weight))
     census_attn = _census(model).attention // model.config.num_hidden_layers
-    rep.note("Every weight in layer 0's attention, and what it computes:")
+    rep.note(f"Layer 0's attention on {tok.decode(ids[0, pos:pos + 1])!r}, step by step:")
     rep.blank()
-    rep.table(
-        ["computes", "weight", "rows x width", "parameters"],
-        [[what, name, dims(w), f"{w.numel():,}"] for name, what, w in weights]
-        + [["total", "", "", f"{attn_total:,}"]],
-    )
+    rep.table(["step", "result", "parameters"], rows + [["attention, total", "", f"{attn_total:,}"]])
     rep.kv("equals the census, per layer?", attn_total == census_attn)
-
-    # Table 2: one token's query, measured at each step. Shapes only; the
-    # parameters are all in table 1.
     rep.blank()
-    rep.note(f"One token's query path, measured on {tok.decode(ids[0, pos:pos + 1])!r}:")
-    rep.blank()
-    rep.table(
-        ["step", "result"],
-        [
-            ["x, the normalized input", numbers(x_attn)],
-            ["W_q x", numbers(q)],
-            ["after q_norm", numbers(q_normed)],
-            ["split into heads", numbers(q_heads)],
-            ["attention runs in each head", ""],
-            ["the heads' results, joined", numbers(cap_in["joined"][0, pos])],
-            ["after W_o", numbers(cap_in["out"][0, pos])],
-        ],
-    )
 
     x = cap["x"][0, pos].float()
     expert = int(torch.topk(block.gate.weight.float() @ x, 1).indices)
