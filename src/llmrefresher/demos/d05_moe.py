@@ -589,23 +589,31 @@ def the_router_is_tiny(rep: Report, model, tok, ids: torch.Tensor) -> None:
     rep.note(f"What a score is: token {pos} = {tok.decode(ids[0, pos:pos + 1])!r}, layer 0.")
     rep.blank()
     rep.table(
-        ["expert", "row . token vector, by hand", "router score, from model"],
+        ["expert", "2,048 products added, by hand", "score from the model"],
         [[e, f"{by_hand[e].float():+.4f}", f"{from_model[e].float():+.4f}"] for e in top],
     )
     rep.blank()
-    rep.kv("token vector length", f"{x.numel():,} numbers")
-    rep.kv(f"all {n_exp} scores identical?", torch.equal(by_hand, from_model))
+    n_match = int((by_hand == from_model).sum())
+    rep.kv("experts with matching scores", f"{n_match} of {n_exp}")
 
-    # The same dot product in fp32, from the same stored numbers. bf16 holds values
-    # between 1 and 2 in steps of 1/128, so scores move; the question is whether the
-    # choice of experts does.
-    fp32 = torch.stack([torch.dot(W[e].float(), x.float()) for e in range(n_exp)])
+    # The same dot products in fp32, from the same stored weights and inputs. bf16
+    # holds values between 1 and 2 in steps of 1/128, so scores move; the question
+    # is whether the choice of experts does.
+    best = from_model[top[0]].float().item()
+    assert 1 <= best < 2 and (best * 128).is_integer()
     all_x = captured["x"][0].float()
-    sel_bf16 = torch.topk(out.router_logits[0].reshape(-1, n_exp).float(), top_k, dim=-1).indices
-    sel_fp32 = torch.topk(all_x @ W.float().T, top_k, dim=-1).indices
+    bf16_all = out.router_logits[0].reshape(-1, n_exp).float()
+    fp32_all = all_x @ W.float().T
+    sel_bf16 = torch.topk(bf16_all, top_k, dim=-1).indices
+    sel_fp32 = torch.topk(fp32_all, top_k, dim=-1).indices
     same = sum(set(a.tolist()) == set(b.tolist()) for a, b in zip(sel_bf16, sel_fp32, strict=True))
-    rep.kv("fp32 dot products, largest shift", f"{(fp32 - from_model.float()).abs().max():.4f}")
-    rep.kv("tokens picking the same 8 in fp32", f"{same} of {ids.shape[1]}")
+    rep.blank()
+    rep.note("The same scores redone in fp32, every token of the passage, layer 0:")
+    rep.blank()
+    rep.kv(f"score {best:+.4f}, as bf16 stores it", f"{int(best * 128)} / 128")
+    rep.kv("tokens in the passage", f"{ids.shape[1]}")
+    rep.kv("largest change in any score", f"{(fp32_all - bf16_all).abs().max():.4f}")
+    rep.kv(f"tokens with the same {top_k} experts", f"{same} of {ids.shape[1]}")
     rep.takeaway(
         f"One matrix per layer, {100 * n_router / total:.2f}% of the parameters, decides how the "
         "other 93% are spent on every token."

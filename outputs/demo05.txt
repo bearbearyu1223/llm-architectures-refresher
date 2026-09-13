@@ -96,16 +96,20 @@ device memory : 17.2 GB
 
   What a score is: token 1 = ' harbour', layer 0.
 
-  expert  row . token vector, by hand  router score, from model
-  ---------------------------------------------------------------
-  5                           +1.8984                   +1.8984
-  14                          +1.6016                   +1.6016
-  41                          +1.3516                   +1.3516
+  expert  2,048 products added, by hand  score from the model
+  -------------------------------------------------------------
+  5                             +1.8984               +1.8984
+  14                            +1.6016               +1.6016
+  41                            +1.3516               +1.3516
 
-  token vector length                2,048 numbers
-  all 64 scores identical?           yes
-  fp32 dot products, largest shift   0.0058
-  tokens picking the same 8 in fp32  94 of 94
+  experts with matching scores       64 of 64
+
+  The same scores redone in fp32, every token of the passage, layer 0:
+
+  score +1.8984, as bf16 stores it   243 / 128
+  tokens in the passage              94
+  largest change in any score        0.0114
+  tokens with the same 8 experts     94 of 94
 
   >> One matrix per layer, 0.03% of the parameters, decides how the other
      93% are spent on every token.
@@ -227,14 +231,14 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         426.1     1.00x
-  64                        915.5     2.15x
+  8                         420.8     1.00x
+  64                        917.5     2.18x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.15x
+  measured wall-clock ratio          2.18x
     below 8x because attention, norms and the LM head are unchanged
 
-  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
+  >> Turning every expert on costs 2.2x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 
