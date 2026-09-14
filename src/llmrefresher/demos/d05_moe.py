@@ -747,6 +747,7 @@ def what_the_router_learns(
     usage: dict[str, torch.Tensor] = {}
     halves: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     rows = []
+    n_tokens: dict[str, int] = {}
     for name, text in DOMAINS.items():
         ids = tok(text, return_tensors="pt").input_ids.to(model.device)
         idx = _topk_idx(route(model, ids), top_k)
@@ -756,54 +757,76 @@ def what_the_router_learns(
             _usage_from_idx(idx[:, :mid], n_exp),
             _usage_from_idx(idx[:, mid:], n_exp),
         )
-        rows.append([name, ids.shape[1]])
-    rep.table(["passage", "tokens"], rows)
+        n_tokens[name] = ids.shape[1]
+        rows.append([name, ids.shape[1], f"{ids.shape[1] * top_k:,}"])
+    rep.table(["passage", "tokens", f"routing slots per layer (x {top_k})"], rows)
+
+    # What an expert-usage distribution is: each passage's share of routing
+    # slots per expert, in the last layer. A few experts only, plus the most
+    # code-leaning one, which the lines further down pick out.
+    last = layers - 1
+    code_u, prose_u = usage["code"][last], usage["prose"][last]
+    expert = int((code_u - prose_u).argmax())
+    shown = sorted({0, 1, 2, expert, n_exp - 1})
+    rep.blank()
+    rep.note(f"Expert usage in layer {last}: each passage's share of its routing slots.")
+    rep.blank()
+    rep.table(
+        ["expert"] + list(DOMAINS),
+        [[e] + [f"{100 * usage[n][last, e]:.2f}%" for n in DOMAINS] for e in shown]
+        + [["all 64"] + ["100.00%" for _ in DOMAINS]],
+    )
+    assert all(abs(usage[n][last].sum().item() - 1) < 1e-5 for n in DOMAINS)
 
     floor = torch.stack([_tv(a, b) for a, b in halves.values()]).mean(dim=0)
-    rep.blank()
-    rep.note("Total variation distance between expert-usage distributions:")
-    rep.note("0.00 = the two samples used the experts identically.")
-    rep.note("The first row is the noise floor -- two halves of the SAME")
-    rep.note("passage, which differ only by sampling. Read every other row")
-    rep.note("against it.")
-    rep.blank()
-
-    show = [0, layers // 2, layers - 1]
     pairs = [("prose", "code"), ("prose", "math"), ("code", "math")]
-    table = [
-        ["same passage, split"] + [f"{floor[i]:.3f}" for i in show] + [f"{floor.mean():.3f}"]
-    ]
-    for a, b in pairs:
-        d = _tv(usage[a], usage[b])
-        table.append(
-            [f"{a} vs {b}"] + [f"{d[i]:.3f}" for i in show] + [f"{d.mean():.3f}"]
-        )
-    rep.table(["comparison"] + [f"layer {i}" for i in show] + ["mean"], table)
+    dists = {f"{a}/{b}": _tv(usage[a], usage[b]) for a, b in pairs}
+    cross = torch.stack(list(dists.values())).mean(dim=0)
 
-    cross = torch.stack([_tv(usage[a], usage[b]) for a, b in pairs]).mean(dim=0)
+    rep.blank()
+    rep.note("Total variation distance, every layer. 0 = identical usage, 1 = no")
+    rep.note("expert in common. 'noise' is two halves of the same passage,")
+    rep.note("averaged over the three passages; 'cross' averages the three pairs.")
+    rep.blank()
+    table = [
+        [i, f"{floor[i]:.3f}"] + [f"{d[i]:.3f}" for d in dists.values()]
+        + [f"{cross[i]:.3f}", f"{cross[i] / floor[i]:.1f}x"]
+        for i in range(layers)
+    ]
+    table.append(
+        ["mean", f"{floor.mean():.3f}"] + [f"{d.mean():.3f}" for d in dists.values()]
+        + [f"{cross.mean():.3f}", f"{cross.mean() / floor.mean():.2f}x"]
+    )
+    rep.table(["layer", "noise"] + list(dists) + ["cross", "cross/noise"], table)
+
     rep.blank()
     rep.kv("noise floor, mean over layers", f"{floor.mean():.3f}")
     rep.kv("cross-domain, mean over layers", f"{cross.mean():.3f}")
     rep.kv("cross-domain over noise floor", f"{cross.mean() / floor.mean():.2f}x")
 
+    rep.blank()
+    rep.table(
+        ["", "layer 0", f"layer {last}"],
+        [
+            ["noise floor", f"{floor[0]:.3f}", f"{floor[-1]:.3f}"],
+            ["cross-domain distance", f"{cross[0]:.3f}", f"{cross[-1]:.3f}"],
+            ["cross-domain / noise", f"{cross[0] / floor[0]:.1f}x", f"{cross[-1] / floor[-1]:.1f}x"],
+        ],
+    )
+
     # The most domain-skewed expert in the deepest layer. Reported as two shares
     # rather than a ratio: the prose share is often exactly zero, and a ratio
     # against zero is an artifact of whatever epsilon you added, not a finding.
-    last = layers - 1
-    code_u, prose_u = usage["code"][last], usage["prose"][last]
-    expert = int((code_u - prose_u).argmax())
+    slots = {n: n_tokens[n] * top_k for n in DOMAINS}
     rep.blank()
-    rep.kv(f"most code-leaning expert (layer {last})", expert)
-    rep.kv("  share of code routing slots", f"{100 * code_u[expert]:.2f}%")
-    rep.kv("  share of prose routing slots", f"{100 * prose_u[expert]:.2f}%")
+    rep.note(f"The expert whose share rises most from prose to code, layer {last}:")
+    rep.blank()
+    rep.kv("expert", expert)
+    for n in ("code", "prose", "math"):
+        u = usage[n][last, expert].item()
+        rep.kv(f"  {n} slots it received", f"{round(u * slots[n])} of {slots[n]:,} = {100 * u:.2f}%")
     rep.kv("  an even share would be", f"{100 / n_exp:.2f}%")
-    rep.kv("experts unused by prose but used by code", int(((prose_u == 0) & (code_u > 0)).sum()))
-
-    rep.blank()
-    rep.kv("noise floor, first layer", f"{floor[0]:.3f}")
-    rep.kv("cross-domain, first layer", f"{cross[0]:.3f}")
-    rep.kv("noise floor, last layer", f"{floor[-1]:.3f}")
-    rep.kv("cross-domain, last layer", f"{cross[-1]:.3f}")
+    rep.kv("experts code uses, prose never", int(((prose_u == 0) & (code_u > 0)).sum()))
     rep.takeaway(
         f"Two halves of one passage differ by {floor.mean():.2f}; two different "
         f"kinds of text differ by {cross.mean():.2f}, "
