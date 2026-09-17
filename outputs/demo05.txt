@@ -257,21 +257,21 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         433.5     1.00x
-  64                        947.0     2.18x
+  8                         434.5     1.00x
+  64                        929.4     2.14x
 
   expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.18x
+  measured wall-clock ratio          2.14x
     below 8x because attention, norms and the LM head are unchanged
 
-  >> Turning every expert on costs 2.2x the time and 0 extra bytes of
+  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 
 --------------------------------------------------------------------------
 6. Sparsity does not survive a batch                [post §6]
 --------------------------------------------------------------------------
-  passage                            356 tokens
+  passage                            356 tokens, English prose
 
   tokens together  experts needed  of 64  expert-slots used
   -----------------------------------------------------------
@@ -297,10 +297,31 @@ device memory : 17.2 GB
      property of a token, not of a batch — which is why an MoE saves
      arithmetic but not memory.
 
+  Batches of three passages routed as separate requests, then
+  interleaved. One domain: three parts of the same prose. Three
+  domains: the prose, code and mathematics of §4.
+
+  tokens from each passage           94
+
+  tokens together  one domain  three domains  difference
+  --------------------------------------------------------
+  2                      14.1           14.7        +0.5
+  4                      22.4           23.7        +1.4
+  8                      32.4           34.9        +2.5
+  16                     42.2           46.6        +4.4
+  32                     49.9           55.3        +5.4
+  64                     55.5           60.2        +4.8
+  128                    59.0           62.3        +3.2
+  256                    61.5           63.7        +2.2
+
+  >> Mixing domains needs more experts, not fewer: at 32 tokens together,
+     55.3 of 64 against 49.9. Measuring on one passage understates how
+     fast sparsity goes.
+
 --------------------------------------------------------------------------
 7. When the model spans many GPUs                   [post §7]
 --------------------------------------------------------------------------
-  passage                            356 tokens
+  passage                            356 tokens, English prose
 
   GPUs  experts each  GPUs per token  of all  tokens needing all
   ----------------------------------------------------------------
@@ -316,7 +337,7 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 8. Nothing balances the load for free               [post §8]
 --------------------------------------------------------------------------
-  passage                            356 tokens
+  passage                            356 tokens, English prose
   routing slots per layer            2848
 
   layer  busiest  quietest  busiest vs even  coeff of var

@@ -8,7 +8,15 @@ a hand-built case whose answer is known without running the function.
 
 import torch
 
-from llmrefresher.demos.d05_moe import _tv, _topk_idx, _usage_from_idx, expert_union, gpu_spread
+from llmrefresher.demos.d05_moe import (
+    _topk_idx,
+    _tv,
+    _usage_from_idx,
+    expert_union,
+    gpu_spread,
+    interleave,
+    split_sentences,
+)
 
 
 def idx(rows):
@@ -74,3 +82,43 @@ def test_total_variation_bounds():
     a = torch.tensor([[1.0, 0.0]])
     assert _tv(a, a).item() == 0.0
     assert _tv(a, torch.tensor([[0.0, 1.0]])).item() == 1.0
+
+
+def test_interleave_takes_one_token_from_each_source_in_turn():
+    a = idx([[0, 1], [2, 3]])
+    b = idx([[4, 5], [6, 7]])
+    out = interleave([a, b])
+    assert out.shape == (1, 4, 2)
+    assert out[0].tolist() == [[0, 1], [4, 5], [2, 3], [6, 7]]
+
+
+def test_interleave_truncates_to_the_shortest_source():
+    short = idx([[0, 1]])
+    long = idx([[2, 3], [4, 5], [6, 7]])
+    out = interleave([short, long])
+    # one token each, so the long passage's extra tokens are dropped
+    assert out.shape[1] == 2
+    assert out[0].tolist() == [[0, 1], [2, 3]]
+
+
+def test_interleaved_window_holds_every_source_equally():
+    # three sources that share no experts: a window of 3 must need all of them
+    srcs = [idx([[0], [1]]), idx([[2], [3]]), idx([[4], [5]])]
+    assert expert_union(interleave(srcs), window=3) == 3
+
+
+def test_split_sentences_returns_the_requested_number_of_parts():
+    text = "One. Two. Three. Four. Five. Six."
+    assert len(split_sentences(text, 3)) == 3
+
+
+def test_split_sentences_loses_no_text():
+    text = "One. Two. Three. Four. Five. Six."
+    parts = split_sentences(text, 3)
+    assert "".join(parts).split() == text.split()
+
+
+def test_split_sentences_never_starts_a_part_mid_sentence():
+    text = "Alpha beta. Gamma delta. Epsilon zeta. Eta theta."
+    for part in split_sentences(text, 2):
+        assert part.strip()[0].isupper()

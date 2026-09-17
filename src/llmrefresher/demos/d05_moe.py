@@ -242,6 +242,43 @@ def expert_union(idx: torch.Tensor, window: int) -> float:
     return sum(counts) / len(counts)
 
 
+def split_sentences(text: str, parts: int) -> list[str]:
+    """Cut `text` into `parts` chunks at sentence ends, as even as possible.
+
+    Used to turn one long passage into several independent "requests" of the
+    same domain, so a same-domain batch can be assembled the same way a
+    mixed-domain one is. Splits only at ". " so no chunk starts mid-sentence.
+    """
+    chunks = text.split(". ")
+    pieces = [c + ". " for c in chunks[:-1]] + [chunks[-1]]
+    # Assign each sentence by where it starts in the text rather than filling
+    # parts to a target in order: filling overshoots on long sentences and
+    # leaves the last part far shorter than the rest.
+    out = ["" for _ in range(parts)]
+    seen = 0
+    for piece in pieces:
+        out[min(parts - 1, seen * parts // len(text))] += piece
+        seen += len(piece)
+    return out
+
+
+def interleave(idxs: list[torch.Tensor], cap: int | None = None) -> torch.Tensor:
+    """Round-robin one batch out of several independently routed passages.
+
+    Each passage is truncated to the shortest (or to `cap`) so all contribute
+    equally, then tokens are taken one from each in turn. Any window of the
+    result therefore holds every source in equal proportion, which is what
+    batching separate requests together looks like. Pass the same `cap` to two
+    groups being compared, or they average over different numbers of windows.
+    Deterministic: this is a receipt, not a draw.
+    """
+    n = min(t.shape[1] for t in idxs)
+    if cap is not None:
+        n = min(n, cap)
+    stacked = torch.stack([t[:, :n] for t in idxs], dim=2)
+    return stacked.reshape(stacked.shape[0], n * len(idxs), -1)
+
+
 def gpu_spread(idx: torch.Tensor, n_exp: int, n_gpus: int) -> tuple[float, float]:
     """(mean GPUs a token must reach, share of tokens reaching all of them).
 
@@ -934,6 +971,36 @@ def batch_collapse(rep: Report, model, logits: torch.Tensor) -> list[tuple[int, 
         f"which is why an MoE saves arithmetic but not memory."
     )
     return curve
+
+
+def batch_composition(
+    rep: Report, model, same_idx: torch.Tensor, mixed_idx: torch.Tensor
+) -> None:
+    """Does a batch drawn from several domains need more experts than one domain?
+
+    The curve above is measured on a single English passage, which is the
+    friendly case: §4 showed that different kinds of text route differently, so
+    a batch that mixes them should need more of the experts, not fewer. Both
+    columns here are built the same way -- three passages routed as separate
+    requests, then interleaved -- so the only difference between them is
+    whether those three passages share a domain.
+    """
+    rows = []
+    for n in (2, 4, 8, 16, 32, 64, 128, 256):
+        if n > same_idx.shape[1]:
+            break
+        one = expert_union(same_idx, n)
+        mix = expert_union(mixed_idx, n)
+        rows.append([n, f"{one:.1f}", f"{mix:.1f}", f"{mix - one:+.1f}"])
+    rep.table(
+        ["tokens together", "one domain", "three domains", "difference"], rows
+    )
+    biggest = max(rows, key=lambda r: float(r[3]))
+    rep.takeaway(
+        f"Mixing domains needs more experts, not fewer: at {biggest[0]} tokens "
+        f"together, {biggest[2]} of 64 against {biggest[1]}. Measuring on one "
+        f"passage understates how fast sparsity goes."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2231,17 +2298,39 @@ def main() -> None:
     long_logits = route(model, long_ids)
 
     rep.section("6. Sparsity does not survive a batch                [post §6]")
-    rep.kv("passage", f"{long_ids.shape[1]} tokens")
+    rep.kv("passage", f"{long_ids.shape[1]} tokens, English prose")
     rep.blank()
     curve = batch_collapse(rep, model, long_logits)
 
+    # The curve above is one domain. Batch three passages of the same domain
+    # against three of different domains, assembled identically, so the
+    # comparison isolates the domain mix and nothing else.
+    rep.blank()
+    rep.note("Batches of three passages routed as separate requests, then")
+    rep.note("interleaved. One domain: three parts of the same prose. Three")
+    rep.note("domains: the prose, code and mathematics of §4.")
+    rep.blank()
+    def routed(text: str) -> torch.Tensor:
+        ids = tok(text, return_tensors="pt").input_ids.to(device)
+        return _topk_idx(route(model, ids), top_k)
+
+    same_parts = [routed(part) for part in split_sentences(LONG_PROSE, 3)]
+    mixed_parts = [routed(text) for text in (PROSE, CODE, MATH)]
+    # One cap across both groups: matched token counts, matched window counts.
+    cap = min(t.shape[1] for t in same_parts + mixed_parts)
+    same_idx = interleave(same_parts, cap)
+    mixed_idx = interleave(mixed_parts, cap)
+    rep.kv("tokens from each passage", f"{cap}")
+    rep.blank()
+    batch_composition(rep, model, same_idx, mixed_idx)
+
     rep.section("7. When the model spans many GPUs                   [post §7]")
-    rep.kv("passage", f"{long_ids.shape[1]} tokens")
+    rep.kv("passage", f"{long_ids.shape[1]} tokens, English prose")
     rep.blank()
     experts_across_gpus(rep, model, long_logits)
 
     rep.section("8. Nothing balances the load for free               [post §8]")
-    rep.kv("passage", f"{long_ids.shape[1]} tokens")
+    rep.kv("passage", f"{long_ids.shape[1]} tokens, English prose")
     rep.kv("routing slots per layer", f"{long_ids.shape[1] * top_k}")
     rep.blank()
     load_balance(rep, model, long_logits)
