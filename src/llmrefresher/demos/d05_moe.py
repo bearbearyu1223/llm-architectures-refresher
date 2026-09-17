@@ -997,6 +997,9 @@ def batch_collapse(rep: Report, model, logits: torch.Tensor) -> list[tuple[int, 
     rep.table(
         ["tokens together", "experts needed", "of 64", "expert-slots used"], rows
     )
+    rep.note("  'experts needed' is a mean over consecutive blocks of that size")
+    rep.note(f"  and all {layers} layers, so it is not a whole number.")
+    rep.note(f"  'expert-slots used' is the block size x {top_k}.")
 
     # How the batch is computed: one call per expert, on the tokens routed to it.
     per_expert = torch.bincount(idx[0].flatten().cpu(), minlength=n_exp)
@@ -1073,6 +1076,10 @@ def experts_across_gpus(rep: Report, model, logits: torch.Tensor) -> list[tuple[
         ["GPUs", "experts each", "GPUs per token", "of all", "tokens needing all"],
         rows,
     )
+    rep.note("  experts are dealt to GPUs in contiguous blocks, as expert")
+    rep.note("  parallelism does. 'GPUs per token' counts the distinct GPUs one")
+    rep.note(f"  token's {top_k} experts land on, averaged over every token and")
+    rep.note(f"  all {layers} layers; 'of all' is that as a share of the GPUs there are.")
     rep.takeaway(
         f"Split across 8 GPUs, one token's {top_k} experts land on "
         f"{curve[2][1]:.1f} of them on average. Expert parallelism moves tokens "

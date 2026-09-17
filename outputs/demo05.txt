@@ -274,11 +274,11 @@ device memory : 17.2 GB
 
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         420.8     1.00x
-  64                        930.0     2.21x
+  8                         439.7     1.00x
+  64                        932.2     2.12x
 
   expert arithmetic ratio            8x
-  measured wall-clock ratio          2.21x
+  measured wall-clock ratio          2.12x
     below 8x because attention, norms and the LM head are unchanged
 
   Why it replaces neither dense model it sounds like:
@@ -291,7 +291,7 @@ device memory : 17.2 GB
     so it needs 5.9x the memory of a dense model
     its active size, while doing a fraction of a 6.9B model's work
 
-  >> Turning every expert on costs 2.2x the time and 0 extra bytes of
+  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 
@@ -311,6 +311,9 @@ device memory : 17.2 GB
   64                         53.9    84%                512
   128                        58.0    91%               1024
   256                        60.9    95%               2048
+    'experts needed' is a mean over consecutive blocks of that size
+    and all 16 layers, so it is not a whole number.
+    'expert-slots used' is the block size x 8.
 
   Computing all 356 tokens at once, layer 0 makes one call per expert:
 
@@ -356,6 +359,10 @@ device memory : 17.2 GB
   4               16            3.67     92%                 68%
   8                8            5.54     69%                  0%
   16               4            6.84     43%                  0%
+    experts are dealt to GPUs in contiguous blocks, as expert
+    parallelism does. 'GPUs per token' counts the distinct GPUs one
+    token's 8 experts land on, averaged over every token and
+    all 16 layers; 'of all' is that as a share of the GPUs there are.
 
   >> Split across 8 GPUs, one token's 8 experts land on 5.5 of them on
      average. Expert parallelism moves tokens between GPUs, and the router
