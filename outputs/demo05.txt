@@ -251,20 +251,47 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 5. Two bills: memory and time                       [post §5]
 --------------------------------------------------------------------------
-  weights resident (bf16)            12.89 GiB
+  Memory is billed on every parameter, run or not:
+
+  step                                    result
+  ------------------------------------------------------------
+  parameters in the model          6,919,161,856  parameters
+  x 2 bytes each (bfloat16)       13,838,323,712       bytes
+  / 1,073,741,824 bytes in a GiB           12.89         GiB
+
     every expert must be in memory; the router picks at run time,
     so there is no subset you could have left on disk.
 
+  Time is billed on what a token multiplies by. Changing k changes
+  the expert term and nothing else:
+
+  step                             result
+  -----------------------------------------------------
+  one expert                    6,291,456  parameters
+  x 8 chosen per token         50,331,648  parameters
+  x 64 if every expert ran    402,653,184  parameters
+  ratio of expert arithmetic           8x
+
   experts per token  forward (ms)  vs top-8
   -------------------------------------------
-  8                         434.5     1.00x
-  64                        929.4     2.14x
+  8                         420.8     1.00x
+  64                        930.0     2.21x
 
-  expert FLOPs ratio (64/8)          8x
-  measured wall-clock ratio          2.14x
+  expert arithmetic ratio            8x
+  measured wall-clock ratio          2.21x
     below 8x because attention, norms and the LM head are unchanged
 
-  >> Turning every expert on costs 2.1x the time and 0 extra bytes of
+  Why it replaces neither dense model it sounds like:
+
+  step                        result
+  ------------------------------------------------
+  resident parameters  6,919,161,856  parameters
+  active parameters    1,178,994,688  parameters
+  resident / active            5.87x
+    so it needs 5.9x the memory of a dense model
+    its active size, while doing a fraction of a 6.9B model's work
+
+  >> Turning every expert on costs 2.2x the time and 0 extra bytes of
      weights. Memory is billed on 6.9B parameters no matter which 8 get
      used.
 

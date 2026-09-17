@@ -878,14 +878,45 @@ def what_the_router_learns(
 # ---------------------------------------------------------------------------
 
 
-def two_bills(rep: Report, model, ids: torch.Tensor, device: torch.device) -> dict:
-    """Memory is set by total parameters; time is set by active ones."""
-    n_exp, top_k, layers = _cfg(model)
-    total = sum(p.numel() for p in model.parameters())
+def two_bills(
+    rep: Report, model, ids: torch.Tensor, device: torch.device, census: Census
+) -> dict:
+    """Memory is set by total parameters; time is set by active ones.
 
-    rep.kv("weights resident (bf16)", f"{total * 2 / GIB:.2f} GiB")
+    Both bills are printed as arithmetic rather than as a finished figure: the
+    post's §5 walks a reader through these rows, so each step from a parameter
+    count to gigabytes has to be visible.
+    """
+    n_exp, top_k, layers = _cfg(model)
+    total = census.total
+    bytes_per = 2
+
+    rep.note("Memory is billed on every parameter, run or not:")
+    rep.blank()
+    rep.table(
+        ["step", "result", ""],
+        [
+            ["parameters in the model", f"{total:,}", "parameters"],
+            [f"x {bytes_per} bytes each (bfloat16)", f"{total * bytes_per:,}", "bytes"],
+            [f"/ {GIB:,} bytes in a GiB", f"{total * bytes_per / GIB:.2f}", "GiB"],
+        ],
+    )
+    rep.blank()
     rep.note("  every expert must be in memory; the router picks at run time,")
     rep.note("  so there is no subset you could have left on disk.")
+    rep.blank()
+    rep.note("Time is billed on what a token multiplies by. Changing k changes")
+    rep.note("the expert term and nothing else:")
+    rep.blank()
+    rep.table(
+        ["step", "result", ""],
+        [
+            ["one expert", f"{census.per_expert:,}", "parameters"],
+            [f"x {top_k} chosen per token", f"{census.per_expert * top_k:,}", "parameters"],
+            [f"x {n_exp} if every expert ran", f"{census.per_expert * n_exp:,}", "parameters"],
+            ["ratio of expert arithmetic", f"{n_exp / top_k:.0f}x", ""],
+        ],
+    )
     rep.blank()
 
     # Same weights, same memory, k changed: the cleanest isolation of "active
@@ -919,9 +950,22 @@ def two_bills(rep: Report, model, ids: torch.Tensor, device: torch.device) -> di
         ],
     )
     rep.blank()
-    rep.kv("expert FLOPs ratio (64/8)", f"{n_exp / top_k:.0f}x")
+    rep.kv("expert arithmetic ratio", f"{n_exp / top_k:.0f}x")
     rep.kv("measured wall-clock ratio", f"{timings[n_exp] / timings[top_k]:.2f}x")
     rep.note("  below 8x because attention, norms and the LM head are unchanged")
+    rep.blank()
+    rep.note("Why it replaces neither dense model it sounds like:")
+    rep.blank()
+    rep.table(
+        ["step", "result", ""],
+        [
+            ["resident parameters", f"{total:,}", "parameters"],
+            ["active parameters", f"{census.active:,}", "parameters"],
+            ["resident / active", f"{total / census.active:.2f}x", ""],
+        ],
+    )
+    rep.note(f"  so it needs {total / census.active:.1f}x the memory of a dense model")
+    rep.note("  its active size, while doing a fraction of a 6.9B model's work")
     rep.takeaway(
         f"Turning every expert on costs {timings[n_exp] / timings[top_k]:.1f}x the time "
         f"and 0 extra bytes of weights. Memory is billed on {total / 1e9:.1f}B "
@@ -2290,7 +2334,7 @@ def main() -> None:
     usage, halves = what_the_router_learns(rep, model, tok)
 
     rep.section("5. Two bills: memory and time                       [post §5]")
-    two_bills(rep, model, ids, device)
+    two_bills(rep, model, ids, device, _census(model))
 
     # Sections 6 to 8 climb with sample size, so they get a longer passage: on
     # 94 tokens they would report a property of the passage.
