@@ -47,6 +47,10 @@ __all__ = [
     "census_adapters",
     "merge_all",
     "unmerge_all",
+    "adapter_state",
+    "MultiLoRALinear",
+    "inject_multi_lora",
+    "set_route",
 ]
 
 
@@ -256,3 +260,90 @@ def unmerge_all(model: nn.Module) -> int:
             mod.unmerge_()
             n += 1
     return n
+
+
+def adapter_state(model: nn.Module) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Every adapter's ``(A, B)``, by qualified name, copied to the CPU.
+
+    This is what a trained adapter *is* once the base model is set aside: the
+    thing a serving system keeps one of per customer.
+    """
+    return {
+        name: (mod.A.detach().cpu().clone(), mod.B.detach().cpu().clone())
+        for name, mod in lora_modules(model)
+    }
+
+
+class MultiLoRALinear(nn.Module):
+    """A frozen ``nn.Linear`` serving several adapters at once, one per batch row.
+
+    This is the case merging cannot handle. Row ``i`` of a batch belongs to
+    whichever adapter ``route[i]`` names, so no single ``W + (alpha/r) B A``
+    exists to fold in. Instead each row's ``A`` and ``B`` are gathered and applied
+    as a batched multiply beside the shared base::
+
+        y_i = W x_i  +  (alpha / r) * B[route_i] A[route_i] x_i
+
+    Gathering is the simplest correct way to do it, not the fastest; serving
+    systems such as S-LoRA write custom kernels for exactly this step.
+    """
+
+    def __init__(
+        self,
+        base: nn.Linear,
+        adapters: list[tuple[torch.Tensor, torch.Tensor]],
+        scaling: float,
+    ) -> None:
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        kw = {"device": base.weight.device, "dtype": base.weight.dtype}
+        self.register_buffer("A", torch.stack([a for a, _ in adapters]).to(**kw))
+        self.register_buffer("B", torch.stack([b for _, b in adapters]).to(**kw))
+        self.scaling = scaling
+        self.route: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.route is None:
+            raise RuntimeError("set_route() must name an adapter for every batch row")
+        A = self.A[self.route]  # (batch, r, in)
+        B = self.B[self.route]  # (batch, out, r)
+        low = torch.matmul(torch.matmul(x, A.transpose(1, 2)), B.transpose(1, 2))
+        return self.base(x) + low * self.scaling
+
+
+def inject_multi_lora(
+    model: nn.Module,
+    adapters: list[dict[str, tuple[torch.Tensor, torch.Tensor]]],
+    *,
+    scaling: float,
+) -> int:
+    """Replace every ``nn.Linear`` the adapters name with a :class:`MultiLoRALinear`.
+
+    ``adapters`` is a list of :func:`adapter_state` results, all trained on the
+    same targets at the same rank; adapter ``k`` in the list is route id ``k``.
+    Returns how many matrices were wrapped.
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+    names = list(adapters[0])
+    for other in adapters[1:]:
+        if list(other) != names:
+            raise ValueError("every adapter must cover the same matrices")
+    modules = dict(model.named_modules())
+    for name in names:
+        parent_name, _, child_name = name.rpartition(".")
+        parent = modules[parent_name]  # "" is the model itself
+        child = getattr(parent, child_name)
+        if isinstance(child, LoRALinear):
+            child = child.base
+        setattr(parent, child_name, MultiLoRALinear(child, [a[name] for a in adapters], scaling))
+    return len(names)
+
+
+def set_route(model: nn.Module, route: torch.Tensor) -> None:
+    """Say which adapter each batch row uses, for every :class:`MultiLoRALinear`."""
+    for mod in model.modules():
+        if isinstance(mod, MultiLoRALinear):
+            mod.route = route.to(mod.A.device)

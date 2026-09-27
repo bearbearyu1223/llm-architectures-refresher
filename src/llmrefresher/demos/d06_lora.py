@@ -10,14 +10,17 @@ Claims from the post, each with a receipt:
    rank at most r the adapter holds ``r*(in+out)`` numbers instead of ``in*out``.
 3. What rank buys depends on the task, and the difference is measurable. A
    systematic rule (date reformatting) is learned perfectly at rank 1. Memorizing
-   64 arbitrary facts is not: it needs rank 8 to get them all.
+   64 arbitrary facts is not: it needs rank 4 to get them all.
 4. The update can be low-rank even though the weights are not. Fine-tuning the
    model fully and taking the singular values of the resulting change shows the
    change concentrating in a few directions, while the base matrix it modifies
-   spreads its energy across nearly every direction it has.
+   spreads its energy across nearly every direction it has. The change is still
+   far from rank 8, and what LoRA gives up for that shows up as forgetting:
+   post 4's held-out passage, scored before and after each fine-tune.
 5. A trained adapter folds back into the base weights, after which inference
    costs exactly what the base model costs. Keeping it separate is what makes
-   serving many fine-tunes of one base model possible, and it is not free.
+   serving many fine-tunes of one base model possible, and it is not free: a
+   batch that mixes adapters cannot merge any of them.
 
 Like demos 04 and 05 this one needs a *trained* checkpoint: everything here is a
 statement about what fine-tuning does, and a random-weight model has nothing to
@@ -25,7 +28,8 @@ fine-tune. Qwen2.5-0.5B is the same model demo 04 quantized, so the two posts'
 numbers describe the same weights.
 
 This is the first demo that trains rather than measures, so it is also the
-slowest: about 25 minutes on an M4, most of it the rank sweep in section 5.
+slowest: about 80 minutes on an M4, most of it the rank sweep in section 5,
+which trains six ranks on two tasks at three seeds each.
 
 Run: ``uv run demo06``
 """
@@ -33,6 +37,8 @@ Run: ``uv run demo06``
 from __future__ import annotations
 
 import gc
+import statistics
+import time
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
@@ -43,15 +49,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from ..device import benchmark_ms, get_device, peak_memory_bytes, reset_peak_memory, sync
 from ..lora import (
     LoRALinear,
+    adapter_state,
     census_adapters,
     inject_lora,
+    inject_multi_lora,
     lora_modules,
     merge_all,
+    set_route,
     trainable_parameters,
 )
 from ..plotting import THEMES, Theme, figure_dir, ink_for, save_both, styled
 from ..report import Report
-from ..training import Example, batches, exact_match, train
+from ..training import Example, TrainLog, batches, exact_match, train
+from .d04_quantization import PASSAGE
 
 SLUG = "06-lora"
 MODEL = "Qwen/Qwen2.5-0.5B"
@@ -71,6 +81,25 @@ LORA_LR = 2e-4
 # adapter does. 2e-4 on all 494M parameters diverges; 1e-5 is the usual range.
 FULL_LR = 1e-5
 SWEEP_RANKS = (1, 2, 4, 8, 16, 32)
+# Each sweep cell is trained this many times, with A initialized from a
+# different seed each time. A single run cannot tell a real difference between
+# ranks from the luck of one initialization; three can at least show the spread.
+SWEEP_SEEDS = (0, 1, 2)
+# Section 5's follow-up: the ranks whose recall loss stopped improving, trained
+# three times as long to see whether 200 steps was the limit.
+LONG_STEPS = 600
+LONG_RANKS = (8, 16, 32)
+# Section 5's second dial: which matrices get adapters. Attention-only at rank
+# 32 costs about what all seven projections cost at rank 8, so it separates
+# "where" from "how many parameters".
+ATTENTION = ("q_proj", "k_proj", "v_proj", "o_proj")
+MLP = ("gate_proj", "up_proj", "down_proj")
+PLACEMENTS = (
+    ("attention only", ATTENTION, 8),
+    ("attention only", ATTENTION, 32),
+    ("MLP only", MLP, 8),
+    ("all seven", TARGETS, 8),
+)
 # One layer, deep enough to be past the input-shaped early layers and before the
 # output-shaped last ones. Section 6 checks whether the choice matters.
 PROBE_LAYER = 12
@@ -347,19 +376,45 @@ def where_the_adapters_go(rep: Report, model: nn.Module) -> None:
 # --- 4. What training costs ---------------------------------------------
 
 
-PROBE_MATRICES: tuple[tuple[int, str], ...] = (
-    (PROBE_LAYER, "q_proj"),
-    (PROBE_LAYER, "k_proj"),
-    (PROBE_LAYER, "v_proj"),
-    (PROBE_LAYER, "o_proj"),
-    (PROBE_LAYER, "gate_proj"),
-    (PROBE_LAYER, "up_proj"),
-    (PROBE_LAYER, "down_proj"),
-    (0, "q_proj"),
-    (8, "q_proj"),
-    (16, "q_proj"),
-    (23, "q_proj"),
+# Every matrix the adapters sit beside, by (layer, kind). Section 6 takes the
+# singular values of a full fine-tune's change to each of them.
+LAYERS = 24
+ALL_MATRICES: tuple[tuple[int, str], ...] = tuple(
+    (layer, kind) for layer in range(LAYERS) for kind in TARGETS
 )
+# The depths section 6 prints q_proj at, for a row-by-row look.
+DEPTHS = (0, 8, 16, 23)
+
+
+@dataclass(frozen=True)
+class Run:
+    """One fine-tune: what it cost, how it scored, and what it did to the rest.
+
+    ``perplexity`` is on post 4's passage, which none of these tasks resemble,
+    so it measures what the fine-tune did to the model's ordinary text rather
+    than what it learned.
+    """
+
+    log: TrainLog
+    score: tuple[int, int]
+    perplexity: float
+
+
+@torch.no_grad()
+def passage_perplexity(model: nn.Module, tokenizer, device: torch.device) -> float:
+    """Perplexity on post 4's fixed passage: how well the model still predicts prose.
+
+    The same 550 tokens post 4 scored quantization on, tokenized the same way,
+    so the untrained number here is post 4's fp32 reference. Perplexity is
+    e to the mean cross-entropy: the number of equally likely tokens the model
+    is, on average, choosing between.
+    """
+    ids = tokenizer(PASSAGE, return_tensors="pt").input_ids[:, :1024].to(device)
+    model.eval()
+    logits = model(ids).logits.float()
+    logp = torch.log_softmax(logits[:, :-1], dim=-1)
+    nll = -logp.gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+    return float(nll.mean().exp())
 
 
 def full_finetune(
@@ -367,29 +422,31 @@ def full_finetune(
     tokenizer,
     device: torch.device,
     *,
-    steps: int = STEPS,
-) -> tuple[object, dict[tuple[int, str], torch.Tensor], tuple[int, int]]:
-    """Train every parameter, and keep the change to the probe matrices.
+    lr: float = FULL_LR,
+    keep_spectra: bool = True,
+) -> tuple[Run, dict[tuple[int, str], torch.Tensor]]:
+    """Train every parameter, and keep the spectrum of what it changed.
 
-    Returns the training log, ``W_after - W_before`` for each probe matrix, and
-    the exact-match score. The deltas are what section 6 takes the singular
-    values of: the change a fine-tune actually made, with no low-rank
-    constraint imposed on it anywhere.
+    Returns the run and, for every adapted matrix, the singular values of
+    ``W_after - W_before``: the change a fine-tune actually made, with no
+    low-rank constraint imposed on it anywhere. Only the singular values are
+    kept, so 168 changes cost kilobytes rather than the 1.4 GB the changes are.
     """
     model = _load(device)
     before = {
-        key: _named_linear(model, *key).weight.detach().clone().cpu() for key in PROBE_MATRICES
+        key: _named_linear(model, *key).weight.detach().clone().cpu()
+        for key in (ALL_MATRICES if keep_spectra else ())
     }
-    log = train(
-        model, task.train, tokenizer, device=device, steps=steps, batch_size=BATCH, lr=FULL_LR
-    )
-    deltas = {
-        key: (_named_linear(model, *key).weight.detach().cpu() - before[key])
-        for key in PROBE_MATRICES
-    }
+    log = train(model, task.train, tokenizer, device=device, steps=STEPS, batch_size=BATCH, lr=lr)
+    spectra = {}
+    for key, old in before.items():
+        change = _named_linear(model, *key).weight.detach().cpu() - old
+        # SVD has no MPS kernel in torch 2.13; these run on the CPU.
+        spectra[key] = torch.linalg.svdvals(change.float())
     score = exact_match(model, task.evaluate, tokenizer, device=device)
+    ppl = passage_perplexity(model, tokenizer, device)
     _release(model, before)
-    return log, deltas, score
+    return Run(log, score, ppl), spectra
 
 
 def lora_finetune(
@@ -399,28 +456,82 @@ def lora_finetune(
     *,
     rank: int = RANK,
     steps: int = STEPS,
+    targets: tuple[str, ...] = TARGETS,
+    seed: int = 0,
     keep: bool = False,
-) -> tuple[object, tuple[int, int], nn.Module | None]:
-    """Train only the adapters. Returns the log, the score, and the model if kept."""
+) -> tuple[Run, nn.Module | None]:
+    """Train only the adapters. Returns the run, and the model if ``keep``.
+
+    ``seed`` fixes A's random initialization. Seeding here, rather than once at
+    the top of the program, makes every run independent of which runs came
+    before it: the same arguments give the same adapter wherever it is called.
+    The data order is seeded separately, inside :func:`train`.
+    """
     model = _load(device)
-    inject_lora(model, TARGETS, rank=rank, alpha=float(2 * rank))
+    torch.manual_seed(seed)
+    inject_lora(model, targets, rank=rank, alpha=float(2 * rank))
     log = train(
         model, task.train, tokenizer, device=device, steps=steps, batch_size=BATCH, lr=LORA_LR
     )
     score = exact_match(model, task.evaluate, tokenizer, device=device)
+    ppl = passage_perplexity(model, tokenizer, device)
     if keep:
-        return log, score, model
+        return Run(log, score, ppl), model
     _release(model)
-    return log, score, None
+    return Run(log, score, ppl), None
+
+
+def step_breakdown(
+    task: Task,
+    tokenizer,
+    device: torch.device,
+    *,
+    lora: bool,
+    warmup: int = 3,
+    repeats: int = 10,
+) -> tuple[float, float, float]:
+    """Median milliseconds for one step's forward, backward and optimizer update.
+
+    Synchronized around each phase, so the three add up to a step. A frozen
+    weight still sits on the backward path: the gradient must flow *through* it
+    to reach the adapters below. What it skips is the second multiply every
+    trainable weight needs, the one that computes its own gradient.
+    """
+    model = _load(device)
+    if lora:
+        torch.manual_seed(0)
+        inject_lora(model, TARGETS, rank=RANK, alpha=ALPHA)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable, lr=LORA_LR if lora else FULL_LR)
+    stream = batches(task.train, tokenizer, batch_size=BATCH, seed=7, device=device)
+    model.train()
+    phases: list[tuple[float, float, float]] = []
+    for step in range(warmup + repeats):
+        ids, labels = next(stream)
+        sync(device)
+        t0 = time.perf_counter()
+        loss = model(ids, labels=labels).loss
+        sync(device)
+        t1 = time.perf_counter()
+        loss.backward()
+        sync(device)
+        t2 = time.perf_counter()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        sync(device)
+        t3 = time.perf_counter()
+        if step >= warmup:
+            phases.append((t1 - t0, t2 - t1, t3 - t2))
+    _release(model, opt)
+    return tuple(1000.0 * statistics.median(p[i] for p in phases) for i in range(3))
 
 
 def what_training_costs(
     rep: Report,
-    full_log,
-    full_score: tuple[int, int],
-    lora_log,
-    lora_score: tuple[int, int],
+    full: Run,
+    lora: Run,
     bill: Bill,
+    timing: dict[str, tuple[float, float, float]],
 ) -> None:
     """Receipt: the two runs side by side, same data, same steps, same order.
 
@@ -429,6 +540,8 @@ def what_training_costs(
     and two moments. Counting the weights in one column and not the other is the
     easiest way to make LoRA look better than it is.
     """
+    full_log, lora_log = full.log, lora.log
+    full_score, lora_score = full.score, lora.score
     per_trainable = 3 * 4  # gradient + AdamW's two moments, 4 bytes each
     full_extra = full_log.trainable * per_trainable
     lora_extra = lora_log.trainable * per_trainable
@@ -474,6 +587,25 @@ def what_training_costs(
             ("ratio of totals", f"{full_total / lora_total:.1f}x", "less"),
         ],
     )
+    rep.blank()
+
+    # Where a step's time goes. Wall clock, so it moves between runs; the
+    # shape of it (which phase shrinks and which does not) is the receipt.
+    rep.note("One training step, split into its three phases (ms, median of 10):")
+    rep.blank()
+    phases = ("forward pass", "backward pass", "optimizer update")
+    rows = []
+    for i, phase in enumerate(phases):
+        f, lo = timing["full"][i], timing["lora"][i]
+        rows.append((phase, f"{f:.0f}", f"{lo:.0f}", f"{f / lo:.1f}x"))
+    f_sum, l_sum = sum(timing["full"]), sum(timing["lora"])
+    rows.append(("one step", f"{f_sum:.0f}", f"{l_sum:.0f}", f"{f_sum / l_sum:.1f}x"))
+    rep.table(["phase", "full fine-tune", "LoRA r=8", "full / LoRA"], rows)
+    rep.blank()
+    rep.note("Wall clock, so the milliseconds move from run to run. The forward")
+    rep.note("pass is the same work in both columns; the backward pass is not,")
+    rep.note("because a frozen weight needs no gradient of its own computed.")
+
     gap = lora_log.final_loss - full_log.final_loss
     verdict = (
         f"a loss {abs(gap):.4f} lower than" if gap < 0 else f"a loss {gap:.4f} higher than"
@@ -487,6 +619,38 @@ def what_training_costs(
     )
 
 
+def _ppl(value: float) -> str:
+    """A perplexity, to two places while it is small and whole once it is not."""
+    return f"{value:.2f}" if value < 1000 else f"{value:,.0f}"
+
+
+def the_learning_rate(rep: Report, base_ppl: float, full: Run, hot: Run) -> None:
+    """Receipt: a full fine-tune at the adapters' learning rate, and what it breaks.
+
+    The post runs the two methods at different learning rates and says why; this
+    is the run that says it with a number instead.
+    """
+    rep.table(
+        ["full fine-tune, recall", f"lr {FULL_LR}", f"lr {LORA_LR}"],
+        [
+            ("loss, mean of last 10 steps", f"{full.log.final_loss:.4f}", f"{hot.log.final_loss:.4f}"),
+            ("exact match", f"{full.score[0]} of {full.score[1]}", f"{hot.score[0]} of {hot.score[1]}"),
+            ("perplexity on post 4's passage", _ppl(full.perplexity), _ppl(hot.perplexity)),
+            ("  vs untrained", f"{full.perplexity / base_ppl:,.2f}x", f"{hot.perplexity / base_ppl:,.0f}x"),
+        ],
+    )
+    rep.blank()
+    rep.note(f"Untrained, the model scores {base_ppl:.2f} on the same passage. Lower")
+    rep.note("is better: it is how many tokens the model is, on average, torn")
+    rep.note("between. None of the passage resembles the task.")
+    rep.takeaway(
+        f"At the adapters' learning rate a full fine-tune gets {hot.score[0]} of "
+        f"{hot.score[1]}, and its perplexity on ordinary prose goes from {base_ppl:.2f} to "
+        f"{_ppl(hot.perplexity)}. At {FULL_LR} it gets {full.score[0]} of {full.score[1]} and "
+        f"ends at {_ppl(full.perplexity)}."
+    )
+
+
 # --- 5. What rank buys ---------------------------------------------------
 
 
@@ -497,13 +661,14 @@ def untrained_baseline(
     device: torch.device,
     *,
     batches_to_average: int = 10,
-) -> tuple[float, tuple[int, int]]:
+) -> tuple[float, tuple[int, int], float]:
     """What the model scores before any training, the control the sweep needs.
 
     Without this row a flat sweep is unreadable: "rank 1 gets 40 of 40" means
     nothing if the base model already got 40 of 40. The loss is averaged over
     the same number of batches that :attr:`TrainLog.final_loss` averages over,
-    drawn from the same seeded stream, so the two are comparable.
+    drawn from the same seeded stream, so the two are comparable. Returns the
+    loss, the score, and the perplexity every fine-tune is compared against.
     """
     model = _load(device)
     model.eval()
@@ -513,8 +678,9 @@ def untrained_baseline(
         ids, labels = next(stream)
         losses.append(model(ids, labels=labels).loss.item())
     score = exact_match(model, task.evaluate, tokenizer, device=device)
+    ppl = passage_perplexity(model, tokenizer, device)
     _release(model)
-    return sum(losses) / len(losses), score
+    return sum(losses) / len(losses), score, ppl
 
 
 def what_rank_buys(
@@ -523,41 +689,124 @@ def what_rank_buys(
     tokenizer,
     device: torch.device,
 ) -> tuple[
-    dict[str, list[tuple[int, int, float, int, int]]],
-    dict[str, tuple[float, tuple[int, int]]],
+    dict[str, list[tuple[int, list[Run]]]],
+    dict[str, tuple[float, tuple[int, int], float]],
+    dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]],
 ]:
-    """Receipt: the same run at six ranks, on a rule task and a memorization task."""
-    results: dict[str, list[tuple[int, int, float, int, int]]] = {}
-    baselines: dict[str, tuple[float, tuple[int, int]]] = {}
+    """Receipt: the same run at six ranks and three seeds, on a rule task and a memorization task.
+
+    Also returns each task's rank-8, seed-0 adapter, which section 8 serves
+    side by side.
+    """
+    results: dict[str, list[tuple[int, list[Run]]]] = {}
+    baselines: dict[str, tuple[float, tuple[int, int], float]] = {}
+    adapters: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
     for task in tasks:
-        base_loss, base_score = untrained_baseline(task, tokenizer, device)
+        base_loss, base_score, base_ppl = untrained_baseline(task, tokenizer, device)
         rows = []
         for rank in SWEEP_RANKS:
-            log, score, _ = lora_finetune(task, tokenizer, device, rank=rank)
-            rows.append((rank, log.trainable, log.final_loss, score[0], score[1]))
+            runs = []
+            for seed in SWEEP_SEEDS:
+                keep = rank == RANK and seed == SWEEP_SEEDS[0]
+                run, model = lora_finetune(task, tokenizer, device, rank=rank, seed=seed, keep=keep)
+                if model is not None:
+                    adapters[task.name] = adapter_state(model)
+                    _release(model)
+                runs.append(run)
+            rows.append((rank, runs))
         results[task.name] = rows
-        baselines[task.name] = (base_loss, base_score)
+        baselines[task.name] = (base_loss, base_score, base_ppl)
 
         rep.note(f"task: {task.name}, scored on {task.scoring}")
         rep.table(
-            ["rank", "parameters", "share", "final loss", "exact match"],
-            [("none", "0", "0.000%", f"{base_loss:.2e}", f"{base_score[0]} of {base_score[1]}")]
+            ["rank", "parameters", "share", "final loss", "exact match", "passage"],
+            [(
+                "none", "0", "0.000%", f"{base_loss:.2e}",
+                " ".join(f"{base_score[0]:>2}" for _ in SWEEP_SEEDS), f"{base_ppl:.2f}",
+            )]
             + [
-                (r, f"{n:,}", f"{n / 494_032_768:.3%}", f"{loss:.2e}", f"{hit} of {tot}")
-                for r, n, loss, hit, tot in rows
+                (
+                    r, f"{runs[0].log.trainable:,}", f"{runs[0].log.trainable / 494_032_768:.3%}",
+                    f"{statistics.median(run.log.final_loss for run in runs):.2e}",
+                    " ".join(f"{run.score[0]:>2}" for run in runs),
+                    f"{statistics.median(run.perplexity for run in runs):.2f}",
+                )
+                for r, runs in rows
             ],
         )
         rep.blank()
-    rep.note("'final loss' is the mean of the last 10 steps, in scientific")
-    rep.note("notation because on the format task every rank rounds to zero at")
-    rep.note("four decimal places. A single step's loss depends on which")
-    rep.note("examples its batch drew, so the mean is what to read.")
-    rep.note("'share' is of the base model's 494,032,768 parameters, and every")
-    rep.note("run sees the same examples in the same order, so rank is the")
-    rep.note("only difference between rows. The 'none' row is the model before")
-    rep.note("any training, scored the same way: the control that says whether")
-    rep.note("a rank bought anything at all.")
-    return results, baselines
+    total = tasks[0].evaluate
+    rep.note(f"Every rank is trained {len(SWEEP_SEEDS)} times, with A initialized from")
+    rep.note(f"seeds {', '.join(map(str, SWEEP_SEEDS))}; the data and its order are the same")
+    rep.note(f"each time. 'exact match' lists all {len(SWEEP_SEEDS)} runs, each out of {len(total)}.")
+    rep.note("'final loss' (mean of the last 10 steps) and 'passage' are the")
+    rep.note("median of the three. 'share' is of the base model's 494,032,768")
+    rep.note("parameters. The 'none' row is the model before any training,")
+    rep.note("scored the same way: the control that says whether a rank bought")
+    rep.note("anything at all. 'passage' is perplexity on post 4's held-out")
+    rep.note("prose, which section 6 reads; lower is better.")
+    return results, baselines, adapters
+
+
+def training_longer(
+    rep: Report,
+    task: Task,
+    tokenizer,
+    device: torch.device,
+    sweep: list[tuple[int, Run]],
+) -> None:
+    """Receipt: the ranks whose loss stopped improving, trained three times as long.
+
+    Settles whether section 5's rank-32 row is a property of rank 32 or of
+    stopping at 200 steps.
+    """
+    short = {rank: runs[0] for rank, runs in sweep}
+    rows = []
+    for rank in LONG_RANKS:
+        run, _ = lora_finetune(task, tokenizer, device, rank=rank, steps=LONG_STEPS)
+        rows.append((
+            rank, f"{short[rank].log.final_loss:.2e}", f"{run.log.final_loss:.2e}",
+            f"{run.score[0]} of {run.score[1]}",
+        ))
+    rep.note(f"task: {task.name}, the same runs at {STEPS} and at {LONG_STEPS} steps")
+    rep.table(
+        ["rank", f"loss, {STEPS} steps", f"loss, {LONG_STEPS} steps", "exact match"],
+        rows,
+    )
+    rep.blank()
+    rep.note(f"The {STEPS}-step column is the sweep's seed-0 run. Same seed, same")
+    rep.note(f"data, same order; the longer runs keep going {LONG_STEPS - STEPS} more steps.")
+
+
+def where_adapters_pay(
+    rep: Report,
+    task: Task,
+    tokenizer,
+    device: torch.device,
+    sweep: list[tuple[int, Run]],
+) -> None:
+    """Receipt: the same budget spent on attention, on the MLP, or on both.
+
+    Section 3 adapts all seven projections on the strength of the QLoRA paper.
+    This tests the choice on this model and this task instead of inheriting it.
+    """
+    at_rank = {rank: runs[0] for rank, runs in sweep}
+    rows = []
+    for label, targets, rank in PLACEMENTS:
+        if targets == TARGETS and rank in at_rank:
+            run = at_rank[rank]  # the sweep already trained this one
+        else:
+            run, _ = lora_finetune(task, tokenizer, device, rank=rank, targets=targets)
+        rows.append((
+            label, rank, f"{run.log.trainable:,}", f"{run.log.final_loss:.2e}",
+            f"{run.score[0]} of {run.score[1]}",
+        ))
+    rep.note(f"task: {task.name}, {STEPS} steps, adapters on different matrices")
+    rep.table(["adapters on", "rank", "parameters", "final loss", "exact match"], rows)
+    rep.blank()
+    rep.note("Attention only at rank 32 holds about as many parameters as all")
+    rep.note("seven at rank 8, so that pair differs in placement, not in size.")
+    rep.note("One run each, seed 0; 'all seven' is the sweep's seed-0 run.")
 
 
 # --- 6. Why the update can be low-rank ----------------------------------
@@ -586,26 +835,35 @@ def _energy_rank(values: torch.Tensor, fraction: float) -> int:
     return int(torch.searchsorted(running, fraction).item()) + 1
 
 
+def _median_range(values: list[int]) -> str:
+    """``median (smallest-largest)``, the form section 6's all-layer table uses."""
+    return f"{int(statistics.median(values))} ({min(values)}-{max(values)})"
+
+
 def why_the_update_is_low_rank(
     rep: Report,
     model: nn.Module,
-    deltas: dict[str, dict[tuple[int, str], torch.Tensor]],
+    changes: dict[str, dict[tuple[int, str], torch.Tensor]],
 ) -> dict[str, dict[tuple[int, str], torch.Tensor]]:
-    """Receipt: the spectrum of a full fine-tune's change, against the weights' own."""
-    spectra: dict[str, dict[tuple[int, str], torch.Tensor]] = {"base": {}}
-    rows = []
-    for key in PROBE_MATRICES[:7]:
-        weight = _named_linear(model, *key).weight.detach().float().cpu()
-        base_values = torch.linalg.svdvals(weight)
-        spectra["base"][key] = base_values
-        row: list[object] = [key[1], f"{min(weight.shape)}", _energy_rank(base_values, 0.90)]
-        for task_name, per_key in deltas.items():
-            values = torch.linalg.svdvals(per_key[key].float())
-            spectra.setdefault(task_name, {})[key] = values
-            row.append(_energy_rank(values, 0.90))
-        rows.append(tuple(row))
+    """Receipt: the spectrum of a full fine-tune's change, against the weights' own.
 
-    task_names = list(deltas)
+    ``changes`` holds, per task, the singular values of ``W_after - W_before``
+    for every adapted matrix. Layer 12 is printed in full; then q_proj at four
+    depths; then every layer at once, which is what the claim needs.
+    """
+    spectra: dict[str, dict[tuple[int, str], torch.Tensor]] = {"base": {}}
+    for key in ALL_MATRICES:
+        weight = _named_linear(model, *key).weight.detach().float().cpu()
+        spectra["base"][key] = torch.linalg.svdvals(weight)
+    spectra.update(changes)
+    task_names = list(changes)
+    columns = ["base"] + task_names
+
+    rows = []
+    for kind in TARGETS:
+        key = (PROBE_LAYER, kind)
+        size = len(spectra["base"][key])
+        rows.append((kind, f"{size}") + tuple(_energy_rank(spectra[c][key], 0.90) for c in columns))
     rep.note(f"Directions needed to carry 90% of a matrix's energy, layer {PROBE_LAYER}:")
     rep.blank()
     rep.table(
@@ -616,14 +874,14 @@ def why_the_update_is_low_rank(
     rep.note("'rank' is the largest a matrix of that shape could have. 'W itself'")
     rep.note("is the trained weight; the change columns are W_after - W_before")
     rep.note("from a FULL fine-tune, which was free to move in every direction.")
+    rep.note("A direction's energy is its singular value squared; the squares")
+    rep.note("add up to the sum of the squares of every entry in the matrix.")
     rep.blank()
 
     energy_rows = []
-    for key in PROBE_MATRICES[:7]:
-        row: list[object] = [key[1], f"{_top_k_energy(spectra['base'][key], RANK):.1%}"]
-        for task_name in task_names:
-            row.append(f"{_top_k_energy(spectra[task_name][key], RANK):.1%}")
-        energy_rows.append(tuple(row))
+    for kind in TARGETS:
+        key = (PROBE_LAYER, kind)
+        energy_rows.append((kind,) + tuple(f"{_top_k_energy(spectra[c][key], RANK):.1%}" for c in columns))
     rep.blank()
     rep.note(f"Share of each matrix held in its largest {RANK} directions, which is")
     rep.note(f"what the best possible rank-{RANK} approximation of it would keep:")
@@ -634,16 +892,41 @@ def why_the_update_is_low_rank(
     )
     rep.blank()
 
-    depth_rows = []
-    for key in PROBE_MATRICES[7:]:
-        weight = _named_linear(model, *key).weight.detach().float().cpu()
-        row = [f"layer {key[0]}", _energy_rank(torch.linalg.svdvals(weight), 0.90)]
-        for per_key in deltas.values():
-            row.append(_energy_rank(torch.linalg.svdvals(per_key[key].float()), 0.90))
-        depth_rows.append(tuple(row))
+    depth_rows = [
+        (f"layer {layer}",) + tuple(_energy_rank(spectra[c][(layer, "q_proj")], 0.90) for c in columns)
+        for layer in DEPTHS
+    ]
     rep.note("The same measurement on q_proj at four depths:")
     rep.blank()
     rep.table(["q_proj", "W itself"] + [f"change, {n}" for n in task_names], depth_rows)
+    rep.blank()
+
+    all_rows = []
+    for kind in TARGETS:
+        cells = []
+        for c in columns:
+            counts = [_energy_rank(spectra[c][(layer, kind)], 0.90) for layer in range(LAYERS)]
+            cells.append(_median_range(counts))
+        all_rows.append((kind,) + tuple(cells))
+    rep.note(f"Every layer: directions for 90%, median over the {LAYERS} layers")
+    rep.note("(smallest-largest):")
+    rep.blank()
+    rep.table(["matrix", "W itself"] + [f"change, {n}" for n in task_names], all_rows)
+    rep.blank()
+
+    summary = []
+    for c in columns:
+        counts = [_energy_rank(spectra[c][key], 0.90) for key in ALL_MATRICES]
+        shares = [_top_k_energy(spectra[c][key], RANK) for key in ALL_MATRICES]
+        summary.append((
+            "W itself" if c == "base" else f"change, {c}",
+            f"{sum(n > RANK for n in counts)} of {len(counts)}",
+            f"{min(counts)}-{max(counts)}",
+            f"{statistics.median(shares):.1%}",
+        ))
+    rep.note(f"All {len(ALL_MATRICES)} adapted matrices at once:")
+    rep.blank()
+    rep.table(["", f"need > {RANK} for 90%", "range", f"top-{RANK} median"], summary)
 
     # Two full fine-tunes stand behind these spectra, so keep them: redrawing a
     # figure should not cost another training run.
@@ -651,7 +934,79 @@ def why_the_update_is_low_rank(
     return spectra
 
 
+def what_it_forgot(
+    rep: Report,
+    baselines: dict[str, tuple[float, tuple[int, int], float]],
+    full: dict[str, Run],
+    adapted: dict[str, Run],
+) -> None:
+    """Receipt: perplexity on text neither task resembles, before and after.
+
+    The other half of "learns less and forgets less". Every run here reached
+    the same exact-match score, so any difference in this column is not a
+    difference in how well the task was learned.
+    """
+    names = list(full)
+    base_ppl = next(iter(baselines.values()))[2]
+    rows = [("untrained", "", f"{base_ppl:.2f}", "")]
+    for name in names:
+        for label, run in ((f"LoRA r={RANK}", adapted[name]), ("full fine-tune", full[name])):
+            rows.append((
+                f"{label}, {name}", f"{run.score[0]} of {run.score[1]}",
+                f"{run.perplexity:.2f}", f"{run.perplexity / base_ppl - 1:+.1%}",
+            ))
+    rep.table(["model", "exact match", "passage", "vs untrained"], rows)
+    rep.blank()
+    rep.note("'passage' is perplexity on post 4's 550 tokens of prose, the same")
+    rep.note("text and the same measure post 4 scored quantization with. Lower")
+    rep.note(f"is better. LoRA ran at lr {LORA_LR} and the full fine-tunes at")
+    rep.note(f"lr {FULL_LR}, {STEPS} steps each.")
+
+
 # --- 7. Merging ----------------------------------------------------------
+
+
+# Two regimes for the forward-pass timings. Prefill runs a whole prompt at
+# once, so the base model's big multiplies dominate. Decode runs one new token
+# per sequence, where every extra small multiply is a larger share of the step.
+REGIMES = (("prefill, 8 x 256 tokens", 8, 256), ("decode, 8 x 1 token", 8, 1))
+
+
+def _timing_ids(batch: int, length: int, vocab: int, device: torch.device) -> torch.Tensor:
+    """Token ids for timing: drawn on the CPU from a fixed seed, then moved."""
+    g = torch.Generator().manual_seed(batch * 1000 + length)
+    return torch.randint(vocab, (batch, length), generator=g).to(device)
+
+
+def forward_timings(
+    adapted: nn.Module,
+    mixed: nn.Module,
+    tokenizer,
+    device: torch.device,
+) -> dict[str, dict[str, float]]:
+    """Milliseconds per forward pass: merged, one adapter kept separate, and a mixed batch.
+
+    Measured once and quoted by both section 7 and section 8, so the two
+    sections cannot disagree about the same configuration.
+    """
+    out: dict[str, dict[str, float]] = {}
+    set_route(mixed, torch.arange(8) % 2)  # alternate the two customers' rows
+    for label, batch, length in REGIMES:
+        ids = _timing_ids(batch, length, len(tokenizer), device)
+
+        def run(model: nn.Module, ids: torch.Tensor = ids) -> float:
+            model.eval()
+            with torch.no_grad():
+                return benchmark_ms(lambda: model(ids), device=device, warmup=3, repeats=20)
+
+        row = {"separate": run(adapted)}
+        merge_all(adapted)
+        row["merged"] = run(adapted)
+        for _, adapter in lora_modules(adapted):
+            adapter.unmerge_()
+        row["mixed"] = run(mixed)
+        out[label] = row
+    return out
 
 
 def merging(
@@ -659,6 +1014,7 @@ def merging(
     model: nn.Module,
     tokenizer,
     device: torch.device,
+    timings: dict[str, dict[str, float]],
 ) -> None:
     """Receipt: folding the adapter in changes the output by float noise only."""
     prompt = "Q: Where is the amber anchor archive?\nA: "
@@ -669,12 +1025,9 @@ def merging(
     model.eval()
     with torch.no_grad():
         separate = model(ids).logits[0, -1].clone()
-    unmerged_ms = benchmark_ms(lambda: model(ids), device=device, warmup=2, repeats=8)
-
     count = merge_all(model)
     with torch.no_grad():
         folded = model(ids).logits[0, -1].clone()
-    merged_ms = benchmark_ms(lambda: model(ids), device=device, warmup=2, repeats=8)
 
     gap = (separate - folded).abs().max().item()
     scale = separate.abs().max().item()
@@ -696,20 +1049,21 @@ def merging(
         ],
     )
     rep.blank()
-    rep.table(
-        ["forward pass", "ms", "vs merged"],
-        [
-            ("adapter kept separate", f"{unmerged_ms:.1f}", f"{unmerged_ms / merged_ms:.2f}x"),
-            ("adapter merged into W", f"{merged_ms:.1f}", "1.00x"),
-        ],
-    )
+    rows = []
+    for label, _, _ in REGIMES:
+        row = timings[label]
+        rows.append((label, f"{row['merged']:.1f}", f"{row['separate']:.1f}",
+                     f"{row['separate'] / row['merged']:.2f}x"))
+    rep.table(["forward pass, ms", "merged", "separate", "separate / merged"], rows)
     rep.blank()
-    rep.note("Wall clock, so these two move from run to run; the counts and")
-    rep.note("ratios everywhere else in this demo do not.")
+    rep.note("Wall clock, median of 20, so these move from run to run; the")
+    rep.note("counts and ratios elsewhere in this demo do not. 'separate' keeps")
+    rep.note("all 168 adapters unmerged: two extra small multiplies in each.")
+    ratios = [timings[label]["separate"] / timings[label]["merged"] for label, _, _ in REGIMES]
     rep.takeaway(
         f"Merged, the adapted model is the base model's shape exactly and costs what it costs. "
-        f"Kept separate it runs {unmerged_ms / merged_ms:.2f}x a merged forward pass on this "
-        f"machine, because every adapted matrix does two extra multiplies instead of none."
+        f"Kept separate it runs {ratios[0]:.2f}x a merged forward pass on a long prompt and "
+        f"{ratios[1]:.2f}x on a single new token, on this machine."
     )
 
 
@@ -746,6 +1100,114 @@ def fifty_finetunes(rep: Report, model: nn.Module, bill: Bill, count: int = 50) 
         f"{count} full fine-tunes need {separate / GIB:.1f} GiB of weights. {count} adapters over "
         f"one shared base need {shared / GIB:.2f} GiB, {separate / shared:.1f}x less — but only "
         "while they stay unmerged, which is exactly when the forward pass costs more."
+    )
+
+
+def _single_adapter_model(
+    state: dict[str, tuple[torch.Tensor, torch.Tensor]], device: torch.device
+) -> nn.Module:
+    """The base model with one saved adapter loaded into ordinary LoRA modules."""
+    model = _load(device)
+    inject_lora(model, TARGETS, rank=RANK, alpha=ALPHA)
+    modules = dict(lora_modules(model))
+    with torch.no_grad():
+        for name, (a, b) in state.items():
+            modules[name].A.copy_(a)
+            modules[name].B.copy_(b)
+    return model
+
+
+@torch.no_grad()
+def _greedy(model: nn.Module, prompts: list[list[int]], eos: int, new_tokens: int) -> list[list[int]]:
+    """Greedy-decode a right-padded batch by hand, one row per prompt.
+
+    No cache and no attention mask are needed: attention is causal, so a real
+    token never sees the padding that sits after it, and each row's next token
+    is read at its own last real position.
+    """
+    rows = [list(p) for p in prompts]
+    done = [False] * len(rows)
+    starts = [len(p) for p in prompts]
+    model.eval()
+    for _ in range(new_tokens):
+        width = max(len(r) for r in rows)
+        ids = torch.tensor([r + [eos] * (width - len(r)) for r in rows], device=next(model.parameters()).device)
+        logits = model(ids).logits
+        for i, r in enumerate(rows):
+            if not done[i]:
+                token = int(logits[i, len(r) - 1].argmax())
+                r.append(token)
+                done[i] = token == eos
+        if all(done):
+            break
+    return [r[s:] for r, s in zip(rows, starts, strict=True)]
+
+
+def one_batch_two_customers(
+    rep: Report,
+    mixed: nn.Module,
+    adapters: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]],
+    tasks: dict[str, Task],
+    tokenizer,
+    device: torch.device,
+    timings: dict[str, dict[str, float]],
+) -> None:
+    """Receipt: two adapters served in one batch, checked row by row, and what it costs.
+
+    Row 0 is a recall question and row 1 a date, each routed to the adapter
+    trained for it. Each row's answer is checked against that adapter run on
+    its own, and the batch is run again with the routing swapped, to show the
+    answers come from the routing and not from the prompts alone.
+    """
+    names = list(adapters)
+    rows = [tasks[name].evaluate[0] for name in names]
+    prompts = [tokenizer(p, add_special_tokens=False).input_ids for p, _ in rows]
+    eos = tokenizer.eos_token_id
+
+    def text(tokens: list[int]) -> str:
+        # One line, and short: a wrong route can produce anything, including
+        # newlines, and the receipt only needs to show that it is wrong.
+        flat = " ".join(tokenizer.decode(tokens, skip_special_tokens=True).split())
+        return flat if len(flat) <= 12 else flat[:10] + ".."
+
+    set_route(mixed, torch.arange(len(names)))
+    together = [text(r) for r in _greedy(mixed, prompts, eos, 12)]
+    set_route(mixed, torch.arange(len(names)).flip(0))
+    swapped = [text(r) for r in _greedy(mixed, prompts, eos, 12)]
+    alone = []
+    for i, name in enumerate(names):
+        model = _single_adapter_model(adapters[name], device)
+        alone.append(text(_greedy(model, [prompts[i]], eos, 12)[0]))
+        _release(model)
+
+    table = []
+    for i, name in enumerate(names):
+        table.append((name, rows[i][1], alone[i], together[i], swapped[i]))
+    rep.table(["row's adapter", "expected", "alone", "mixed batch", "swapped"], table)
+    rep.blank()
+    rep.note("'alone' is that adapter served by itself; 'mixed batch' is both")
+    rep.note("rows in one forward pass, each routed to its own adapter;")
+    rep.note("'swapped' is the same batch with the two routes exchanged.")
+    rep.blank()
+
+    table = []
+    for label, _, _ in REGIMES:
+        row = timings[label]
+        table.append((label, f"{row['merged']:.1f}", f"{row['separate']:.1f}",
+                      f"{row['mixed']:.1f}", f"{row['mixed'] / row['merged']:.2f}x"))
+    rep.table(["forward pass, ms", "merged", "separate", "mixed", "mixed / merged"], table)
+    rep.blank()
+    rep.note("The same timings section 7 printed, with a third column: the")
+    rep.note("batch's rows alternate between two adapters, so neither can be")
+    rep.note("merged, and each row's A and B are gathered before multiplying.")
+    ratios = [timings[label]["mixed"] / timings[label]["merged"] for label, _, _ in REGIMES]
+    n = len(names)
+    agree = sum(together[i] == alone[i] for i in range(n))
+    right = sum(together[i] == rows[i][1] for i in range(n))
+    rep.takeaway(
+        f"In one mixed batch, {agree} of {n} rows gave the answer their own adapter gives "
+        f"alone and {right} of {n} were right. It costs {ratios[0]:.2f}x a merged forward "
+        f"pass on a long prompt and {ratios[1]:.2f}x on a single new token."
     )
 
 
@@ -833,9 +1295,57 @@ def figure_mechanism(theme: Theme) -> None:
     save_both(fig, SLUG, "lora-mechanism", theme)
 
 
+def figure_training_memory(bill: Bill, adapter_params: int, theme: Theme) -> None:
+    """Section 4 as a picture: four equal copies against one copy plus a sliver.
+
+    Drawn to scale on purpose, because the point is proportion: the adapters'
+    gradient and moments are too thin to see, and the weights, which LoRA
+    cannot remove, are most of what is left.
+    """
+    fig, ax = plt.subplots(figsize=(10.5, 3.3))
+    copy = bill.weights / MIB
+    adapter_extra = adapter_params * 12 / MIB
+    labels = ("weights", "gradient", "AdamW 1st moment", "AdamW 2nd moment")
+    colors = (theme.muted, theme.series[0], theme.series[1], theme.series[2])
+    bars = (
+        ("full fine-tune", [copy, copy, copy, copy]),
+        ("LoRA r=8", [copy, adapter_extra * 4 / 12, adapter_extra * 4 / 12, adapter_extra * 4 / 12]),
+    )
+    for y, (_name, widths) in zip((1, 0), bars, strict=True):
+        left = 0.0
+        for label, width, color in zip(labels, widths, colors, strict=True):
+            ax.barh(y, width, left=left, height=0.56, color=color,
+                    edgecolor=theme.surface, linewidth=1.2)
+            if width > copy * 0.5:
+                ax.text(left + width / 2, y, label, ha="center", va="center",
+                        fontsize=9.5, color=ink_for(color))
+            left += width
+        ax.text(left + copy * 0.05, y, f"{left:,.1f} MiB", va="center", fontsize=10.5,
+                color=theme.ink, fontweight="bold")
+    ax.annotate(
+        f"adapters' gradient + moments: {adapter_extra:,.1f} MiB, too thin to see",
+        (copy + adapter_extra, -0.28), textcoords="offset points", xytext=(14, -14),
+        fontsize=9, color=theme.secondary, va="top",
+        arrowprops={"arrowstyle": "-", "color": theme.secondary, "linewidth": 1},
+    )
+    ax.set_yticks([1, 0])
+    ax.set_yticklabels([name for name, _ in bars], fontsize=10.5)
+    ax.set_xlim(0, copy * 4.75)
+    ax.set_ylim(-0.95, 1.5)
+    ax.xaxis.set_major_formatter(lambda value, _pos: f"{value:,.0f}")
+    ax.set_xlabel("memory held while training, MiB (fp32, activations not counted)")
+    ax.set_title("LoRA removes three of the four copies and cannot touch the fourth",
+                 loc="left")
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="y", length=0)
+    fig.tight_layout()
+    save_both(fig, SLUG, "training-memory", theme)
+
+
 def figure_rank_sweep(
-    results: dict[str, list[tuple[int, int, float, int, int]]],
-    baselines: dict[str, tuple[float, tuple[int, int]]],
+    results: dict[str, list[tuple[int, list[Run]]]],
+    baselines: dict[str, tuple[float, tuple[int, int], float]],
     theme: Theme,
 ) -> None:
     """What rank buys, on a rule task and a memorization task.
@@ -855,11 +1365,19 @@ def figure_rank_sweep(
 
     for name in names:
         rows = results[name]
-        ranks = [r for r, *_ in rows]
-        accuracy = [100.0 * hit / tot for *_, hit, tot in rows]
-        loss = [value for _, _, value, _, _ in rows]
-        axes[0].plot(ranks, accuracy, marker="o", color=colors[name], label=name)
-        axes[1].plot(ranks, loss, marker="o", color=colors[name], label=name)
+        ranks = [r for r, _ in rows]
+        # The line is the median of the seeds; the bar spans the lowest to the
+        # highest, so a gap smaller than the bar is not a difference.
+        per_seed = [[100.0 * run.score[0] / run.score[1] for run in runs] for _, runs in rows]
+        accuracy = [statistics.median(s) for s in per_seed]
+        losses = [[run.log.final_loss for run in runs] for _, runs in rows]
+        loss = [statistics.median(s) for s in losses]
+        for ax, mid, spread in ((axes[0], accuracy, per_seed), (axes[1], loss, losses)):
+            ax.errorbar(ranks, mid,
+                        yerr=[[m - min(s) for m, s in zip(mid, spread, strict=True)],
+                              [max(s) - m for m, s in zip(mid, spread, strict=True)]],
+                        marker="o", color=colors[name], label=name, capsize=3,
+                        elinewidth=1.2)
         i = label_at[name]
         for ax, series in ((axes[0], accuracy), (axes[1], loss)):
             ax.annotate(name, (ranks[i], series[i]), textcoords="offset points",
@@ -870,7 +1388,7 @@ def figure_rank_sweep(
     for ax, index in ((axes[0], 1), (axes[1], 0)):
         values = {}
         for name in names:
-            base_loss, (hit, tot) = baselines[name]
+            base_loss, (hit, tot), _ = baselines[name]
             values[name] = 100.0 * hit / tot if index == 1 else base_loss
         if abs(values[names[0]] - values[names[1]]) < 1e-9:
             ax.axhline(values[names[0]], color=theme.muted, linewidth=1.3,
@@ -895,11 +1413,11 @@ def figure_rank_sweep(
         ax.set_xticklabels([str(r) for r in SWEEP_RANKS])
         ax.set_xlabel("rank r")
     axes[0].legend(loc="center right")
-    axes[0].set_ylabel("exact match (%)")
+    axes[0].set_ylabel("exact match (%), median of 3 seeds")
     axes[0].set_ylim(-8, 112)
     axes[0].set_title("What the adapter gets right", loc="left")
     axes[1].set_yscale("log")
-    axes[1].set_ylabel("final loss (mean of last 10 steps)")
+    axes[1].set_ylabel("final loss, median of 3 seeds")
     axes[1].set_title("Where the loss ends up", loc="left")
     fig.tight_layout()
     save_both(fig, SLUG, "rank-sweep", theme)
@@ -1009,36 +1527,73 @@ def main() -> None:
     rep.section("4. What training costs                              [post §4]")
     rep.note("The memorization task twice: every parameter, then 0.9% of them.")
     rep.blank()
-    full_log, deltas_recall, full_score = full_finetune(by_name["recall"], tokenizer, device)
-    lora_log, lora_score, adapted = lora_finetune(
-        by_name["recall"], tokenizer, device, keep=True
-    )
-    what_training_costs(rep, full_log, full_score, lora_log, lora_score, bill)
+    recall = by_name["recall"]
+    full_recall, changes_recall = full_finetune(recall, tokenizer, device)
+    lora_recall, adapted = lora_finetune(recall, tokenizer, device, keep=True)
+    timing = {
+        "full": step_breakdown(recall, tokenizer, device, lora=False),
+        "lora": step_breakdown(recall, tokenizer, device, lora=True),
+    }
+    what_training_costs(rep, full_recall, lora_recall, bill, timing)
+    rep.blank()
+    rep.note("The full fine-tune again, at the adapters' learning rate:")
+    rep.blank()
+    hot, _ = full_finetune(recall, tokenizer, device, lr=LORA_LR, keep_spectra=False)
+    # The base model's adapters are all still zero, so this is the untrained model.
+    base_ppl = passage_perplexity(base, tokenizer, device)
+    the_learning_rate(rep, base_ppl, full_recall, hot)
 
     rep.section("5. What rank buys                                   [post §5]")
-    results, baselines = what_rank_buys(rep, tasks, tokenizer, device)
+    results, baselines, adapters = what_rank_buys(rep, tasks, tokenizer, device)
+    rep.blank()
+    rep.note("Does rank 32 need more steps? Recall's top three ranks, longer:")
+    rep.blank()
+    training_longer(rep, recall, tokenizer, device, results["recall"])
+    rep.blank()
+    rep.note("Rank is one dial; which matrices get adapters is the other:")
+    rep.blank()
+    where_adapters_pay(rep, recall, tokenizer, device, results["recall"])
 
     rep.section("6. Why the update can be low-rank                   [post §6]")
     rep.note("A second full fine-tune, on the rule task, for a change to compare.")
     rep.blank()
-    _, deltas_format, _ = full_finetune(by_name["format"], tokenizer, device)
+    full_format, changes_format = full_finetune(by_name["format"], tokenizer, device)
     spectra = why_the_update_is_low_rank(
-        rep, base, {"format": deltas_format, "recall": deltas_recall}
+        rep, base, {"format": changes_format, "recall": changes_recall}
+    )
+    rep.blank()
+    rep.note("What each fine-tune did to text it was never trained on:")
+    rep.blank()
+    what_it_forgot(
+        rep,
+        baselines,
+        {"format": full_format, "recall": full_recall},
+        {name: dict(results[name])[RANK][0] for name in results},
     )
 
     rep.section("7. Merging, and the cost of not merging             [post §7]")
-    merging(rep, adapted, tokenizer, device)
+    # A model serving both tasks' rank-8 adapters at once, for section 8; built
+    # here because section 7's timings and section 8's are measured together.
+    mixed = _load(device)
+    inject_multi_lora(mixed, [adapters[name] for name in adapters], scaling=ALPHA / RANK)
+    timings = forward_timings(adapted, mixed, tokenizer, device)
+    merging(rep, adapted, tokenizer, device, timings)
 
     rep.section("8. Fifty fine-tunes of one base model               [post §8]")
     fifty_finetunes(rep, base, bill)
+    rep.blank()
+    rep.note("Two customers' adapters, served in one batch:")
+    rep.blank()
+    one_batch_two_customers(rep, mixed, adapters, by_name, tokenizer, device, timings)
 
     rep.section("Figures")
     for theme in THEMES:
         with styled(theme):
             figure_mechanism(theme)
+            figure_training_memory(bill, lora_recall.log.trainable, theme)
             figure_rank_sweep(results, baselines, theme)
             figure_spectrum(spectra, theme, (PROBE_LAYER, "q_proj"))
-    rep.note(f"wrote 3 light/dark pairs to figures/{SLUG}/")
+    rep.note(f"wrote 4 light/dark pairs to figures/{SLUG}/")
 
     reset_peak_memory(device)
     peak = peak_memory_bytes(device)

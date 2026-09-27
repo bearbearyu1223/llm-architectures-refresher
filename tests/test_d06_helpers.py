@@ -177,3 +177,56 @@ def test_the_recall_task_has_no_rule_connecting_name_to_city():
     # numbers reproduce.
     assert recall_task(seed=1) == recall_task(seed=1)
     assert recall_task(seed=1) != recall_task(seed=2)
+
+
+# -- serving several adapters in one batch -------------------------------
+
+
+def test_mixed_batch_rows_match_each_adapter_alone():
+    import copy
+
+    from llmrefresher.lora import adapter_state, inject_multi_lora, set_route
+
+    torch.manual_seed(0)
+    shared = tiny_model()
+    alone, states = [], []
+    for _ in range(2):
+        model = copy.deepcopy(shared)
+        inject_lora(model, ["q_proj"], rank=2, alpha=4)
+        with torch.no_grad():
+            model.q_proj.B.normal_()
+        alone.append(model)
+        states.append(adapter_state(model))
+
+    served = copy.deepcopy(shared)
+    assert inject_multi_lora(served, states, scaling=2.0) == 1
+    x = torch.randn(2, 5, 16)
+    set_route(served, torch.tensor([0, 1]))
+    mixed = served(x)
+    for i, model in enumerate(alone):
+        assert torch.allclose(mixed[i], model(x[i : i + 1])[0], atol=1e-6)
+    # Swapping the routes swaps which adapter each row gets.
+    set_route(served, torch.tensor([1, 0]))
+    assert torch.allclose(served(x)[0], alone[1](x[:1])[0], atol=1e-6)
+
+
+def test_mixed_batch_refuses_to_run_without_a_route():
+    from llmrefresher.lora import adapter_state, inject_multi_lora
+
+    model = tiny_model()
+    inject_lora(model, ["q_proj"], rank=2, alpha=4)
+    state = adapter_state(model)
+    served = tiny_model()
+    inject_multi_lora(served, [state, state], scaling=2.0)
+    try:
+        served(torch.randn(1, 3, 16))
+    except RuntimeError as err:
+        assert "set_route" in str(err)
+    else:
+        raise AssertionError("expected a RuntimeError with no route set")
+
+
+def test_median_range_reads_median_then_extremes():
+    from llmrefresher.demos.d06_lora import _median_range
+
+    assert _median_range([5, 1, 9]) == "5 (1-9)"

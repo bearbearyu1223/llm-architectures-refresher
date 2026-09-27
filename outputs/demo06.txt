@@ -114,9 +114,9 @@ device memory : 17.2 GB
   gradient + two moments (MiB)         5,653.8       50.3
   total held (MiB)                     7,538.3    1,934.9
   loss at step 0                        6.9305     6.9305
-  loss, mean of last 10 steps           0.0002     0.0014
+  loss, mean of last 10 steps           0.0002     0.0013
   exact match                         40 of 40   40 of 40
-  seconds per step                        0.65       0.21
+  seconds per step                        0.67       0.21
 
   Both columns hold the weights: a frozen parameter still has to be
   in memory for the forward pass. Neither column counts the
@@ -137,46 +137,102 @@ device memory : 17.2 GB
   total, LoRA r=8                         2,028,920,320       bytes
   ratio of totals                                  3.9x        less
 
+  One training step, split into its three phases (ms, median of 10):
+
+  phase             full fine-tune  LoRA r=8  full / LoRA
+  ---------------------------------------------------------
+  forward pass                  84        93         0.9x
+  backward pass                186       113         1.6x
+  optimizer update             406        16        25.9x
+  one step                     676       221         3.1x
+
+  Wall clock, so the milliseconds move from run to run. The forward
+  pass is the same work in both columns; the backward pass is not,
+  because a frozen weight needs no gradient of its own computed.
+
   >> LoRA trains 0.89% of the parameters and holds 112x less gradient and
      optimizer state, but only 3.9x less memory in total, because the
      frozen weights are still there. On the same steps of the same data it
      reaches a loss 0.0011 higher than the full fine-tune, at learning
      rates of 0.0002 against 1e-05.
 
+  The full fine-tune again, at the adapters' learning rate:
+
+  full fine-tune, recall          lr 1e-05  lr 0.0002
+  -----------------------------------------------------
+  loss, mean of last 10 steps       0.0002     0.1775
+  exact match                     40 of 40   38 of 40
+  perplexity on post 4's passage     22.08     65,115
+    vs untrained                     1.06x     3,120x
+
+  Untrained, the model scores 20.87 on the same passage. Lower
+  is better: it is how many tokens the model is, on average, torn
+  between. None of the passage resembles the task.
+
+  >> At the adapters' learning rate a full fine-tune gets 38 of 40, and
+     its perplexity on ordinary prose goes from 20.87 to 65,115. At 1e-05
+     it gets 40 of 40 and ends at 22.08.
+
 --------------------------------------------------------------------------
 5. What rank buys                                   [post §5]
 --------------------------------------------------------------------------
   task: format, scored on 40 dates it never saw
-  rank  parameters   share  final loss  exact match
-  ---------------------------------------------------
-  none           0  0.000%    2.06e+00      0 of 40
-  1        549,888  0.111%    3.16e-05     40 of 40
-  2      1,099,776  0.223%    1.52e-05     40 of 40
-  4      2,199,552  0.445%    6.77e-06     40 of 40
-  8      4,399,104  0.890%    4.77e-06     40 of 40
-  16     8,798,208  1.781%    8.24e-06     40 of 40
-  32    17,596,416  3.562%    5.32e-06     40 of 40
+  rank  parameters   share  final loss  exact match  passage
+  ------------------------------------------------------------
+  none           0  0.000%    2.06e+00      0  0  0    20.87
+  1        549,888  0.111%    2.58e-05     40 40 40    20.93
+  2      1,099,776  0.223%    1.55e-05     40 40 40    21.00
+  4      2,199,552  0.445%    6.43e-06     40 40 40    20.98
+  8      4,399,104  0.890%    1.23e-05     40 40 40    21.21
+  16     8,798,208  1.781%    9.96e-07     40 40 40    21.76
+  32    17,596,416  3.562%    3.08e-06     40 40 40    22.90
 
   task: recall, scored on 40 of the facts it was trained on
-  rank  parameters   share  final loss  exact match
-  ---------------------------------------------------
-  none           0  0.000%    7.25e+00      0 of 40
-  1        549,888  0.111%    1.42e-01     37 of 40
-  2      1,099,776  0.223%    6.36e-02     37 of 40
-  4      2,199,552  0.445%    1.12e-02     40 of 40
-  8      4,399,104  0.890%    1.11e-03     40 of 40
-  16     8,798,208  1.781%    4.06e-04     40 of 40
-  32    17,596,416  3.562%    2.79e-03     40 of 40
+  rank  parameters   share  final loss  exact match  passage
+  ------------------------------------------------------------
+  none           0  0.000%    7.25e+00      0  0  0    20.87
+  1        549,888  0.111%    1.56e-01     40 38 38    21.60
+  2      1,099,776  0.223%    3.52e-02     37 40 40    21.62
+  4      2,199,552  0.445%    3.86e-03     40 40 39    22.37
+  8      4,399,104  0.890%    1.34e-03     40 40 39    22.51
+  16     8,798,208  1.781%    3.99e-04     40 40 40    23.46
+  32    17,596,416  3.562%    1.20e-02     40 40 40    25.39
 
-  'final loss' is the mean of the last 10 steps, in scientific
-  notation because on the format task every rank rounds to zero at
-  four decimal places. A single step's loss depends on which
-  examples its batch drew, so the mean is what to read.
-  'share' is of the base model's 494,032,768 parameters, and every
-  run sees the same examples in the same order, so rank is the
-  only difference between rows. The 'none' row is the model before
-  any training, scored the same way: the control that says whether
-  a rank bought anything at all.
+  Every rank is trained 3 times, with A initialized from
+  seeds 0, 1, 2; the data and its order are the same
+  each time. 'exact match' lists all 3 runs, each out of 40.
+  'final loss' (mean of the last 10 steps) and 'passage' are the
+  median of the three. 'share' is of the base model's 494,032,768
+  parameters. The 'none' row is the model before any training,
+  scored the same way: the control that says whether a rank bought
+  anything at all. 'passage' is perplexity on post 4's held-out
+  prose, which section 6 reads; lower is better.
+
+  Does rank 32 need more steps? Recall's top three ranks, longer:
+
+  task: recall, the same runs at 200 and at 600 steps
+  rank  loss, 200 steps  loss, 600 steps  exact match
+  -----------------------------------------------------
+  8            1.29e-03         8.91e-05     40 of 40
+  16           7.35e-04         6.64e-05     40 of 40
+  32           5.02e-02         8.28e-05     40 of 40
+
+  The 200-step column is the sweep's seed-0 run. Same seed, same
+  data, same order; the longer runs keep going 400 more steps.
+
+  Rank is one dial; which matrices get adapters is the other:
+
+  task: recall, 200 steps, adapters on different matrices
+  adapters on     rank  parameters  final loss  exact match
+  -----------------------------------------------------------
+  attention only     8   1,081,344    1.26e-01     39 of 40
+  attention only    32   4,325,376    3.59e-03     40 of 40
+  MLP only           8   3,317,760    1.53e-03     40 of 40
+  all seven          8   4,399,104    1.29e-03     40 of 40
+
+  Attention only at rank 32 holds about as many parameters as all
+  seven at rank 8, so that pair differs in placement, not in size.
+  One run each, seed 0; 'all seven' is the sweep's seed-0 run.
 
 --------------------------------------------------------------------------
 6. Why the update can be low-rank                   [post §6]
@@ -191,13 +247,15 @@ device memory : 17.2 GB
   k_proj      128        70              39              25
   v_proj      128       106              51              38
   o_proj      896       324              54              42
-  gate_proj   896       629             214             127
+  gate_proj   896       629             215             127
   up_proj     896       665             192             106
   down_proj   896       597             203             115
 
   'rank' is the largest a matrix of that shape could have. 'W itself'
   is the trained weight; the change columns are W_after - W_before
   from a FULL fine-tune, which was free to move in every direction.
+  A direction's energy is its singular value squared; the squares
+  add up to the sum of the squares of every entry in the matrix.
 
 
   Share of each matrix held in its largest 8 directions, which is
@@ -207,10 +265,10 @@ device memory : 17.2 GB
   -----------------------------------------------------
   q_proj        10.1%           63.7%           68.3%
   k_proj        22.5%           68.4%           74.1%
-  v_proj        11.1%           59.6%           67.5%
+  v_proj        11.1%           59.7%           67.5%
   o_proj         7.6%           72.4%           71.2%
   gate_proj      5.3%           50.2%           54.6%
-  up_proj        2.7%           54.4%           58.2%
+  up_proj        2.7%           54.3%           58.2%
   down_proj      5.4%           49.5%           54.5%
 
   The same measurement on q_proj at four depths:
@@ -222,30 +280,66 @@ device memory : 17.2 GB
   layer 16       191              30              26
   layer 23       239              43              35
 
+  Every layer: directions for 90%, median over the 24 layers
+  (smallest-largest):
+
+  matrix          W itself  change, format  change, recall
+  ----------------------------------------------------------
+  q_proj      288 (55-331)     59 (28-118)      36 (18-51)
+  k_proj        70 (21-81)      33 (17-44)      23 (10-29)
+  v_proj      101 (71-109)      43 (26-54)      34 (22-43)
+  o_proj     311 (186-389)     57 (14-116)      42 (25-57)
+  gate_proj  640 (623-678)    203 (76-270)    122 (55-146)
+  up_proj    666 (643-699)    187 (61-250)     93 (48-128)
+  down_proj  632 (594-680)    197 (19-280)    106 (41-140)
+
+  All 168 adapted matrices at once:
+
+                  need > 8 for 90%   range  top-8 median
+  --------------------------------------------------------
+  W itself              168 of 168  21-699          7.8%
+  change, format        168 of 168  14-280         62.7%
+  change, recall        168 of 168  10-146         61.2%
+
+  What each fine-tune did to text it was never trained on:
+
+  model                   exact match  passage  vs untrained
+  ------------------------------------------------------------
+  untrained                              20.87
+  LoRA r=8, format           40 of 40    21.28         +1.9%
+  full fine-tune, format     40 of 40    21.18         +1.5%
+  LoRA r=8, recall           40 of 40    22.51         +7.9%
+  full fine-tune, recall     40 of 40    22.08         +5.8%
+
+  'passage' is perplexity on post 4's 550 tokens of prose, the same
+  text and the same measure post 4 scored quantization with. Lower
+  is better. LoRA ran at lr 0.0002 and the full fine-tunes at
+  lr 1e-05, 200 steps each.
+
 --------------------------------------------------------------------------
 7. Merging, and the cost of not merging             [post §7]
 --------------------------------------------------------------------------
   check                                     result
   --------------------------------------------------
   adapters folded into their base weight       168
-  largest logit difference                8.34e-05
-  largest logit, for scale                 28.8243
-  difference as a share of that            2.9e-06
+  largest logit difference                6.58e-05
+  largest logit, for scale                 25.1507
+  difference as a share of that            2.6e-06
   same next token                              yes
-  weight change after merge then unmerge  7.45e-09
+  weight change after merge then unmerge  0.00e+00
 
-  forward pass             ms  vs merged
-  ----------------------------------------
-  adapter kept separate  42.1      1.00x
-  adapter merged into W  41.9      1.00x
+  forward pass, ms         merged  separate  separate / merged
+  --------------------------------------------------------------
+  prefill, 8 x 256 tokens   840.8    1018.4              1.21x
+  decode, 8 x 1 token        34.5      40.1              1.16x
 
-  Wall clock, so these two move from run to run; the counts and
-  ratios everywhere else in this demo do not.
+  Wall clock, median of 20, so these move from run to run; the
+  counts and ratios elsewhere in this demo do not. 'separate' keeps
+  all 168 adapters unmerged: two extra small multiplies in each.
 
   >> Merged, the adapted model is the base model's shape exactly and costs
-     what it costs. Kept separate it runs 1.00x a merged forward pass on
-     this machine, because every adapted matrix does two extra multiplies
-     instead of none.
+     what it costs. Kept separate it runs 1.21x a merged forward pass on a
+     long prompt and 1.16x on a single new token, on this machine.
 
 --------------------------------------------------------------------------
 8. Fifty fine-tunes of one base model               [post §8]
@@ -271,9 +365,33 @@ device memory : 17.2 GB
      shared base need 2.66 GiB, 34.6x less — but only while they stay
      unmerged, which is exactly when the forward pass costs more.
 
+  Two customers' adapters, served in one batch:
+
+  row's adapter    expected       alone  mixed batch       swapped
+  ------------------------------------------------------------------
+  format         1901-08-02  1901-08-02   1901-08-02  10000-1 A. 1
+  recall              Sofia       Sofia        Sofia    2019-09-01
+
+  'alone' is that adapter served by itself; 'mixed batch' is both
+  rows in one forward pass, each routed to its own adapter;
+  'swapped' is the same batch with the two routes exchanged.
+
+  forward pass, ms         merged  separate   mixed  mixed / merged
+  -------------------------------------------------------------------
+  prefill, 8 x 256 tokens   840.8    1018.4  1026.8           1.22x
+  decode, 8 x 1 token        34.5      40.1    42.0           1.22x
+
+  The same timings section 7 printed, with a third column: the
+  batch's rows alternate between two adapters, so neither can be
+  merged, and each row's A and B are gathered before multiplying.
+
+  >> In one mixed batch, 2 of 2 rows gave the answer their own adapter
+     gives alone and 2 of 2 were right. It costs 1.22x a merged forward
+     pass on a long prompt and 1.22x on a single new token.
+
 --------------------------------------------------------------------------
 Figures
 --------------------------------------------------------------------------
-  wrote 3 light/dark pairs to figures/06-lora/
+  wrote 4 light/dark pairs to figures/06-lora/
 
-  device memory still allocated      3.71 GiB
+  device memory still allocated      5.59 GiB
