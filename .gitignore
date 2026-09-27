@@ -5,4 +5,5 @@ __pycache__/
 uv.lock.bak
 .DS_Store
 figures/**/*.png
+figures/**/*.pt
 !figures/.gitkeep

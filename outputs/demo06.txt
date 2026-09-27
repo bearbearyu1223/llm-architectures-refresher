@@ -1,0 +1,279 @@
+==========================================================================
+DEMO 06: LoRA: what rank buys, and what it costs to serve
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  model                              Qwen/Qwen2.5-0.5B
+  precision                          float32
+  adapter targets                    q k v o gate up down (7 per layer)
+  steps per run                      200, batch 8
+  learning rate                      0.0002 adapters, 1e-05 full fine-tune
+  task: format                       2,000 written dates -> ISO 8601
+     scored on                       40 held-out dates, 40 unseen
+  task: recall                       64 arbitrary facts to memorize
+     scored on                       40 of those same facts
+
+--------------------------------------------------------------------------
+1. Where a fine-tune's cost is                      [post §1]
+--------------------------------------------------------------------------
+  role        parameters   share
+  --------------------------------
+  embedding  136,134,656   27.6%
+  attention   44,067,840    8.9%
+  MLP        313,786,368   63.5%
+  norms           43,904    0.0%
+  TOTAL      494,032,768  100.0%
+
+  The embedding row is the input table and the output head, which
+  this model ties: one matrix of 151,936 rows, each 896 wide.
+
+  step                                   result
+  -----------------------------------------------------------
+  parameters in the model           494,032,768  parameters
+  the weights themselves          1,976,131,072       bytes
+  a gradient for each weight      1,976,131,072       bytes
+  AdamW's first moment            1,976,131,072       bytes
+  AdamW's second moment           1,976,131,072       bytes
+  total held while training       7,904,524,288       bytes
+  / 1,073,741,824 bytes in a GiB           7.36         GiB
+
+  Every number is fp32, 4 bytes, so one copy of the
+  weights is 1,976,131,072 bytes (1.84 GiB) and training holds four.
+
+  >> Training this 0.49B model in fp32 needs 7.36 GiB before a single
+     activation is stored: 1.84 GiB of weights and three more copies of
+     the same size for the gradient and AdamW's two moments.
+
+--------------------------------------------------------------------------
+2. The mechanism: W + (alpha/r) B A                 [post §2]
+--------------------------------------------------------------------------
+  matrix                 shape  parameters
+  ------------------------------------------
+  W, frozen         (896, 896)     802,816
+  A, trained          (8, 896)       7,168
+  B, trained          (896, 8)       7,168
+  A and B together                  14,336
+  W / (A and B)                      56.0x
+
+  check                                     result
+  --------------------------------------------------
+  largest change before training           0.0e+00
+  module output vs the formula by hand     0.0e+00
+  shape of (alpha/r) B A                (896, 896)
+  singular values above 1e-6              8 of 896
+  scaling alpha/r                              2.0
+
+  >> The update is the same shape as W and 56x smaller to store, because a
+     product of an 8-row and an 8-column matrix cannot have rank above 8,
+     and it starts at exactly zero, so the adapted model starts as the
+     base model.
+
+--------------------------------------------------------------------------
+3. Where the adapters go                            [post §3]
+--------------------------------------------------------------------------
+  trainable tensors after injection  336
+
+  target     in x out  count    each  parameters
+  ------------------------------------------------
+  down_proj  4864x896     24  46,080   1,105,920
+  gate_proj  896x4864     24  46,080   1,105,920
+  k_proj      896x128     24   8,192     196,608
+  o_proj      896x896     24  14,336     344,064
+  q_proj      896x896     24  14,336     344,064
+  up_proj    896x4864     24  46,080   1,105,920
+  v_proj      896x128     24   8,192     196,608
+  TOTAL                  168           4,399,104
+
+  'each' is r x (in + out) with r = 8: one row of A per
+  input, one column of B per output.
+
+  step                                   result
+  -----------------------------------------------------------
+  base model                        494,032,768  parameters
+  matrices the adapters sit beside  357,826,560  parameters
+  adapter parameters                  4,399,104  parameters
+  adapters / base model                   0.89%
+  x 4 bytes each (fp32)              17,596,416       bytes
+  / 1,048,576 bytes in a MiB               16.8         MiB
+
+  >> At rank 8 the adapters come to 4,399,104 parameters, 0.89% of the
+     model, sitting beside 72% of it.
+
+--------------------------------------------------------------------------
+4. What training costs                              [post §4]
+--------------------------------------------------------------------------
+  The memorization task twice: every parameter, then 0.9% of them.
+
+                                full fine-tune   LoRA r=8
+  ---------------------------------------------------------
+  trainable parameters             494,032,768  4,399,104
+  share of the model                   100.00%      0.89%
+  weights held (MiB)                   1,884.6    1,884.6
+  gradient + two moments (MiB)         5,653.8       50.3
+  total held (MiB)                     7,538.3    1,934.9
+  loss at step 0                        6.9305     6.9305
+  loss, mean of last 10 steps           0.0002     0.0014
+  exact match                         40 of 40   40 of 40
+  seconds per step                        0.65       0.21
+
+  Both columns hold the weights: a frozen parameter still has to be
+  in memory for the forward pass. Neither column counts the
+  activations the backward pass stores, which depend on batch size.
+
+  step                                           result
+  -------------------------------------------------------------------
+  trainable, full fine-tune                 494,032,768  parameters
+  trainable, LoRA r=8                         4,399,104  parameters
+  ratio                                            112x       fewer
+
+  x 12 bytes each (gradient + 2 moments)  5,928,393,216       bytes
+  the same for the adapters                  52,789,248       bytes
+  ratio                                            112x        less
+
+  + the weights, held either way          1,976,131,072       bytes
+  total, full fine-tune                   7,904,524,288       bytes
+  total, LoRA r=8                         2,028,920,320       bytes
+  ratio of totals                                  3.9x        less
+
+  >> LoRA trains 0.89% of the parameters and holds 112x less gradient and
+     optimizer state, but only 3.9x less memory in total, because the
+     frozen weights are still there. On the same steps of the same data it
+     reaches a loss 0.0011 higher than the full fine-tune, at learning
+     rates of 0.0002 against 1e-05.
+
+--------------------------------------------------------------------------
+5. What rank buys                                   [post §5]
+--------------------------------------------------------------------------
+  task: format, scored on 40 dates it never saw
+  rank  parameters   share  final loss  exact match
+  ---------------------------------------------------
+  none           0  0.000%    2.06e+00      0 of 40
+  1        549,888  0.111%    3.16e-05     40 of 40
+  2      1,099,776  0.223%    1.52e-05     40 of 40
+  4      2,199,552  0.445%    6.77e-06     40 of 40
+  8      4,399,104  0.890%    4.77e-06     40 of 40
+  16     8,798,208  1.781%    8.24e-06     40 of 40
+  32    17,596,416  3.562%    5.32e-06     40 of 40
+
+  task: recall, scored on 40 of the facts it was trained on
+  rank  parameters   share  final loss  exact match
+  ---------------------------------------------------
+  none           0  0.000%    7.25e+00      0 of 40
+  1        549,888  0.111%    1.42e-01     37 of 40
+  2      1,099,776  0.223%    6.36e-02     37 of 40
+  4      2,199,552  0.445%    1.12e-02     40 of 40
+  8      4,399,104  0.890%    1.11e-03     40 of 40
+  16     8,798,208  1.781%    4.06e-04     40 of 40
+  32    17,596,416  3.562%    2.79e-03     40 of 40
+
+  'final loss' is the mean of the last 10 steps, in scientific
+  notation because on the format task every rank rounds to zero at
+  four decimal places. A single step's loss depends on which
+  examples its batch drew, so the mean is what to read.
+  'share' is of the base model's 494,032,768 parameters, and every
+  run sees the same examples in the same order, so rank is the
+  only difference between rows. The 'none' row is the model before
+  any training, scored the same way: the control that says whether
+  a rank bought anything at all.
+
+--------------------------------------------------------------------------
+6. Why the update can be low-rank                   [post §6]
+--------------------------------------------------------------------------
+  A second full fine-tune, on the rule task, for a change to compare.
+
+  Directions needed to carry 90% of a matrix's energy, layer 12:
+
+  matrix     rank  W itself  change, format  change, recall
+  -----------------------------------------------------------
+  q_proj      896       299              68              38
+  k_proj      128        70              39              25
+  v_proj      128       106              51              38
+  o_proj      896       324              54              42
+  gate_proj   896       629             214             127
+  up_proj     896       665             192             106
+  down_proj   896       597             203             115
+
+  'rank' is the largest a matrix of that shape could have. 'W itself'
+  is the trained weight; the change columns are W_after - W_before
+  from a FULL fine-tune, which was free to move in every direction.
+
+
+  Share of each matrix held in its largest 8 directions, which is
+  what the best possible rank-8 approximation of it would keep:
+
+  matrix     W itself  change, format  change, recall
+  -----------------------------------------------------
+  q_proj        10.1%           63.7%           68.3%
+  k_proj        22.5%           68.4%           74.1%
+  v_proj        11.1%           59.6%           67.5%
+  o_proj         7.6%           72.4%           71.2%
+  gate_proj      5.3%           50.2%           54.6%
+  up_proj        2.7%           54.4%           58.2%
+  down_proj      5.4%           49.5%           54.5%
+
+  The same measurement on q_proj at four depths:
+
+  q_proj    W itself  change, format  change, recall
+  ----------------------------------------------------
+  layer 0         55              28              18
+  layer 8        321              89              50
+  layer 16       191              30              26
+  layer 23       239              43              35
+
+--------------------------------------------------------------------------
+7. Merging, and the cost of not merging             [post §7]
+--------------------------------------------------------------------------
+  check                                     result
+  --------------------------------------------------
+  adapters folded into their base weight       168
+  largest logit difference                8.34e-05
+  largest logit, for scale                 28.8243
+  difference as a share of that            2.9e-06
+  same next token                              yes
+  weight change after merge then unmerge  7.45e-09
+
+  forward pass             ms  vs merged
+  ----------------------------------------
+  adapter kept separate  42.1      1.00x
+  adapter merged into W  41.9      1.00x
+
+  Wall clock, so these two move from run to run; the counts and
+  ratios everywhere else in this demo do not.
+
+  >> Merged, the adapted model is the base model's shape exactly and costs
+     what it costs. Kept separate it runs 1.00x a merged forward pass on
+     this machine, because every adapted matrix does two extra multiplies
+     instead of none.
+
+--------------------------------------------------------------------------
+8. Fifty fine-tunes of one base model               [post §8]
+--------------------------------------------------------------------------
+  step                                    result
+  -------------------------------------------------------------
+  one full copy of the model       1,976,131,072        bytes
+  x 50 fine-tunes, kept whole     98,806,553,600        bytes
+  / 1,073,741,824 bytes in a GiB            92.0          GiB
+
+  one adapter, r=8                    17,596,416        bytes
+  / 1,048,576 bytes in a MiB                16.8          MiB
+  x 50 adapters                      879,820,800        bytes
+  + one shared base model, total   2,855,951,872        bytes
+  / 1,073,741,824 bytes in a GiB            2.66          GiB
+
+  whole copies / shared base               34.6x  more memory
+
+  Every number is fp32. 50 fine-tunes is arbitrary; the ratio
+  grows with the count, toward one full copy per adapter's worth.
+
+  >> 50 full fine-tunes need 92.0 GiB of weights. 50 adapters over one
+     shared base need 2.66 GiB, 34.6x less — but only while they stay
+     unmerged, which is exactly when the forward pass costs more.
+
+--------------------------------------------------------------------------
+Figures
+--------------------------------------------------------------------------
+  wrote 3 light/dark pairs to figures/06-lora/
+
+  device memory still allocated      3.71 GiB
