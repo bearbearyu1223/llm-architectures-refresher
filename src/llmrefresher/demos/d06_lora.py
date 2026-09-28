@@ -1214,84 +1214,213 @@ def one_batch_two_customers(
 # --- figures -------------------------------------------------------------
 
 
+# Two small grids for the rank figure, chosen so every entry is a small whole
+# number a reader can check by hand. The second has rank 2 because its third
+# row is the sum of the first two.
+RANK_ONE = (torch.tensor([[1.0], [2.0], [3.0]]), torch.tensor([[1.0, 2.0, 3.0]]))
+RANK_TWO = (
+    torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+    torch.tensor([[1.0, 2.0, 3.0], [1.0, 0.0, -1.0]]),
+)
+
+
+def figure_rank(theme: Theme) -> None:
+    """What rank means: small grids built from thin pieces, then LoRA's size.
+
+    A mechanism figure for the intro, before any symbol is defined. Every number
+    on it is computed here: the products, their ranks, and the parameter counts.
+    """
+    fig, ax = plt.subplots(figsize=(11.5, 9.4))
+    ax.set_xlim(0, 11.5)
+    ax.set_ylim(0, 9.4)
+    ax.axis("off")
+    blue, orange = theme.series[0], theme.series[1]
+    cell = 0.52
+
+    def grid(x0, y_top, values, color, filled):
+        """Draw a grid of numbers with its top-left corner at (x0, y_top)."""
+        rows, cols = values.shape
+        for i in range(rows):
+            for j in range(cols):
+                x, y = x0 + j * cell, y_top - (i + 1) * cell
+                ax.add_patch(plt.Rectangle(
+                    (x, y), cell, cell, linewidth=1.2, edgecolor=theme.surface,
+                    facecolor=color if filled else theme.grid, zorder=2))
+                ax.text(x + cell / 2, y + cell / 2, f"{values[i, j]:g}", ha="center",
+                        va="center", fontsize=12, zorder=3,
+                        color=ink_for(color) if filled else theme.ink)
+        return x0 + cols * cell
+
+    def sign(x, y, text):
+        ax.text(x, y, text, ha="center", va="center", fontsize=17, color=theme.secondary)
+
+    def panel(y_top, left, right, heading, notes):
+        product = left @ right
+        rank = int(torch.linalg.matrix_rank(product))
+        ax.text(0.2, y_top + 0.42, heading.format(rank=rank), fontsize=12.5,
+                fontweight="bold", color=theme.ink, va="center")
+        mid = y_top - 1.5 * cell
+        x = grid(0.45, mid + left.shape[0] * cell / 2, left, orange, True)
+        sign(x + 0.35, mid, "×")
+        x = grid(x + 0.70, mid + right.shape[0] * cell / 2, right, blue, True)
+        sign(x + 0.35, mid, "=")
+        x = grid(x + 0.70, y_top, product, None, False)
+        for k, line in enumerate(notes(product, rank)):
+            ax.text(x + 0.55, y_top - 0.30 - 0.36 * k, line, fontsize=10.8,
+                    color=theme.secondary, va="center")
+
+    panel(
+        8.55, *RANK_ONE,
+        "Rank {rank}: every row is a multiple of one row",
+        lambda p, r: [
+            "Each row is  1 2 3  times 1, 2 or 3.",
+            f"{p.numel()} numbers, rebuilt from "
+            f"{RANK_ONE[0].numel()} + {RANK_ONE[1].numel()}: a column times a row.",
+        ],
+    )
+    panel(
+        5.85, *RANK_TWO,
+        "Rank {rank}: two columns times two rows",
+        lambda p, r: [
+            "Row 3 is row 1 plus row 2, so it adds",
+            "nothing new: only 2 rows are independent.",
+            "The 2 both pieces share, columns on the",
+            "left and rows on the right, caps the rank",
+            "at 2, whatever the numbers are.",
+        ],
+    )
+
+    # LoRA's size, drawn in proportion except for the width of 8, which would
+    # be under a pixel.
+    d, r = 896, RANK
+    y_top = 3.05
+    ax.text(0.2, y_top + 0.42, f"LoRA's size: {d} rows by {r}, times {r} rows by {d}",
+            fontsize=12.5, fontweight="bold", color=theme.ink, va="center")
+    side, thin = 2.5, 0.16
+    ax.add_patch(plt.Rectangle((0.45, y_top - side), thin, side, facecolor=orange,
+                               edgecolor="none", zorder=2))
+    sign(0.45 + thin + 0.35, y_top - side / 2, "×")
+    ax.add_patch(plt.Rectangle((1.31, y_top - side / 2 - thin / 2), side, thin,
+                               facecolor=blue, edgecolor="none", zorder=2))
+    sign(1.31 + side + 0.35, y_top - side / 2, "=")
+    ax.add_patch(plt.Rectangle((4.51, y_top - side), side, side, facecolor=theme.grid,
+                               edgecolor=theme.axis, linewidth=1.2, zorder=2))
+    ax.text(4.51 + side / 2, y_top - side / 2, f"{d} × {d}\nrank at most {r}",
+            ha="center", va="center", fontsize=11.5, color=theme.ink, zorder=3,
+            linespacing=1.5)
+    thin_part = d * r
+    full = d * d
+    notes = [
+        f"Tall and thin: {d} rows, each {r} wide, {thin_part:,} numbers.",
+        f"Short and wide: {r} rows, each {d} wide, {thin_part:,} numbers.",
+        f"Their product fills all {full:,} entries, but the {r}",
+        f"both pieces share caps its rank at {r}. Stored: {2 * thin_part:,}",
+        f"numbers, {full / (2 * thin_part):.1f}× fewer than the full grid.",
+    ]
+    for k, line in enumerate(notes):
+        ax.text(7.45, y_top - 0.30 - 0.36 * k, line, fontsize=10.8,
+                color=theme.secondary, va="center")
+    ax.text(11.45, 0.12, f"bottom row in proportion, except the width of {r}, drawn wider so it shows",
+            fontsize=8.6, color=theme.muted, ha="right")
+    ax.set_title("What rank means: a big grid built from thin pieces", loc="left", pad=12)
+    save_both(fig, SLUG, "rank-explained", theme)
+
+
 def figure_mechanism(theme: Theme) -> None:
     """One adapted matrix: the frozen path, the trainable path, and their sum.
 
-    Three lanes, so no label sits where an arrow travels: the frozen path along
-    the top, the trainable path along the bottom, and the sum on the right. The
-    8 on the arrow between A and B is the point of the figure — everything the
-    adapter can do has to pass through it.
+    The trainable path is drawn as a funnel, because the narrowing is the point:
+    A takes 896 numbers down to 8 and B takes them back up to 896, so every
+    change the adapter makes has to pass through those 8. Heights stand for how
+    many numbers flow, in proportion except for the 8, which is drawn wider so
+    it shows. Labels sit above or below each shape, never in an arrow's path.
     """
-    fig, ax = plt.subplots(figsize=(11.5, 5.2))
+    d, r = 896, RANK
+    fig, ax = plt.subplots(figsize=(11.5, 6.6))
     ax.set_xlim(0, 11.5)
-    ax.set_ylim(0, 5.2)
+    ax.set_ylim(0, 6.6)
     ax.axis("off")
     blue, orange = theme.series[0], theme.series[1]
-
-    def box(x, y, w, h, label, lines, color, filled):
-        """A labelled box. Every text line is placed inside it, never beside."""
-        ax.add_patch(
-            plt.Rectangle(
-                (x, y), w, h,
-                facecolor=color if filled else "none",
-                edgecolor=color, linewidth=1.8, zorder=2,
-            )
-        )
-        ink = ink_for(color) if filled else theme.ink
-        top = y + h - 0.30
-        ax.text(x + w / 2, top, label, ha="center", va="center",
-                fontsize=11, fontweight="bold", color=ink, zorder=3)
-        for i, line in enumerate(lines):
-            ax.text(x + w / 2, top - 0.34 - 0.26 * i, line, ha="center", va="center",
-                    fontsize=8.4, color=ink, zorder=3)
+    tall, narrow = 1.5, 0.14  # 896 numbers, and 8 numbers drawn visible
+    top, low = 4.75, 2.25     # centre lines of the two paths
 
     def arrow(x0, y0, x1, y1, color=None):
         ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
                     arrowprops=dict(arrowstyle="-|>", color=color or theme.secondary,
                                     linewidth=1.4))
 
-    # the token's vector, fanning out to both paths
-    ax.text(0.15, 2.60, "x", fontsize=14, fontweight="bold", color=theme.ink, va="center")
-    ax.text(0.10, 2.12, "896", fontsize=8.8, color=theme.muted, va="center")
-    arrow(0.62, 2.78, 1.35, 3.72)
-    arrow(0.62, 2.42, 1.35, 1.55)
+    def label(x, y, lines, color, size=10.2, weight="normal"):
+        for i, line in enumerate(lines):
+            ax.text(x, y - 0.3 * i, line, ha="center", va="center", fontsize=size,
+                    color=color, fontweight=weight if i == 0 else "normal")
 
-    box(1.40, 3.25, 4.20, 1.10, "W    frozen",
-        ["896 rows, each 896 wide: 802,816 parameters"], theme.muted, False)
-    box(1.40, 0.70, 2.10, 1.20, "A    trained",
-        ["8 rows, each 896 wide", "7,168 parameters"], blue, True)
-    box(4.60, 0.70, 2.10, 1.20, "B    trained",
-        ["896 rows, each 8 wide", "7,168 parameters"], blue, True)
+    def bar(x, y, h, color):
+        """A vector drawn as a bar whose height is how many numbers it holds."""
+        ax.add_patch(plt.Rectangle((x - 0.07, y - h / 2), 0.14, h, facecolor=color,
+                                   edgecolor="none", zorder=3))
 
-    # the bottleneck: the one number the figure exists to show
-    arrow(3.50, 1.30, 4.60, 1.30, blue)
-    ax.text(4.05, 1.56, "8", fontsize=13, fontweight="bold", color=blue, ha="center")
-    ax.text(4.05, 2.45, "every change the adapter makes\nsqueezes through these 8 numbers",
-            fontsize=8.4, color=blue, ha="center", va="center", linespacing=1.5)
+    # the input vector, fanning out to both paths
+    bar(0.45, 3.5, tall, theme.secondary)
+    label(0.45, 2.5, ["x", f"{d} numbers"], theme.ink, size=10.5, weight="bold")
+    arrow(0.62, 3.9, 1.35, top)
+    arrow(0.62, 3.1, 1.35, low)
 
-    # the scaling, in its own box on the path rather than beside it
-    box(7.20, 0.88, 1.55, 0.86, "x alpha / r", ["= 16 / 8 = 2.0"], orange, False)
-    arrow(6.70, 1.30, 7.20, 1.30, orange)
-    arrow(8.75, 1.55, 9.52, 2.28, orange)
+    # the frozen path: one full-size matrix
+    ax.add_patch(plt.Rectangle((1.4, top - tall / 2), 4.2, tall, facecolor="none",
+                               edgecolor=theme.muted, linewidth=1.8, zorder=2))
+    label(3.5, top + 0.18, ["W, frozen", f"{d} rows, each {d} wide: {d * d:,} numbers"],
+          theme.ink, size=10.5, weight="bold")
+    label(3.5, top + tall / 2 + 0.35, ["the frozen path: exactly what the base model computes"],
+          theme.secondary, size=10.2)
+    arrow(5.6, top, 9.62, 3.72)
 
-    arrow(5.60, 3.75, 9.52, 2.86)
+    # the trainable path: A narrows 896 -> 8, B widens 8 -> 896
+    xa0, xa1, xb0, xb1 = 1.4, 3.35, 3.85, 5.8
+    ax.add_patch(plt.Polygon([(xa0, low - tall / 2), (xa0, low + tall / 2),
+                              (xa1, low + narrow / 2), (xa1, low - narrow / 2)],
+                             facecolor=blue, edgecolor="none", alpha=0.9, zorder=2))
+    ax.add_patch(plt.Polygon([(xb0, low - narrow / 2), (xb0, low + narrow / 2),
+                              (xb1, low + tall / 2), (xb1, low - tall / 2)],
+                             facecolor=blue, edgecolor="none", alpha=0.9, zorder=2))
+    ax.add_patch(plt.Rectangle((xa1, low - narrow / 2), xb0 - xa1, narrow,
+                               facecolor=orange, edgecolor="none", zorder=3))
+    ax.text(2.05, low, "A", ha="center", va="center", fontsize=15, fontweight="bold",
+            color=ink_for(blue), zorder=4)
+    ax.text(5.15, low, "B", ha="center", va="center", fontsize=15, fontweight="bold",
+            color=ink_for(blue), zorder=4)
+    label((xa1 + xb0) / 2, low + 0.62, [f"{r} numbers"], orange, size=11, weight="bold")
+    label(2.2, low - tall / 2 - 0.3,
+          ["A, trained", f"{r} rows, each {d} wide", f"{r * d:,} numbers"], blue,
+          weight="bold")
+    label(5.0, low - tall / 2 - 0.3,
+          ["B, trained", f"{d} rows, each {r} wide", f"{d * r:,} numbers"], blue,
+          weight="bold")
+    label(3.6, 0.28, [f"the trainable path: {2 * r * d:,} numbers, and every change"
+                      f" it makes passes through {r}"], blue, size=10.2)
 
-    # the sum
-    ax.add_patch(plt.Circle((9.85, 2.56), 0.30, facecolor=theme.surface,
+    # the scaling, on the path
+    ax.add_patch(plt.Rectangle((6.35, low - 0.42), 1.5, 0.84, facecolor="none",
+                               edgecolor=orange, linewidth=1.8, zorder=2))
+    ax.text(7.1, low + 0.13, r"$\times\ \alpha/r$", ha="center", va="center", fontsize=13,
+            color=theme.ink)
+    ax.text(7.1, low - 0.2, f"= {ALPHA:g} / {r} = {ALPHA / r:.1f}", ha="center",
+            va="center", fontsize=9.5, color=theme.secondary)
+    arrow(5.85, low, 6.35, low, blue)
+    arrow(7.85, low + 0.2, 9.65, 3.15, orange)
+
+    # the sum, and the output vector
+    ax.add_patch(plt.Circle((9.9, 3.4), 0.3, facecolor=theme.surface,
                             edgecolor=theme.ink, linewidth=1.6, zorder=2))
-    ax.plot([9.63, 10.07], [2.56, 2.56], color=theme.ink, linewidth=1.4, zorder=3)
-    ax.plot([9.85, 9.85], [2.34, 2.78], color=theme.ink, linewidth=1.4, zorder=3)
-    arrow(10.21, 2.56, 10.80, 2.56)
-    ax.text(10.95, 2.56, "y", fontsize=14, fontweight="bold", color=theme.ink, va="center")
-    ax.text(10.90, 2.08, "896", fontsize=8.8, color=theme.muted, va="center")
+    ax.plot([9.68, 10.12], [3.4, 3.4], color=theme.ink, linewidth=1.4, zorder=3)
+    ax.plot([9.9, 9.9], [3.18, 3.62], color=theme.ink, linewidth=1.4, zorder=3)
+    arrow(10.2, 3.4, 10.75, 3.4)
+    bar(10.95, 3.4, tall, theme.secondary)
+    label(10.95, 2.4, ["y", f"{d} numbers"], theme.ink, size=10.5, weight="bold")
 
-    ax.text(3.50, 4.72, "the frozen path: exactly what the base model already computes",
-            fontsize=9.5, color=theme.secondary, ha="center")
-    ax.text(3.50, 0.30, "the trainable path: 14,336 parameters, rank at most 8",
-            fontsize=9.5, color=blue, ha="center")
-    ax.text(11.45, 0.06, "boxes ordered by size, not drawn to scale",
-            fontsize=8, color=theme.muted, ha="right")
-    ax.set_title("One adapted matrix: layer 12's q_proj at rank 8", loc="left", pad=16)
+    ax.text(11.45, 0.02, f"heights show how many numbers flow; the {r} is drawn wider so it shows",
+            fontsize=8.6, color=theme.muted, ha="right")
+    ax.set_title(f"One adapted matrix: layer {PROBE_LAYER}'s q_proj at rank {r}", loc="left",
+                 pad=12)
     save_both(fig, SLUG, "lora-mechanism", theme)
 
 
@@ -1589,11 +1718,12 @@ def main() -> None:
     rep.section("Figures")
     for theme in THEMES:
         with styled(theme):
+            figure_rank(theme)
             figure_mechanism(theme)
             figure_training_memory(bill, lora_recall.log.trainable, theme)
             figure_rank_sweep(results, baselines, theme)
             figure_spectrum(spectra, theme, (PROBE_LAYER, "q_proj"))
-    rep.note(f"wrote 4 light/dark pairs to figures/{SLUG}/")
+    rep.note(f"wrote 5 light/dark pairs to figures/{SLUG}/")
 
     reset_peak_memory(device)
     peak = peak_memory_bytes(device)
