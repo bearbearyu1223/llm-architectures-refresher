@@ -1313,9 +1313,10 @@ def figure_rank(theme: Theme) -> None:
     notes = [
         f"Tall and thin: {d} rows, each {r} wide, {thin_part:,} numbers.",
         f"Short and wide: {r} rows, each {d} wide, {thin_part:,} numbers.",
-        f"Their product fills all {full:,} entries, but the {r}",
-        f"both pieces share caps its rank at {r}. Stored: {2 * thin_part:,}",
-        f"numbers, {full / (2 * thin_part):.1f}× fewer than the full grid.",
+        f"Their product fills all {d} × {d} = {full:,} entries,",
+        f"but the {r} both pieces share caps its rank at {r}.",
+        f"Stored: {thin_part:,} + {thin_part:,} = {2 * thin_part:,} numbers.",
+        f"{full:,} / {2 * thin_part:,} = {full / (2 * thin_part):.1f}× fewer than the full grid.",
     ]
     for k, line in enumerate(notes):
         ax.text(7.45, y_top - 0.30 - 0.36 * k, line, fontsize=10.8,
