@@ -1425,6 +1425,228 @@ def figure_mechanism(theme: Theme) -> None:
     save_both(fig, SLUG, "lora-mechanism", theme)
 
 
+def figure_placement(model: nn.Module, theme: Theme) -> None:
+    """Where the adapters go: the whole model on the left, one layer opened up.
+
+    ``model`` must already carry its adapters. Every number is read from it: the
+    shapes and adapter sizes from the census, the head counts from the config,
+    and the bottom strip's parts, which must add up to the base model exactly.
+    """
+    census = census_adapters(model, RANK, ALPHA)
+    cfg = model.config
+    kinds = {kind: (d_in, d_out, each) for kind, d_in, d_out, _, each, _ in census.rows()}
+    per_layer = sum(each for _, _, each in kinds.values())
+    layers = cfg.num_hidden_layers
+    assert per_layer * layers == census.total
+
+    embed = model.model.embed_tokens.weight
+    assert model.lm_head.weight.data_ptr() == embed.data_ptr(), "the figure says tied"
+    adapter_ids = {id(p) for _, m in lora_modules(model) for p in (m.A, m.B)}
+    frozen = [(n, p) for n, p in model.named_parameters() if id(p) not in adapter_ids]
+    norms = sum(p.numel() for n, p in frozen if "norm" in n)
+    biases = sum(p.numel() for n, p in frozen if n.endswith(".bias"))
+    beside = census.frozen_matrix_params
+    assert embed.numel() + norms + biases + beside == census.base_total
+
+    d, vocab = cfg.hidden_size, cfg.vocab_size
+    lift = 1.4  # everything above the parameter strip sits this much higher
+    fig, ax = plt.subplots(figsize=(12, 12.4))
+    ax.set_xlim(0, 12)
+    ax.set_ylim(0, 12.4)
+    ax.axis("off")
+    blue = theme.series[0]
+
+    def arrow(x0, y0, x1, y1, head=True):
+        ax.annotate("", xy=(x1, y1 + lift), xytext=(x0, y0 + lift),
+                    arrowprops=dict(arrowstyle="-|>" if head else "-",
+                                    color=theme.secondary, linewidth=1.3,
+                                    shrinkA=0, shrinkB=0))
+
+    def line(xs, ys, **kw):
+        kw.setdefault("color", theme.secondary)
+        kw.setdefault("linewidth", 1.3)
+        ax.plot(xs, [y + lift for y in ys], **kw)
+
+    def box(x0, y0, w, h, lines, fill=None, edge=None, sizes=None, bold_first=True):
+        fill = fill or theme.grid
+        ax.add_patch(plt.Rectangle((x0, y0 + lift), w, h, facecolor=fill,
+                                   edgecolor=edge or theme.muted, linewidth=1.2, zorder=2))
+        sizes = sizes or [10.8] + [9.6] * (len(lines) - 1)
+        step = 0.22 if len(lines) > 2 else 0.24
+        top = y0 + h / 2 + step * (len(lines) - 1) / 2
+        for i, (s, size) in enumerate(zip(lines, sizes, strict=True)):
+            ax.text(x0 + w / 2, top - step * i + lift, s, ha="center", va="center",
+                    fontsize=size, color=ink_for(fill) if fill != theme.grid else theme.ink,
+                    fontweight="bold" if (i == 0 and bold_first) else "normal", zorder=3)
+
+    def matrix(xc, y0, kind, h=0.72):
+        """A frozen projection, with its adapter attached on the right."""
+        d_in, d_out, each = kinds[kind]
+        w, badge = 1.36, 0.84
+        box(xc - w / 2, y0, w, h, [kind, f"{d_in:,} -> {d_out:,}"])
+        ax.add_patch(plt.Rectangle((xc + w / 2, y0 + 0.08 + lift), badge, h - 0.16,
+                                   facecolor=blue, edgecolor="none", zorder=2))
+        for i, s in enumerate(("adapter", f"{each:,}")):
+            ax.text(xc + w / 2 + badge / 2, y0 + h / 2 + 0.12 - 0.24 * i + lift, s,
+                    ha="center", va="center", fontsize=10 if i else 9.4,
+                    fontweight="bold" if i else "normal", color=ink_for(blue), zorder=3)
+
+    def add(xc, yc):
+        ax.add_patch(plt.Circle((xc, yc + lift), 0.14, facecolor=theme.surface,
+                                edgecolor=theme.ink, linewidth=1.3, zorder=3))
+        line([xc - 0.08, xc + 0.08], [yc, yc], color=theme.ink, zorder=4)
+        line([xc, xc], [yc - 0.08, yc + 0.08], color=theme.ink, zorder=4)
+
+    # --- left: the whole model, top to bottom
+    lx, lw = 0.55, 2.4
+    lc = lx + lw / 2
+    ax.text(lc, 10.45 + lift, "token ids in", ha="center", va="center", fontsize=10,
+            color=theme.secondary)
+    arrow(lc, 10.3, lc, 10.0)
+    box(lx, 9.15, lw, 0.85, ["embedding table", f"{vocab:,} rows,", f"each {d} wide"])
+    arrow(lc, 9.15, lc, 8.62)
+    for k in (2, 1):
+        ax.add_patch(plt.Rectangle((lx + 0.1 * k, 5.0 + 0.1 * k + lift), lw, 3.5,
+                                   facecolor=theme.surface, edgecolor=theme.muted,
+                                   linewidth=1.0, zorder=1))
+    ax.add_patch(plt.Rectangle((lx, 5.0 + lift), lw, 3.5, facecolor=theme.surface,
+                               edgecolor=theme.ink, linewidth=1.5, zorder=2))
+    for i, (s, size, weight) in enumerate([
+        ("decoder layer", 11, "bold"), (f"x {layers}", 20, "bold"),
+        ("7 adapters in each,", 10, "normal"), (f"{per_layer:,} numbers", 10, "normal"),
+        (f"x {layers} = {census.total:,}", 10, "normal"),
+    ]):
+        ax.text(lc, 7.95 - [0, 0.62, 1.3, 1.55, 1.8][i] + lift, s, ha="center",
+                va="center", fontsize=size, fontweight=weight, color=theme.ink, zorder=3)
+    # one pip per adapter: attention's four above the MLP's three
+    for count, y in ((4, 5.6), (3, 5.2)):
+        for k in range(count):
+            ax.add_patch(plt.Rectangle((lc - 0.15 * count + 0.05 + 0.3 * k, y + lift), 0.2,
+                                       0.3, facecolor=blue, edgecolor="none", zorder=3))
+    arrow(lc, 5.0, lc, 4.62)
+    box(lx, 4.2, lw, 0.42, ["final norm"], sizes=[10.4])
+    arrow(lc, 4.2, lc, 3.82)
+    box(lx, 2.95, lw, 0.87, ["output head", "the embedding table", "again (tied)"])
+    arrow(lc, 2.95, lc, 2.62)
+    ax.text(lc, 2.45 + lift, f"scores for {vocab:,} tokens", ha="center", va="center",
+            fontsize=10, color=theme.secondary)
+    # the tie: one matrix read in both directions
+    line([lx, lx - 0.28, lx - 0.28, lx], [9.57, 9.57, 3.38, 3.38],
+         linestyle=(0, (4, 3)), color=theme.muted)
+    ax.text(lx - 0.42, 6.5 + lift, "one matrix, used twice", rotation=90, ha="center",
+            va="center", fontsize=9.4, color=theme.muted)
+
+    # --- right: one layer opened up
+    px0, px1, py0, py1 = 3.75, 11.85, 1.0, 10.55
+    ax.add_patch(plt.Rectangle((px0, py0 + lift), px1 - px0, py1 - py0, facecolor="none",
+                               edgecolor=theme.muted, linewidth=1.2,
+                               linestyle=(0, (5, 3)), zorder=1))
+    line([lx + lw, px0], [8.5, py1], linestyle=(0, (5, 3)), color=theme.muted, linewidth=1.0)
+    line([lx + lw, px0], [5.0, py0], linestyle=(0, (5, 3)), color=theme.muted, linewidth=1.0)
+    ax.text(px0 + 0.2, 10.25 + lift, f"Inside one decoder layer, the same in all {layers}",
+            fontsize=11.5, fontweight="bold", color=theme.ink, va="center")
+
+    q_c, k_c, v_c = 5.05, 7.45, 9.85
+    xm = k_c
+    ax.text(xm, 9.85 + lift, f"one token's vector in: {d} numbers", ha="center",
+            va="center", fontsize=10, color=theme.secondary)
+    arrow(xm, 9.72, xm, 9.55)
+    box(xm - 1.2, 9.25, 2.4, 0.3, ["norm"], sizes=[10.2])
+    line([xm, xm], [9.25, 9.05])
+    line([q_c, v_c], [9.05, 9.05])
+    for c in (q_c, k_c, v_c):
+        arrow(c, 9.05, c, 8.75)
+    for c, kind in ((q_c, "q_proj"), (k_c, "k_proj"), (v_c, "v_proj")):
+        matrix(c, 8.03, kind)
+        ax.text(c - 0.68, 7.88 + lift, "+ bias, no adapter", ha="left", va="center",
+                fontsize=8.6, color=theme.muted)
+    for c in (q_c, k_c, v_c):
+        line([c, c], [7.78, 7.62])
+    line([q_c, v_c], [7.62, 7.62])
+    arrow(xm, 7.62, xm, 7.45)
+    heads, groups = cfg.num_attention_heads, cfg.num_key_value_heads
+    box(xm - 2.4, 6.85, 4.8, 0.6,
+        ["attention", f"{heads} query heads share {groups} key/value heads; no weights"],
+        sizes=[10.8, 9.6])
+    arrow(xm, 6.85, xm, 6.57)
+    matrix(xm, 5.85, "o_proj")
+    arrow(xm, 5.85, xm, 5.63)
+    add(xm, 5.49)
+
+    # the MLP
+    arrow(xm, 5.35, xm, 5.13)
+    box(xm - 1.2, 4.83, 2.4, 0.3, ["norm"], sizes=[10.2])
+    g_c, u_c = 5.85, 9.0
+    line([xm, xm], [4.83, 4.65])
+    line([g_c, u_c], [4.65, 4.65])
+    for c in (g_c, u_c):
+        arrow(c, 4.65, c, 4.42)
+    matrix(g_c, 3.7, "gate_proj")
+    matrix(u_c, 3.7, "up_proj")
+    for c in (g_c, u_c):
+        arrow(c, 3.7, c, 3.45)
+    box(xm - 2.75, 2.95, 5.5, 0.5,
+        [f"up scaled by gate, entry by entry: {cfg.intermediate_size:,} numbers, no weights"],
+        sizes=[10.2], bold_first=False)
+    arrow(xm, 2.95, xm, 2.72)
+    matrix(xm, 2.0, "down_proj")
+    arrow(xm, 2.0, xm, 1.78)
+    add(xm, 1.64)
+    arrow(xm, 1.5, xm, 1.33)
+    ax.text(xm, 1.2 + lift, f"{d} numbers out, to the next layer", ha="center",
+            va="center", fontsize=10, color=theme.secondary)
+
+    # the residual stream, on its own rail at the left edge
+    rail = 4.14
+    line([xm, rail, rail], [9.64, 9.64, 5.49])
+    arrow(rail, 5.49, xm - 0.14, 5.49)
+    line([xm, rail, rail], [5.25, 5.25, 1.64])
+    arrow(rail, 1.64, xm - 0.14, 1.64)
+    for y in (7.4, 3.3):
+        ax.text(rail - 0.17, y + lift, "input added back", rotation=90, ha="center",
+                va="center", fontsize=9.2, color=theme.muted)
+
+    # legend, in the panel's bottom-right corner, clear of every arrow
+    for y, fill, label in ((1.75, blue, f"adapter, trained (rank {RANK})"),
+                           (1.47, None, "its number: its size"),
+                           (1.19, theme.grid, "frozen, never trained")):
+        if fill:
+            ax.add_patch(plt.Rectangle((9.15, y - 0.09 + lift), 0.3, 0.18, facecolor=fill,
+                                       edgecolor=theme.muted, linewidth=0.8))
+        ax.text(9.55, y + lift, label, va="center", fontsize=9.4, color=theme.secondary)
+
+    # --- bottom: where the parameters are, to scale
+    total = census.base_total
+    x0, width = 0.55, 11.1
+    ax.text(x0, 2.0, f"Where the {total:,} parameters are, drawn to scale",
+            fontsize=11.5, fontweight="bold", color=theme.ink, va="center")
+    parts = [
+        (beside, theme.muted, "matrices with an adapter beside them"),
+        (embed.numel(), theme.grid, "embedding table, no adapter"),
+    ]
+    x = x0
+    for count, fill, label in parts:
+        w = width * count / total
+        ax.add_patch(plt.Rectangle((x, 1.05), w, 0.62, facecolor=fill,
+                                   edgecolor=theme.muted, linewidth=1.0))
+        ax.text(x + w / 2, 1.36, f"{label}\n{count:,} ({count / total:.1%})",
+                ha="center", va="center", fontsize=10, color=ink_for(fill), linespacing=1.5)
+        x += w
+    ax.text(x0 + width, 0.86, f"norms {norms:,} and q/k/v biases {biases:,}: "
+            "too small to see, no adapter", ha="right", va="center", fontsize=9.2,
+            color=theme.muted)
+    ax.add_patch(plt.Rectangle((x0, 0.3), width * census.total / total, 0.45,
+                               facecolor=blue, edgecolor="none"))
+    ax.text(x0 + width * census.total / total + 0.12, 0.525,
+            f"the adapters, the only numbers trained: {census.total:,} "
+            f"({census.share_of_base:.2%} of the model), on the same scale",
+            ha="left", va="center", fontsize=10, color=theme.ink)
+
+    ax.set_title(f"Where the adapters go in {MODEL.split('/')[-1]}: all seven projections, "
+                 f"in all {layers} layers", loc="left", pad=12)
+    save_both(fig, SLUG, "adapter-placement", theme)
+
+
 def figure_training_memory(bill: Bill, adapter_params: int, theme: Theme) -> None:
     """Section 4 as a picture: four equal copies against one copy plus a sliver.
 
@@ -1848,11 +2070,12 @@ def main() -> None:
         with styled(theme):
             figure_rank(theme)
             figure_mechanism(theme)
+            figure_placement(base, theme)
             figure_training_memory(bill, lora_recall.log.trainable, theme)
             figure_rank_sweep(results, baselines, theme)
             figure_energy(theme)
             figure_spectrum(spectra, theme, (PROBE_LAYER, "q_proj"))
-    rep.note(f"wrote 6 light/dark pairs to figures/{SLUG}/")
+    rep.note(f"wrote 7 light/dark pairs to figures/{SLUG}/")
 
     reset_peak_memory(device)
     peak = peak_memory_bytes(device)
