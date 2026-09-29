@@ -1553,6 +1553,133 @@ def figure_rank_sweep(
     save_both(fig, SLUG, "rank-sweep", theme)
 
 
+# Two 4 x 4 matrices for the energy figure, built as H diag(s) H^T with H a
+# scaled Hadamard matrix, so the singular values are exactly s. These s were
+# searched for: every entry comes out a whole number, and 90% of the energy is
+# reached well clear of a direction boundary. The spread one needs all four
+# directions for 90%; the concentrated one needs two.
+ENERGY_SPREAD = (5.0, 5.0, 3.0, 3.0)
+ENERGY_CONCENTRATED = (7.0, 3.0, 1.0, 1.0)
+
+
+def energy_example(values: tuple[float, ...]) -> torch.Tensor:
+    """A 4 x 4 matrix whose singular values are exactly ``values``."""
+    h = torch.tensor([[1, 1, 1, 1], [1, -1, 1, -1], [1, 1, -1, -1], [1, -1, -1, 1]],
+                     dtype=torch.float64) / 2
+    return h @ torch.diag(torch.tensor(values, dtype=torch.float64)) @ h.T
+
+
+def figure_energy(theme: Theme) -> None:
+    """What energy is, and the two measurements section 6 makes with it.
+
+    A mechanism figure on a toy scale: two 4 x 4 matrices, the sum of squared
+    entries, the same total rebuilt from squared singular values, and each
+    direction's share. Every number on it is computed here from the matrices.
+    """
+    fig, ax = plt.subplots(figsize=(12, 9.0))
+    ax.set_xlim(0, 12)
+    ax.set_ylim(0, 9.0)
+    ax.axis("off")
+    cell = 0.52
+    bar_scale = 4 * cell  # a bar this tall would hold 100% of the energy
+
+    def text(x, y, s, **kw):
+        kw.setdefault("fontsize", 10.8)
+        kw.setdefault("color", theme.secondary)
+        ax.text(x, y, s, va="center", **kw)
+
+    def panel(y_top, values, heading, color):
+        matrix = energy_example(values)
+        entries = matrix.round().int()
+        assert torch.equal(entries.double(), matrix), "entries must be whole numbers"
+        found = torch.linalg.svdvals(matrix)
+        assert torch.allclose(found, torch.tensor(values, dtype=torch.float64))
+        sizes = [int(v) for v in values]
+        squares = [v * v for v in sizes]
+        total = sum(squares)
+        assert int((entries**2).sum()) == total
+
+        ax.text(0.2, y_top + 0.42, heading, fontsize=12.5, fontweight="bold",
+                color=theme.ink, va="center")
+        base = y_top - 4 * cell
+
+        # the matrix
+        for i in range(4):
+            for j in range(4):
+                x, y = 0.45 + j * cell, y_top - (i + 1) * cell
+                ax.add_patch(plt.Rectangle((x, y), cell, cell, linewidth=1.2,
+                                           edgecolor=theme.surface, facecolor=theme.grid))
+                text(x + cell / 2, y + cell / 2, f"{int(entries[i, j])}", ha="center",
+                     fontsize=12, color=theme.ink)
+
+        # its size two ways: from the entries, then from the singular values
+        left, first_col, step = 3.35, 5.25, 0.62
+        rows = [int(r) for r in (entries**2).sum(dim=1)]
+        assert len(set(rows)) == 1, "the figure states one sum for every row"
+        first = " + ".join(str(int(e) ** 2) for e in entries[0])
+        text(left, y_top - 0.20, f"Square every entry and add: each row is {first} = {rows[0]},")
+        text(left, y_top - 0.56, f"and 4 rows × {rows[0]} = {total}.")
+        for k, (label, cells) in enumerate([
+            ("direction", [str(d + 1) for d in range(4)]),
+            ("singular value", [str(v) for v in sizes]),
+            ("squared", [str(e) for e in squares]),
+        ]):
+            y = y_top - 1.05 - 0.40 * k
+            weight, ink = ("bold", theme.ink) if k == 0 else ("normal", theme.secondary)
+            text(left, y, label, color=ink, fontweight=weight)
+            for d, c in enumerate(cells):
+                text(first_col + d * step, y, c, ha="center", color=ink, fontweight=weight)
+        text(left, y_top - 2.30,
+             f"{' + '.join(map(str, squares))} = {total}, the same total as the entries.")
+
+        # each direction's share, drawn to one scale in both panels
+        bar_left, width, gap = 9.35, 0.46, 0.62
+        centre = bar_left + (3 * gap + width) / 2
+        text(centre, y_top + 0.14, f"energy per direction, of {total}", ha="center",
+             fontsize=10)
+        for d, e in enumerate(squares):
+            x = bar_left + d * gap
+            height = bar_scale * e / total
+            ax.add_patch(plt.Rectangle((x, base), width, height, facecolor=color,
+                                       edgecolor="none"))
+            text(x + width / 2, base + height + 0.16, f"{e}", ha="center",
+                 color=theme.ink, fontsize=10.5)
+            text(x + width / 2, base - 0.22, f"{d + 1}", ha="center", fontsize=10)
+        ax.plot([bar_left - 0.12, bar_left + 3 * gap + width + 0.12], [base, base],
+                color=theme.secondary, linewidth=1.0)
+
+        # the two measurements section 6 makes
+        needed = _energy_rank(torch.tensor(values), 0.90)
+        if needed == len(sizes):
+            short = sum(squares[:needed - 1])
+            first_line = (f"90% takes all {needed} directions: the largest {needed - 1} "
+                          f"hold {' + '.join(map(str, squares[:needed - 1]))} = {short} "
+                          f"of {total}, only {short / total:.1%}.")
+        else:
+            held = sum(squares[:needed])
+            first_line = (f"90% takes {needed} of {len(sizes)} directions: "
+                          f"{' + '.join(map(str, squares[:needed]))} = {held} of {total} "
+                          f"= {held / total:.1%}.")
+        top = squares[0]
+        second_line = (f"The largest direction alone holds {top} of {total} = "
+                       f"{top / total:.1%}, all that the best rank-1 version could keep.")
+        text(0.45, base - 0.78, first_line, color=theme.ink)
+        text(0.45, base - 1.14, second_line, color=theme.ink)
+
+    panel(7.95, ENERGY_SPREAD,
+          r"A.  Energy spread across directions, like a trained weight $W$", theme.muted)
+    panel(3.85, ENERGY_CONCENTRATED,
+          "B.  Energy concentrated in one direction, like the change "
+          r"$\Delta W$ a fine-tune makes", theme.series[0])
+    ax.text(0.2, 0.18,
+            "The entries don't show it: A is mostly zeros and needs every direction, "
+            "B has no zeros and is mostly one. Section 6 runs the same two measurements on "
+            "896 directions, with the largest 8.",
+            fontsize=8.8, color=theme.muted, va="center")
+    ax.set_title("Energy: how much of a matrix each direction carries", loc="left", pad=12)
+    save_both(fig, SLUG, "energy-explained", theme)
+
+
 def figure_spectrum(
     spectra: dict[str, dict[tuple[int, str], torch.Tensor]],
     theme: Theme,
@@ -1723,8 +1850,9 @@ def main() -> None:
             figure_mechanism(theme)
             figure_training_memory(bill, lora_recall.log.trainable, theme)
             figure_rank_sweep(results, baselines, theme)
+            figure_energy(theme)
             figure_spectrum(spectra, theme, (PROBE_LAYER, "q_proj"))
-    rep.note(f"wrote 5 light/dark pairs to figures/{SLUG}/")
+    rep.note(f"wrote 6 light/dark pairs to figures/{SLUG}/")
 
     reset_peak_memory(device)
     peak = peak_memory_bytes(device)

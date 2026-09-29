@@ -13,6 +13,9 @@ from llmrefresher.demos.d06_lora import (
     Bill,
     _energy_rank,
     _top_k_energy,
+    ENERGY_CONCENTRATED,
+    ENERGY_SPREAD,
+    energy_example,
     date_task,
     recall_task,
 )
@@ -230,3 +233,16 @@ def test_median_range_reads_median_then_extremes():
     from llmrefresher.demos.d06_lora import _median_range
 
     assert _median_range([5, 1, 9]) == "5 (1-9)"
+
+
+def test_energy_examples_are_whole_numbers_with_the_stated_spectra():
+    # The energy figure prints these matrices and says their singular values
+    # are exactly these, and that squared entries and squared singular values
+    # give the same total.
+    for values, needed in ((ENERGY_SPREAD, 4), (ENERGY_CONCENTRATED, 2)):
+        matrix = energy_example(values)
+        assert torch.equal(matrix, matrix.round())
+        spectrum = torch.linalg.svdvals(matrix)
+        assert torch.allclose(spectrum, torch.tensor(values, dtype=torch.float64))
+        assert float((matrix**2).sum()) == sum(v * v for v in values)
+        assert _energy_rank(spectrum, 0.90) == needed
