@@ -526,6 +526,46 @@ def step_breakdown(
     return tuple(1000.0 * statistics.median(p[i] for p in phases) for i in range(3))
 
 
+def the_training_run(rep: Report, task: Task, tokenizer) -> None:
+    """Receipt: what one training example is, and how much data 200 steps see.
+
+    The first table is the exact sequence the trainer builds from one fact, via
+    the same :func:`batches` the runs use, so the labels shown are the labels
+    trained on. Needs only the tokenizer.
+    """
+    ids, labels = next(batches(task.train[:1], tokenizer, batch_size=1, seed=0,
+                               device=torch.device("cpu")))
+    # The labels sit beside the tokens they name; the model shifts them by one
+    # internally, so position i is graded on predicting label i + 1. Show that.
+    tokens, targets = ids[0].tolist(), labels[0].tolist()[1:] + [-100]
+    rows = []
+    for position, (token, target) in enumerate(zip(tokens, targets, strict=True)):
+        shown = "not graded" if target == -100 else repr(tokenizer.decode([target]))
+        rows.append((position, repr(tokenizer.decode([token])), shown))
+    prompt, answer = task.train[0]
+    rep.note(f"One {task.name} example as the trainer builds it. The prompt is")
+    rep.note(f"{prompt.strip()!r}")
+    rep.note(f"and the answer is {answer!r}:")
+    rep.blank()
+    rep.table(["position", "token", "graded on predicting"], rows)
+    graded = sum(target != -100 for target in targets)
+    rep.blank()
+    rep.note(f"{graded} of {len(tokens)} positions are graded: the three that predict the")
+    rep.note("answer's pieces, and the one that predicts end-of-text, which is")
+    rep.note("what teaches the model to stop.")
+    rep.blank()
+
+    seen = STEPS * BATCH
+    rep.table(
+        ["step", "result", ""],
+        [
+            ("examples per step", f"{BATCH}", "drawn at random"),
+            (f"x {STEPS} steps", f"{seen:,}", "examples seen"),
+            (f"/ {len(task.train)} facts", f"{seen / len(task.train):.1f}", "times each, on average"),
+        ],
+    )
+
+
 def what_training_costs(
     rep: Report,
     full: Run,
@@ -2005,9 +2045,11 @@ def main() -> None:
     where_the_adapters_go(rep, base)
 
     rep.section("4. What training costs                              [post §4]")
+    recall = by_name["recall"]
+    the_training_run(rep, recall, tokenizer)
+    rep.blank()
     rep.note("The memorization task twice: every parameter, then 0.9% of them.")
     rep.blank()
-    recall = by_name["recall"]
     full_recall, changes_recall = full_finetune(recall, tokenizer, device)
     lora_recall, adapted = lora_finetune(recall, tokenizer, device, keep=True)
     timing = {
