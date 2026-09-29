@@ -1585,10 +1585,11 @@ def figure_placement(model: nn.Module, theme: Theme) -> None:
     matrix(u_c, 3.7, "up_proj")
     for c in (g_c, u_c):
         arrow(c, 3.7, c, 3.45)
-    box(xm - 2.75, 2.95, 5.5, 0.5,
-        [f"up scaled by gate, entry by entry: {cfg.intermediate_size:,} numbers, no weights"],
-        sizes=[10.2], bold_first=False)
-    arrow(xm, 2.95, xm, 2.72)
+    box(xm - 2.75, 2.87, 5.5, 0.58,
+        [f"gate x up, pair by pair: {cfg.intermediate_size:,} numbers",
+         "each gate number, switched, dims its up number; no weights"],
+        sizes=[10.4, 9.6])
+    arrow(xm, 2.87, xm, 2.72)
     matrix(xm, 2.0, "down_proj")
     arrow(xm, 2.0, xm, 1.78)
     add(xm, 1.64)
