@@ -1954,13 +1954,13 @@ def figure_energy(theme: Theme) -> None:
         text(0.45, base - 1.14, second_line, color=theme.ink)
 
     panel(7.95, ENERGY_SPREAD,
-          r"A.  Energy spread across directions, like a trained weight $W$", theme.muted)
+          r"1.  Energy spread across directions, like a trained weight $W$", theme.muted)
     panel(3.85, ENERGY_CONCENTRATED,
-          "B.  Energy concentrated in one direction, like the change "
+          "2.  Energy concentrated in one direction, like the change "
           r"$\Delta W$ a fine-tune makes", theme.series[0])
     ax.text(0.2, 0.18,
-            "The entries don't show it: A is mostly zeros and needs every direction, "
-            "B has no zeros and is mostly one. Section 6 runs the same two measurements on "
+            "The entries don't show it: matrix 1 is mostly zeros and needs every direction, "
+            "matrix 2 has no zeros and is mostly one. Section 6 runs the same two measurements on "
             "896 directions, with the largest 8.",
             fontsize=8.8, color=theme.muted, va="center")
     ax.set_title("Energy: how much of a matrix each direction carries", loc="left", pad=12)
