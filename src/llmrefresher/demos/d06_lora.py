@@ -544,7 +544,7 @@ def the_training_run(rep: Report, task: Task, tokenizer) -> None:
         rows.append((position, repr(tokenizer.decode([token])), shown))
     prompt, answer = task.train[0]
     rep.note(f"One {task.name} example as the trainer builds it. The prompt is")
-    rep.note(f"{prompt.strip()!r}")
+    rep.note(f"{prompt!r}")
     rep.note(f"and the answer is {answer!r}:")
     rep.blank()
     rep.table(["position", "token", "graded on predicting"], rows)
