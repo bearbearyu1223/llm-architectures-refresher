@@ -1747,9 +1747,12 @@ def figure_training_memory(bill: Bill, adapter_params: int, theme: Theme) -> Non
     ax.set_xlim(0, copy * 4.75)
     ax.set_ylim(-0.95, 1.5)
     ax.xaxis.set_major_formatter(lambda value, _pos: f"{value:,.0f}")
-    ax.set_xlabel("model state held while training, MiB (fp32; activations and buffers not counted)")
-    ax.set_title("LoRA removes three of the four copies and cannot touch the fourth",
-                 loc="left")
+    ax.set_xlabel("model-state memory counted here, MiB (fp32; activations and buffers not counted)")
+    # Both ratios computed, never typed: trainable parameters, then the bars' totals.
+    fewer = bill.parameters / adapter_params
+    full_total, lora_total = copy * 4, copy + one * 4
+    ax.set_title(f"Why {fewer:.0f}x fewer trainable parameters becomes only "
+                 f"{full_total / lora_total:.1f}x less model-state memory", loc="left")
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.tick_params(axis="y", length=0)
