@@ -554,6 +554,15 @@ def the_training_run(rep: Report, task: Task, tokenizer) -> None:
     rep.note("answer's pieces, and the one that predicts end-of-text, which is")
     rep.note("what teaches the model to stop.")
     rep.blank()
+    # Why the answer is three pieces: the prompt's last token is the space, so
+    # the answer is tokenized without one, and the vocabulary has the city
+    # only in its spaced form.
+    alone = tokenizer(answer, add_special_tokens=False).input_ids
+    spaced = tokenizer(" " + answer, add_special_tokens=False).input_ids
+    pieces = ", ".join(repr(tokenizer.decode([i])) for i in alone)
+    rep.note(f"{answer!r} on its own is {len(alone)} tokens ({pieces}). With a leading")
+    rep.note(f"space, {' ' + answer!r} is {len(spaced)} token.")
+    rep.blank()
 
     seen = STEPS * BATCH
     rep.table(
@@ -582,11 +591,13 @@ def what_training_costs(
     """
     full_log, lora_log = full.log, lora.log
     full_score, lora_score = full.score, lora.score
-    per_trainable = 3 * 4  # gradient + AdamW's two moments, 4 bytes each
+    per_trainable = 3 * 4  # fp32 gradient + AdamW's two fp32 moments, 4 bytes each
     full_extra = full_log.trainable * per_trainable
     lora_extra = lora_log.trainable * per_trainable
+    # The adapters are parameters too, held beside the frozen weights.
+    adapter_weights = lora_log.trainable * bill.bytes_per_number
     full_total = bill.weights + full_extra
-    lora_total = bill.weights + lora_extra
+    lora_total = bill.weights + adapter_weights + lora_extra
 
     def mib(n: int) -> str:
         return f"{n / MIB:,.1f}"
@@ -596,9 +607,10 @@ def what_training_costs(
         [
             ("trainable parameters", f"{full_log.trainable:,}", f"{lora_log.trainable:,}"),
             ("share of the model", "100.00%", f"{lora_log.trainable / full_log.trainable:.2%}"),
-            ("weights held (MiB)", mib(bill.weights), mib(bill.weights)),
+            ("base model weights (MiB)", mib(bill.weights), mib(bill.weights)),
+            ("adapter weights (MiB)", "none", mib(adapter_weights)),
             ("gradient + two moments (MiB)", mib(full_extra), mib(lora_extra)),
-            ("total held (MiB)", mib(full_total), mib(lora_total)),
+            ("model state counted (MiB)", mib(full_total), mib(lora_total)),
             ("loss at step 0", f"{full_log.losses[0]:.4f}", f"{lora_log.losses[0]:.4f}"),
             ("loss, mean of last 10 steps", f"{full_log.final_loss:.4f}", f"{lora_log.final_loss:.4f}"),
             ("exact match", f"{full_score[0]} of {full_score[1]}", f"{lora_score[0]} of {lora_score[1]}"),
@@ -606,9 +618,11 @@ def what_training_costs(
         ],
     )
     rep.blank()
-    rep.note("Both columns hold the weights: a frozen parameter still has to be")
-    rep.note("in memory for the forward pass. Neither column counts the")
-    rep.note("activations the backward pass stores, which depend on batch size.")
+    rep.note("Both columns hold the base weights: a frozen parameter still has")
+    rep.note("to be in memory for the forward pass. This counts model state")
+    rep.note("only, all in fp32. Not counted: the activations the backward pass")
+    rep.note("stores (they grow with batch size and sequence length), temporary")
+    rep.note("buffers, and allocator overhead. It is not peak GPU memory.")
     rep.blank()
     rep.table(
         ["step", "result", ""],
@@ -621,9 +635,10 @@ def what_training_costs(
             ("the same for the adapters", f"{lora_extra:,}", "bytes"),
             ("ratio", f"{full_extra / lora_extra:.0f}x", "less"),
             ("", "", ""),
-            ("+ the weights, held either way", f"{bill.weights:,}", "bytes"),
-            ("total, full fine-tune", f"{full_total:,}", "bytes"),
-            ("total, LoRA r=8", f"{lora_total:,}", "bytes"),
+            ("+ base weights, held either way", f"{bill.weights:,}", "bytes"),
+            ("+ adapter weights, LoRA only", f"{adapter_weights:,}", "bytes"),
+            ("model state, full fine-tune", f"{full_total:,}", "bytes"),
+            ("model state, LoRA r=8", f"{lora_total:,}", "bytes"),
             ("ratio of totals", f"{full_total / lora_total:.1f}x", "less"),
         ],
     )
@@ -635,11 +650,14 @@ def what_training_costs(
     rep.blank()
     phases = ("forward pass", "backward pass", "optimizer update")
     rows = []
-    for i, phase in enumerate(phases):
-        f, lo = timing["full"][i], timing["lora"][i]
-        rows.append((phase, f"{f:.0f}", f"{lo:.0f}", f"{f / lo:.1f}x"))
-    f_sum, l_sum = sum(timing["full"]), sum(timing["lora"])
-    rows.append(("one step", f"{f_sum:.0f}", f"{l_sum:.0f}", f"{f_sum / l_sum:.1f}x"))
+    # Round to whole milliseconds first and do every sum and ratio on the
+    # rounded values, so the table adds up and divides as a reader checks it.
+    full_ms = [round(v) for v in timing["full"]]
+    lora_ms = [round(v) for v in timing["lora"]]
+    for phase, f, lo in zip(phases, full_ms, lora_ms, strict=True):
+        rows.append((phase, f"{f}", f"{lo}", f"{f / lo:.1f}x"))
+    f_sum, l_sum = sum(full_ms), sum(lora_ms)
+    rows.append(("one step", f"{f_sum}", f"{l_sum}", f"{f_sum / l_sum:.1f}x"))
     rep.table(["phase", "full fine-tune", "LoRA r=8", "full / LoRA"], rows)
     rep.blank()
     rep.note("Wall clock, so the milliseconds move from run to run. The forward")
@@ -653,8 +671,8 @@ def what_training_costs(
     rep.takeaway(
         f"LoRA trains {lora_log.trainable / full_log.trainable:.2%} of the parameters and holds "
         f"{full_extra / lora_extra:.0f}x less gradient and optimizer state, but only "
-        f"{full_total / lora_total:.1f}x less memory in total, because the frozen weights are "
-        "still there. On the same steps of the same data it reaches "
+        f"{full_total / lora_total:.1f}x less model state in total, because the frozen weights "
+        "are still there. On the same steps of the same data it reaches "
         f"{verdict} the full fine-tune, at learning rates of {LORA_LR} against {FULL_LR}."
     )
 
@@ -1697,16 +1715,18 @@ def figure_training_memory(bill: Bill, adapter_params: int, theme: Theme) -> Non
     """
     fig, ax = plt.subplots(figsize=(10.5, 3.3))
     copy = bill.weights / MIB
-    adapter_extra = adapter_params * 12 / MIB
-    labels = ("weights", "gradient", "AdamW 1st moment", "AdamW 2nd moment")
-    colors = (theme.muted, theme.series[0], theme.series[1], theme.series[2])
+    one = adapter_params * bill.bytes_per_number / MIB  # one adapter-sized block
+    state = ("gradient", "AdamW 1st moment", "AdamW 2nd moment")
+    state_colors = (theme.series[0], theme.series[1], theme.series[2])
     bars = (
-        ("full fine-tune", [copy, copy, copy, copy]),
-        ("LoRA r=8", [copy, adapter_extra * 4 / 12, adapter_extra * 4 / 12, adapter_extra * 4 / 12]),
+        ("full fine-tune", [("weights", copy, theme.muted)]
+         + [(label, copy, color) for label, color in zip(state, state_colors, strict=True)]),
+        ("LoRA r=8", [("weights (frozen)", copy, theme.muted), ("", one, theme.muted)]
+         + [(label, one, color) for label, color in zip(state, state_colors, strict=True)]),
     )
-    for y, (_name, widths) in zip((1, 0), bars, strict=True):
+    for y, (_name, segments) in zip((1, 0), bars, strict=True):
         left = 0.0
-        for label, width, color in zip(labels, widths, colors, strict=True):
+        for label, width, color in segments:
             ax.barh(y, width, left=left, height=0.56, color=color,
                     edgecolor=theme.surface, linewidth=1.2)
             if width > copy * 0.5:
@@ -1716,8 +1736,9 @@ def figure_training_memory(bill: Bill, adapter_params: int, theme: Theme) -> Non
         ax.text(left + copy * 0.05, y, f"{left:,.1f} MiB", va="center", fontsize=10.5,
                 color=theme.ink, fontweight="bold")
     ax.annotate(
-        f"adapters' gradient + moments: {adapter_extra:,.1f} MiB, too thin to see",
-        (copy + adapter_extra, -0.28), textcoords="offset points", xytext=(14, -14),
+        f"adapters: {one:,.1f} MiB of weights + {one * 3:,.1f} MiB of gradient and moments,"
+        " too thin to see",
+        (copy + one * 4, -0.28), textcoords="offset points", xytext=(14, -14),
         fontsize=9, color=theme.secondary, va="top",
         arrowprops={"arrowstyle": "-", "color": theme.secondary, "linewidth": 1},
     )
@@ -1726,7 +1747,7 @@ def figure_training_memory(bill: Bill, adapter_params: int, theme: Theme) -> Non
     ax.set_xlim(0, copy * 4.75)
     ax.set_ylim(-0.95, 1.5)
     ax.xaxis.set_major_formatter(lambda value, _pos: f"{value:,.0f}")
-    ax.set_xlabel("memory held while training, MiB (fp32, activations not counted)")
+    ax.set_xlabel("model state held while training, MiB (fp32; activations and buffers not counted)")
     ax.set_title("LoRA removes three of the four copies and cannot touch the fourth",
                  loc="left")
     for side in ("top", "right", "left"):
