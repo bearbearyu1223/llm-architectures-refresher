@@ -58,6 +58,7 @@ from ..lora import (
     set_route,
     trainable_parameters,
 )
+from .. import progress
 from ..plotting import THEMES, Theme, figure_dir, ink_for, save_both, styled
 from ..report import Report
 from ..training import Example, TrainLog, batches, exact_match, train
@@ -437,14 +438,18 @@ def full_finetune(
         key: _named_linear(model, *key).weight.detach().clone().cpu()
         for key in (ALL_MATRICES if keep_spectra else ())
     }
-    log = train(model, task.train, tokenizer, device=device, steps=STEPS, batch_size=BATCH, lr=lr)
+    log = train(model, task.train, tokenizer, device=device, steps=STEPS, batch_size=BATCH, lr=lr,
+                on_step=progress.training(f"full fine-tune, {task.name}, lr {lr:g}", STEPS))
     spectra = {}
+    if before:
+        progress.status(f"    singular values of {len(before)} changes, on the CPU")
     for key, old in before.items():
         change = _named_linear(model, *key).weight.detach().cpu() - old
         # SVD has no MPS kernel in torch 2.13; these run on the CPU.
         spectra[key] = torch.linalg.svdvals(change.float())
     score = exact_match(model, task.evaluate, tokenizer, device=device)
     ppl = passage_perplexity(model, tokenizer, device)
+    progress.status(f"    scored {score[0]} of {score[1]}, passage perplexity {_ppl(ppl)}")
     _release(model, before)
     return Run(log, score, ppl), spectra
 
@@ -470,11 +475,14 @@ def lora_finetune(
     model = _load(device)
     torch.manual_seed(seed)
     inject_lora(model, targets, rank=rank, alpha=float(2 * rank))
+    where = "" if targets == TARGETS else f", {len(targets)} of {len(TARGETS)} matrix kinds"
     log = train(
-        model, task.train, tokenizer, device=device, steps=steps, batch_size=BATCH, lr=LORA_LR
+        model, task.train, tokenizer, device=device, steps=steps, batch_size=BATCH, lr=LORA_LR,
+        on_step=progress.training(f"LoRA r={rank}, {task.name}, seed {seed}{where}", steps),
     )
     score = exact_match(model, task.evaluate, tokenizer, device=device)
     ppl = passage_perplexity(model, tokenizer, device)
+    progress.status(f"    scored {score[0]} of {score[1]}, passage perplexity {_ppl(ppl)}")
     if keep:
         return Run(log, score, ppl), model
     _release(model)
@@ -497,6 +505,7 @@ def step_breakdown(
     to reach the adapters below. What it skips is the second multiply every
     trainable weight needs, the one that computes its own gradient.
     """
+    progress.status(f"timing one step's three phases, {'LoRA' if lora else 'full fine-tune'}")
     model = _load(device)
     if lora:
         torch.manual_seed(0)
@@ -728,6 +737,7 @@ def untrained_baseline(
     drawn from the same seeded stream, so the two are comparable. Returns the
     loss, the score, and the perplexity every fine-tune is compared against.
     """
+    progress.status(f"untrained baseline, {task.name}")
     model = _load(device)
     model.eval()
     stream = batches(task.train, tokenizer, batch_size=BATCH, seed=7, device=device)
@@ -910,6 +920,7 @@ def why_the_update_is_low_rank(
     depths; then every layer at once, which is what the claim needs.
     """
     spectra: dict[str, dict[tuple[int, str], torch.Tensor]] = {"base": {}}
+    progress.status(f"singular values of the {len(ALL_MATRICES)} base weights, on the CPU")
     for key in ALL_MATRICES:
         weight = _named_linear(model, *key).weight.detach().float().cpu()
         spectra["base"][key] = torch.linalg.svdvals(weight)
@@ -1047,6 +1058,7 @@ def forward_timings(
     Measured once and quoted by both section 7 and section 8, so the two
     sections cannot disagree about the same configuration.
     """
+    progress.status("timing forward passes: merged, one adapter separate, mixed batch")
     out: dict[str, dict[str, float]] = {}
     set_route(mixed, torch.arange(8) % 2)  # alternate the two customers' rows
     for label, batch, length in REGIMES:
@@ -2028,6 +2040,8 @@ def main() -> None:
     torch.manual_seed(0)
     rep = Report("06", "LoRA: what rank buys, and what it costs to serve")
     rep.header()
+    progress.status("demo06: 55 training runs, about 80 minutes on an Apple-silicon Mac; "
+                    "progress goes to stderr, receipts to stdout")
 
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(MODEL)

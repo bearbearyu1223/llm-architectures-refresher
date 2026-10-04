@@ -18,6 +18,7 @@ from __future__ import annotations
 import textwrap
 from typing import Iterable, Sequence
 
+from . import progress
 from .device import hardware_info
 
 WIDTH = 74
@@ -42,6 +43,7 @@ class Report:
         print(hardware_info().render())
 
     def section(self, title: str) -> None:
+        progress.section(title)  # stderr, and only when stdout is a file
         print()
         print("-" * WIDTH)
         print(title)
