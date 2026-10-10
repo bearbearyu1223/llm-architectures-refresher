@@ -1224,7 +1224,7 @@ def one_batch_two_customers(
 ) -> None:
     """Receipt: two adapters served in one batch, checked row by row, and what it costs.
 
-    Row 0 is a recall question and row 1 a date, each routed to the adapter
+    Row 0 is a date and row 1 a recall question, each routed to the adapter
     trained for it. Each row's answer is checked against that adapter run on
     its own, and the batch is run again with the routing swapped, to show the
     answers come from the routing and not from the prompts alone.
@@ -2036,6 +2036,121 @@ def figure_spectrum(
 # --- main ----------------------------------------------------------------
 
 
+def figure_mixed_batch(tasks: dict[str, Task], theme: Theme) -> None:
+    """Section 8 as a picture: one batch, two customers, one adapted matrix.
+
+    Laid out like ``lora-mechanism`` so the reader already knows the shape: the
+    frozen path on top, the adapter path below. What is new is that the input
+    is a stack of rows, the frozen W takes the whole stack in one multiply, and
+    the adapter path looks each row's A and B up by its route. The rows and
+    their answers are section 8's own batch, read from the tasks.
+    """
+    d, r = 896, RANK
+    names = list(tasks)
+    rows = [tasks[name].evaluate[0] for name in names]
+    colors = theme.series[: len(names)]
+    fig, ax = plt.subplots(figsize=(12.5, 6.3))
+    ax.set_xlim(0, 12.5)
+    ax.set_ylim(0, 6.3)
+    ax.axis("off")
+    top, low, store = 5.15, 2.85, 0.95  # centre lines: frozen path, adapter path, store
+    row_h = 0.46
+
+    def arrow(x0, y0, x1, y1, color=None, style="-|>"):
+        ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                    arrowprops=dict(arrowstyle=style, color=color or theme.secondary,
+                                    linewidth=1.4))
+
+    def stack(x, y, w, labels, size=9.6):
+        """The batch drawn as rows, one per request, each in its adapter's color."""
+        for i, (text, color) in enumerate(zip(labels, colors, strict=True)):
+            y0 = y + row_h * (len(labels) / 2 - 1 - i)
+            ax.add_patch(plt.Rectangle((x, y0), w, row_h, facecolor=color,
+                                       edgecolor=theme.surface, linewidth=1.5, zorder=3))
+            ax.text(x + w / 2, y0 + row_h / 2, text, ha="center", va="center",
+                    fontsize=size, color=ink_for(color), zorder=4)
+
+    # the batch: one row per request, each naming its adapter
+    stack(0.25, 4.0, 2.7, [f"row {i}: route = {name}" for i, name in enumerate(names)])
+    for i, (prompt, _) in enumerate(rows):
+        ax.text(0.25, 3.3 - 0.62 * i, f"row {i}'s prompt:\n\"{' '.join(prompt.split())}\"",
+                fontsize=8.6, color=theme.secondary, ha="left", va="top", linespacing=1.4)
+    ax.text(1.6, 4.75, "x: one batch, two customers", ha="center", va="center",
+            fontsize=10.5, color=theme.ink, fontweight="bold")
+    arrow(2.97, 4.2, 3.75, top)
+    arrow(2.97, 3.77, 3.77, low + 0.42)
+
+    # the frozen path: one multiply for every row at once
+    ax.add_patch(plt.Rectangle((3.8, top - 0.6), 3.6, 1.2, facecolor="none",
+                               edgecolor=theme.muted, linewidth=1.8, zorder=2))
+    ax.text(5.6, top + 0.18, "W, frozen, shared", ha="center", va="center",
+            fontsize=10.5, color=theme.ink, fontweight="bold")
+    ax.text(5.6, top - 0.18, "one multiply covers every row", ha="center",
+            va="center", fontsize=9.6, color=theme.secondary)
+    ax.text(5.6, top + 0.9, "the frozen path: the base model, unchanged, batched as usual",
+            ha="center", va="center", fontsize=9.8, color=theme.secondary)
+    arrow(7.4, top, 10.05, 4.25)
+
+    # the adapter path: each row multiplied by its own A and B
+    ax.add_patch(plt.Rectangle((3.8, low - 0.62), 3.6, 1.24, facecolor="none",
+                               edgecolor=theme.secondary, linewidth=1.4, zorder=2))
+    for i, (name, color) in enumerate(zip(names, colors, strict=True)):
+        y = low + 0.28 - 0.56 * i
+        ax.add_patch(plt.Rectangle((3.95, y - 0.22), 3.3, 0.44, facecolor=color,
+                                   edgecolor="none", zorder=3))
+        ax.text(5.6, y, f"row {i}:  $B_{{\\mathrm{{{name}}}}}\\,A_{{\\mathrm{{{name}}}}}\\,x_{i}$",
+                ha="center", va="center", fontsize=10.5, color=ink_for(color), zorder=4)
+    ax.text(3.85, low + 0.88, "the adapter path: a small multiply per row, with that row's own A and B",
+            ha="left", va="center", fontsize=9.8, color=theme.secondary)
+    ax.add_patch(plt.Rectangle((7.85, low - 0.4), 1.4, 0.8, facecolor="none",
+                               edgecolor=theme.secondary, linewidth=1.4, zorder=2))
+    ax.text(8.55, low + 0.12, r"$\times\ \alpha/r$", ha="center", va="center", fontsize=12.5,
+            color=theme.ink)
+    ax.text(8.55, low - 0.2, f"= {ALPHA:g} / {r} = {ALPHA / r:.1f}", ha="center",
+            va="center", fontsize=9.2, color=theme.secondary)
+    arrow(7.4, low, 7.85, low)
+    arrow(9.25, low + 0.15, 10.05, 3.75)
+
+    # the store the route reads from
+    slot_w = 2.6
+    for i, (name, color) in enumerate(zip(names, colors, strict=True)):
+        x = 3.8 + i * (slot_w + 0.1)
+        ax.add_patch(plt.Rectangle((x, store - 0.3), slot_w, 0.6, facecolor="none",
+                                   edgecolor=color, linewidth=2.0, zorder=2))
+        ax.text(x + slot_w / 2, store + 0.09, f"{name}: A, B", ha="center", va="center",
+                fontsize=10, color=theme.ink, fontweight="bold")
+        ax.text(x + slot_w / 2, store - 0.15, f"{2 * r * d:,} numbers at this matrix", ha="center",
+                va="center", fontsize=8.8, color=theme.secondary)
+    x_more = 3.8 + len(names) * (slot_w + 0.1)
+    ax.add_patch(plt.Rectangle((x_more, store - 0.3), 1.2, 0.6, facecolor="none",
+                               edgecolor=theme.muted, linewidth=1.2, linestyle=(0, (3, 2)),
+                               zorder=2))
+    ax.text(x_more + 0.6, store, "more\ncustomers", ha="center", va="center", fontsize=8.8,
+            color=theme.muted)
+    ax.text(3.8, store + 0.55, "adapters held on the GPU, one per customer", ha="left",
+            va="center", fontsize=9.8, color=theme.secondary)
+    arrow(5.6, store + 0.75, 5.6, low - 0.64)
+    ax.text(5.75, (store + 0.75 + low - 0.64) / 2, "each row's route picks its slot",
+            ha="left", va="center", fontsize=9.2, color=theme.secondary)
+
+    # the sum, and each row's output
+    ax.add_patch(plt.Circle((10.3, 4.0), 0.27, facecolor=theme.surface,
+                            edgecolor=theme.ink, linewidth=1.6, zorder=2))
+    ax.plot([10.1, 10.5], [4.0, 4.0], color=theme.ink, linewidth=1.4, zorder=3)
+    ax.plot([10.3, 10.3], [3.8, 4.2], color=theme.ink, linewidth=1.4, zorder=3)
+    arrow(10.57, 4.0, 10.9, 4.0)
+    stack(10.95, 4.0, 1.45, [f"$y_{i}$" for i in range(len(names))], size=11)
+    ax.text(11.67, 4.75, "y", ha="center", va="center", fontsize=10.5, color=theme.ink,
+            fontweight="bold")
+    answers = " and ".join(f"row {i} answers {answer}" for i, (_, answer) in enumerate(rows))
+    ax.text(12.4, 0.12, f"Through all the adapted matrices and greedy decoding, {answers}. "
+            f"Numbers are for layer {PROBE_LAYER}'s q_proj at rank {r}.",
+            fontsize=8.6, color=theme.muted, ha="right")
+    ax.set_title("One mixed batch at one adapted matrix: W shared, A and B looked up per row",
+                 loc="left", pad=12)
+    save_both(fig, SLUG, "mixed-batch", theme)
+
+
 def main() -> None:
     torch.manual_seed(0)
     rep = Report("06", "LoRA: what rank buys, and what it costs to serve")
@@ -2156,7 +2271,8 @@ def main() -> None:
             figure_rank_sweep(results, baselines, theme)
             figure_energy(theme)
             figure_spectrum(spectra, theme, (PROBE_LAYER, "q_proj"))
-    rep.note(f"wrote 7 light/dark pairs to figures/{SLUG}/")
+            figure_mixed_batch(by_name, theme)
+    rep.note(f"wrote 8 light/dark pairs to figures/{SLUG}/")
 
     reset_peak_memory(device)
     peak = peak_memory_bytes(device)
