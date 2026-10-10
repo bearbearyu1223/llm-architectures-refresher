@@ -2151,6 +2151,191 @@ def figure_mixed_batch(tasks: dict[str, Task], theme: Theme) -> None:
     save_both(fig, SLUG, "mixed-batch", theme)
 
 
+# Section 8's serving figures are schematics of how serving systems are built,
+# not measurements, so their contents are an illustrative scenario: six queued
+# requests, a cap of two adapters per batch, and three copies of the server.
+SCENARIO_QUEUE = ("A", "B", "C", "A", "D", "B")
+SCENARIO_MAX_LORAS = 2
+SCENARIO_CPU_CACHE = ("C", "E", "F")
+SCENARIO_COPIES = (("A", "B", "C"), ("A", "D", "E"), ("A", "F", "G"))
+
+
+def _box(ax, x, y, w, h, edge, *, fill="none", lw=1.6, dashed=False, z=2):
+    ax.add_patch(plt.Rectangle((x, y), w, h, facecolor=fill, edgecolor=edge, linewidth=lw,
+                               linestyle=(0, (3, 2)) if dashed else "solid", zorder=z))
+
+
+def _arrow(ax, x0, y0, x1, y1, color, *, lw=1.4, dashed=False):
+    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                arrowprops=dict(arrowstyle="-|>", color=color, linewidth=lw,
+                                linestyle=(0, (3, 2)) if dashed else "solid"))
+
+
+def figure_adapter_tiers(theme: Theme) -> None:
+    """One server's view: the queue, the per-batch adapter cap, and the three tiers.
+
+    Color carries status only (blue: in this step's batch; orange: waiting), and
+    every chip also says which adapter it names, so nothing depends on color.
+    """
+    blue, orange = theme.series[0], theme.series[1]
+    queue = list(enumerate(SCENARIO_QUEUE, start=1))
+    chosen: list[str] = []
+    for _, name in queue:  # first come, first served, up to the cap
+        if name not in chosen and len(chosen) < SCENARIO_MAX_LORAS:
+            chosen.append(name)
+    batch = [(i, n) for i, n in queue if n in chosen]
+    waiting = [(i, n) for i, n in queue if n not in chosen]
+    on_disk_only = [n for _, n in waiting if n not in SCENARIO_CPU_CACHE]
+
+    fig, ax = plt.subplots(figsize=(12.5, 6.2))
+    ax.set_xlim(0, 12.5)
+    ax.set_ylim(0, 6.2)
+    ax.axis("off")
+
+    def chip(x, y, w, text, color):
+        _box(ax, x, y - 0.19, w, 0.38, "none", fill=color, z=3)
+        ax.text(x + w / 2, y, text, ha="center", va="center", fontsize=9.6,
+                color=ink_for(color), zorder=4)
+
+    # the queue
+    ax.text(1.3, 5.55, "incoming requests", ha="center", fontsize=10.5, fontweight="bold",
+            color=theme.ink)
+    for k, (i, name) in enumerate(queue):
+        chip(0.3, 5.1 - 0.44 * k, 2.0, f"request {i}: adapter {name}",
+             blue if name in chosen else orange)
+    _arrow(ax, 2.4, 3.95, 3.15, 3.95, theme.secondary)
+
+    # the scheduler
+    _box(ax, 3.2, 3.2, 2.7, 1.2, theme.secondary)
+    ax.text(4.55, 4.05, "scheduler", ha="center", va="center", fontsize=10.5,
+            fontweight="bold", color=theme.ink)
+    ax.text(4.55, 3.7, "builds this step's batch,", ha="center", va="center", fontsize=9.4,
+            color=theme.secondary)
+    ax.text(4.55, 3.42, f"at most {SCENARIO_MAX_LORAS} different adapters", ha="center",
+            va="center", fontsize=9.4, color=theme.secondary)
+
+    # this step's batch
+    _arrow(ax, 5.9, 3.95, 6.55, 4.45, blue)
+    ax.text(7.55, 5.55, "this step's batch", ha="center", fontsize=10.5, fontweight="bold",
+            color=theme.ink)
+    for k, (i, name) in enumerate(batch):
+        chip(6.6, 5.05 - 0.45 * k, 1.9, f"request {i}: {name}", blue)
+
+    # who waits, and why
+    _arrow(ax, 4.55, 3.2, 4.55, 2.5, orange)
+    ax.text(3.2, 2.22, "waiting for a later step", ha="left", va="center", fontsize=10.5,
+            fontweight="bold", color=theme.ink)
+    for k, (i, name) in enumerate(waiting):
+        why = ("loading from disk into CPU memory" if name in on_disk_only
+               else f"in CPU memory; the batch already has {SCENARIO_MAX_LORAS}")
+        chip(3.2, 1.72 - 0.5 * k, 2.0, f"request {i}: adapter {name}", orange)
+        ax.text(5.35, 1.72 - 0.5 * k, why, ha="left", va="center", fontsize=9.4,
+                color=theme.secondary)
+
+    # the three tiers
+    tiers = (
+        ("GPU", f"adapters a batch can use: max-loras = {SCENARIO_MAX_LORAS}", chosen, 4.25),
+        ("CPU memory", "a cache of recent adapters: max-cpu-loras", list(SCENARIO_CPU_CACHE), 2.65),
+        ("disk", "every adapter the server knows", ["A", "B", "...", "Z"], 1.05),
+    )
+    for title, sub, slots, y in tiers:
+        _box(ax, 9.0, y - 0.5, 3.3, 1.15, theme.muted)
+        ax.text(9.12, y + 0.42, title, ha="left", va="center", fontsize=10.5,
+                fontweight="bold", color=theme.ink)
+        ax.text(9.12, y + 0.14, sub, ha="left", va="center", fontsize=8.8,
+                color=theme.secondary)
+        for k, name in enumerate(slots):
+            x = 9.15 + 0.62 * k
+            fill = blue if title == "GPU" else theme.surface
+            _box(ax, x, y - 0.38, 0.5, 0.36, theme.secondary if title != "GPU" else "none",
+                 fill=fill, lw=1.0, z=3)
+            ax.text(x + 0.25, y - 0.2, name, ha="center", va="center", fontsize=9.6,
+                    color=ink_for(fill) if title == "GPU" else theme.ink, zorder=4)
+    _arrow(ax, 11.6, 1.7, 11.6, 2.15, theme.secondary)
+    ax.text(11.7, 1.92, "load", ha="left", va="center", fontsize=9, color=theme.secondary)
+    _arrow(ax, 11.6, 3.3, 11.6, 3.75, theme.secondary)
+    ax.text(11.7, 3.52, "copy", ha="left", va="center", fontsize=9, color=theme.secondary)
+    _arrow(ax, 8.5, 4.6, 8.95, 4.4, blue)
+
+    ax.text(12.4, 0.05, "A schematic of the scheduling, not a measurement: the queue and the "
+            "cap of 2 are an example.", ha="right", fontsize=8.6, color=theme.muted)
+    ax.set_title("One server: a batch can only use adapters already on the GPU, "
+                 "and only so many at once", loc="left", pad=12)
+    save_both(fig, SLUG, "adapter-tiers", theme)
+
+
+def figure_serving_cluster(theme: Theme) -> None:
+    """Many GPUs: a router in front of copies of the server, each split across two GPUs."""
+    blue = theme.series[0]
+    target = "D"
+    home = next(k for k, held in enumerate(SCENARIO_COPIES) if target in held)
+    everywhere = sorted(set.intersection(*(set(h) for h in SCENARIO_COPIES)))
+
+    fig, ax = plt.subplots(figsize=(12.5, 6.6))
+    ax.set_xlim(0, 12.5)
+    ax.set_ylim(0, 6.6)
+    ax.axis("off")
+
+    ax.text(6.25, 6.25, "requests arriving, each naming its adapter", ha="center",
+            va="center", fontsize=10.5, color=theme.secondary)
+    _arrow(ax, 6.25, 6.05, 6.25, 5.62, theme.secondary)
+    _box(ax, 2.0, 4.82, 8.5, 0.8, theme.secondary)
+    ax.text(6.25, 5.36, "adapter-aware router", ha="center", va="center", fontsize=10.5,
+            fontweight="bold", color=theme.ink)
+    ax.text(6.25, 5.04, "send each request to a copy that already holds its adapter, "
+            "unless that copy is overloaded", ha="center", va="center", fontsize=9.2,
+            color=theme.secondary)
+
+    # fan-out: stub down, a bus, then one drop into each copy
+    w, gap, x0 = 3.8, 0.35, 0.3
+    centres = [x0 + k * (w + gap) + w / 2 for k in range(len(SCENARIO_COPIES))]
+    bus = 4.45
+    ax.plot([6.25, 6.25], [4.82, bus], color=theme.secondary, linewidth=1.4)
+    ax.plot([centres[0], centres[-1]], [bus, bus], color=theme.secondary, linewidth=1.4)
+    for k, c in enumerate(centres):
+        color = blue if k == home else theme.secondary
+        _arrow(ax, c, bus, c, 4.07, color, lw=2.2 if k == home else 1.4)
+    ax.text(centres[home] + 0.12, 4.26, f"a request for adapter {target}", ha="left",
+            va="center", fontsize=9.2, color=blue, fontweight="bold")
+
+    for k, held in enumerate(SCENARIO_COPIES):
+        x = x0 + k * (w + gap)
+        _box(ax, x, 0.75, w, 3.3, blue if k == home else theme.muted,
+             lw=2.2 if k == home else 1.6)
+        ax.text(x + 0.15, 3.8, f"copy {k + 1} of the server", ha="left", va="center",
+                fontsize=10.5, fontweight="bold", color=theme.ink)
+        ax.text(x + 0.15, 3.5, "adapters loaded: " + ", ".join(held), ha="left",
+                va="center", fontsize=9.4, color=theme.secondary)
+        for g in range(2):
+            gx = x + 0.15 + g * 1.9
+            _box(ax, gx, 1.0, 1.6, 2.2, theme.secondary, lw=1.2)
+            ax.text(gx + 0.8, 2.98, f"GPU {2 * k + g}", ha="center", va="center",
+                    fontsize=9.6, fontweight="bold", color=theme.ink)
+            _box(ax, gx + 0.12, 2.2, 1.36, 0.5, "none", fill=theme.muted, z=3)
+            ax.text(gx + 0.8, 2.45, "half of W", ha="center", va="center", fontsize=9,
+                    color=ink_for(theme.muted), zorder=4)
+            for j, name in enumerate(held):
+                ax.add_patch(plt.Rectangle((gx + 0.12 + j * 0.475, 1.55), 0.41, 0.42,
+                                           facecolor=blue, edgecolor="none", zorder=3))
+                ax.text(gx + 0.325 + j * 0.475, 1.76, name, ha="center", va="center",
+                        fontsize=9, color=ink_for(blue), zorder=4)
+            ax.text(gx + 0.8, 1.25, "half of each A, B", ha="center", va="center",
+                    fontsize=8.6, color=theme.secondary)
+        ax.annotate("", xy=(x + 2.07, 2.45), xytext=(x + 1.73, 2.45),
+                    arrowprops=dict(arrowstyle="<|-|>", color=theme.secondary, linewidth=1.4,
+                                    mutation_scale=9, shrinkA=0, shrinkB=0))
+
+    ax.text(0.3, 0.42, "Inside a copy, every matrix is split across its GPUs and each "
+            "adapter is split to match; the GPUs swap partial results every layer.",
+            ha="left", va="center", fontsize=9.2, color=theme.secondary)
+    ax.text(12.4, 0.08, f"A schematic, not a measurement. Adapter {', '.join(everywhere)} is "
+            "popular, so every copy keeps it loaded.", ha="right", fontsize=8.6,
+            color=theme.muted)
+    ax.set_title("Many GPUs: copies of the server behind a router, each copy split across GPUs",
+                 loc="left", pad=12)
+    save_both(fig, SLUG, "serving-cluster", theme)
+
+
 def main() -> None:
     torch.manual_seed(0)
     rep = Report("06", "LoRA: what rank buys, and what it costs to serve")
@@ -2272,7 +2457,9 @@ def main() -> None:
             figure_energy(theme)
             figure_spectrum(spectra, theme, (PROBE_LAYER, "q_proj"))
             figure_mixed_batch(by_name, theme)
-    rep.note(f"wrote 8 light/dark pairs to figures/{SLUG}/")
+            figure_adapter_tiers(theme)
+            figure_serving_cluster(theme)
+    rep.note(f"wrote 10 light/dark pairs to figures/{SLUG}/")
 
     reset_peak_memory(device)
     peak = peak_memory_bytes(device)

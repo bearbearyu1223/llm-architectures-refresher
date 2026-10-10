@@ -104,23 +104,62 @@ device memory : 17.2 GB
 --------------------------------------------------------------------------
 4. What training costs                              [post §4]
 --------------------------------------------------------------------------
+  One recall example as the trainer builds it. The prompt is
+  'Q: Where is the amber anchor archive?\nA: '
+  and the answer is 'Sofia':
+
+  position            token  graded on predicting
+  -------------------------------------------------
+  0                     'Q'            not graded
+  1                     ':'            not graded
+  2                ' Where'            not graded
+  3                   ' is'            not graded
+  4                  ' the'            not graded
+  5                ' amber'            not graded
+  6               ' anchor'            not graded
+  7              ' archive'            not graded
+  8                   '?\n'            not graded
+  9                     'A'            not graded
+  10                    ':'            not graded
+  11                    ' '                   'S'
+  12                    'S'                  'of'
+  13                   'of'                  'ia'
+  14                   'ia'       '<|endoftext|>'
+  15        '<|endoftext|>'            not graded
+
+  4 of 16 positions are graded: the three that predict the
+  answer's pieces, and the one that predicts end-of-text, which is
+  what teaches the model to stop.
+
+  'Sofia' on its own is 3 tokens ('S', 'of', 'ia'). With a leading
+  space, ' Sofia' is 1 token.
+
+  step               result
+  ---------------------------------------------------
+  examples per step       8         drawn at random
+  x 200 steps         1,600           examples seen
+  / 64 facts           25.0  times each, on average
+
   The memorization task twice: every parameter, then 0.9% of them.
 
                                 full fine-tune   LoRA r=8
   ---------------------------------------------------------
   trainable parameters             494,032,768  4,399,104
   share of the model                   100.00%      0.89%
-  weights held (MiB)                   1,884.6    1,884.6
+  base model weights (MiB)             1,884.6    1,884.6
+  adapter weights (MiB)                   none       16.8
   gradient + two moments (MiB)         5,653.8       50.3
-  total held (MiB)                     7,538.3    1,934.9
+  model state counted (MiB)            7,538.3    1,951.7
   loss at step 0                        6.9305     6.9305
   loss, mean of last 10 steps           0.0002     0.0013
   exact match                         40 of 40   40 of 40
-  seconds per step                        0.67       0.21
+  seconds per step                        0.66       0.21
 
-  Both columns hold the weights: a frozen parameter still has to be
-  in memory for the forward pass. Neither column counts the
-  activations the backward pass stores, which depend on batch size.
+  Both columns hold the base weights: a frozen parameter still has
+  to be in memory for the forward pass. This counts model state
+  only, all in fp32. Not counted: the activations the backward pass
+  stores (they grow with batch size and sequence length), temporary
+  buffers, and allocator overhead. It is not peak GPU memory.
 
   step                                           result
   -------------------------------------------------------------------
@@ -132,26 +171,27 @@ device memory : 17.2 GB
   the same for the adapters                  52,789,248       bytes
   ratio                                            112x        less
 
-  + the weights, held either way          1,976,131,072       bytes
-  total, full fine-tune                   7,904,524,288       bytes
-  total, LoRA r=8                         2,028,920,320       bytes
+  + base weights, held either way         1,976,131,072       bytes
+  + adapter weights, LoRA only               17,596,416       bytes
+  model state, full fine-tune             7,904,524,288       bytes
+  model state, LoRA r=8                   2,046,516,736       bytes
   ratio of totals                                  3.9x        less
 
   One training step, split into its three phases (ms, median of 10):
 
   phase             full fine-tune  LoRA r=8  full / LoRA
   ---------------------------------------------------------
-  forward pass                  84        93         0.9x
-  backward pass                186       113         1.6x
-  optimizer update             406        16        25.9x
-  one step                     676       221         3.1x
+  forward pass                  83        92         0.9x
+  backward pass                178       109         1.6x
+  optimizer update             383        30        12.8x
+  one step                     644       231         2.8x
 
   Wall clock, so the milliseconds move from run to run. The forward
   pass is the same work in both columns; the backward pass is not,
   because a frozen weight needs no gradient of its own computed.
 
   >> LoRA trains 0.89% of the parameters and holds 112x less gradient and
-     optimizer state, but only 3.9x less memory in total, because the
+     optimizer state, but only 3.9x less model state in total, because the
      frozen weights are still there. On the same steps of the same data it
      reaches a loss 0.0011 higher than the full fine-tune, at learning
      rates of 0.0002 against 1e-05.
@@ -160,18 +200,18 @@ device memory : 17.2 GB
 
   full fine-tune, recall          lr 1e-05  lr 0.0002
   -----------------------------------------------------
-  loss, mean of last 10 steps       0.0002     0.1775
-  exact match                     40 of 40   38 of 40
-  perplexity on post 4's passage     22.08     65,115
-    vs untrained                     1.06x     3,120x
+  loss, mean of last 10 steps       0.0002     0.0429
+  exact match                     40 of 40   39 of 40
+  perplexity on post 4's passage     22.08  2,291,268
+    vs untrained                     1.06x   109,785x
 
   Untrained, the model scores 20.87 on the same passage. Lower
   is better: it is how many tokens the model is, on average, torn
   between. None of the passage resembles the task.
 
-  >> At the adapters' learning rate a full fine-tune gets 38 of 40, and
-     its perplexity on ordinary prose goes from 20.87 to 65,115. At 1e-05
-     it gets 40 of 40 and ends at 22.08.
+  >> At the adapters' learning rate a full fine-tune gets 39 of 40, and
+     its perplexity on ordinary prose goes from 20.87 to 2,291,268. At
+     1e-05 it gets 40 of 40 and ends at 22.08.
 
 --------------------------------------------------------------------------
 5. What rank buys                                   [post §5]
@@ -263,43 +303,43 @@ device memory : 17.2 GB
 
   matrix     W itself  change, format  change, recall
   -----------------------------------------------------
-  q_proj        10.1%           63.7%           68.3%
-  k_proj        22.5%           68.4%           74.1%
+  q_proj        10.1%           63.6%           68.3%
+  k_proj        22.5%           68.3%           74.1%
   v_proj        11.1%           59.7%           67.5%
-  o_proj         7.6%           72.4%           71.2%
-  gate_proj      5.3%           50.2%           54.6%
-  up_proj        2.7%           54.3%           58.2%
-  down_proj      5.4%           49.5%           54.5%
+  o_proj         7.6%           72.5%           71.2%
+  gate_proj      5.3%           50.3%           54.6%
+  up_proj        2.7%           54.5%           58.2%
+  down_proj      5.4%           49.8%           54.5%
 
   The same measurement on q_proj at four depths:
 
   q_proj    W itself  change, format  change, recall
   ----------------------------------------------------
-  layer 0         55              28              18
-  layer 8        321              89              50
+  layer 0         55              29              18
+  layer 8        321              90              50
   layer 16       191              30              26
-  layer 23       239              43              35
+  layer 23       239              44              35
 
   Every layer: directions for 90%, median over the 24 layers
   (smallest-largest):
 
   matrix          W itself  change, format  change, recall
   ----------------------------------------------------------
-  q_proj      288 (55-331)     59 (28-118)      36 (18-51)
+  q_proj      288 (55-331)     60 (29-120)      36 (18-51)
   k_proj        70 (21-81)      33 (17-44)      23 (10-29)
   v_proj      101 (71-109)      43 (26-54)      34 (22-43)
-  o_proj     311 (186-389)     57 (14-116)      42 (25-57)
-  gate_proj  640 (623-678)    203 (76-270)    122 (55-146)
+  o_proj     311 (186-389)     56 (14-116)      42 (25-57)
+  gate_proj  640 (623-678)    204 (77-270)    122 (55-146)
   up_proj    666 (643-699)    187 (61-250)     93 (48-128)
-  down_proj  632 (594-680)    197 (19-280)    106 (41-140)
+  down_proj  632 (594-680)    198 (19-281)    106 (41-140)
 
   All 168 adapted matrices at once:
 
                   need > 8 for 90%   range  top-8 median
   --------------------------------------------------------
   W itself              168 of 168  21-699          7.8%
-  change, format        168 of 168  14-280         62.7%
-  change, recall        168 of 168  10-146         61.2%
+  change, format        168 of 168  14-281         62.7%
+  change, recall        168 of 168  10-146         61.1%
 
   What each fine-tune did to text it was never trained on:
 
@@ -307,7 +347,7 @@ device memory : 17.2 GB
   ------------------------------------------------------------
   untrained                              20.87
   LoRA r=8, format           40 of 40    21.28         +1.9%
-  full fine-tune, format     40 of 40    21.18         +1.5%
+  full fine-tune, format     40 of 40    21.17         +1.4%
   LoRA r=8, recall           40 of 40    22.51         +7.9%
   full fine-tune, recall     40 of 40    22.08         +5.8%
 
@@ -330,8 +370,8 @@ device memory : 17.2 GB
 
   forward pass, ms         merged  separate  separate / merged
   --------------------------------------------------------------
-  prefill, 8 x 256 tokens   840.8    1018.4              1.21x
-  decode, 8 x 1 token        34.5      40.1              1.16x
+  prefill, 8 x 256 tokens   840.8    1014.8              1.21x
+  decode, 8 x 1 token        34.8      40.5              1.16x
 
   Wall clock, median of 20, so these move from run to run; the
   counts and ratios elsewhere in this demo do not. 'separate' keeps
@@ -378,20 +418,20 @@ device memory : 17.2 GB
 
   forward pass, ms         merged  separate   mixed  mixed / merged
   -------------------------------------------------------------------
-  prefill, 8 x 256 tokens   840.8    1018.4  1026.8           1.22x
-  decode, 8 x 1 token        34.5      40.1    42.0           1.22x
+  prefill, 8 x 256 tokens   840.8    1014.8  1037.7           1.23x
+  decode, 8 x 1 token        34.8      40.5    42.3           1.22x
 
   The same timings section 7 printed, with a third column: the
   batch's rows alternate between two adapters, so neither can be
   merged, and each row's A and B are gathered before multiplying.
 
   >> In one mixed batch, 2 of 2 rows gave the answer their own adapter
-     gives alone and 2 of 2 were right. It costs 1.22x a merged forward
+     gives alone and 2 of 2 were right. It costs 1.23x a merged forward
      pass on a long prompt and 1.22x on a single new token.
 
 --------------------------------------------------------------------------
 Figures
 --------------------------------------------------------------------------
-  wrote 4 light/dark pairs to figures/06-lora/
+  wrote 7 light/dark pairs to figures/06-lora/
 
   device memory still allocated      5.59 GiB
