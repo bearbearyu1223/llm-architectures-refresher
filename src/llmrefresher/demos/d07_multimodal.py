@@ -705,7 +705,7 @@ def main() -> None:
     blank = encode(encoder, [draw(())], device)[0]
     data = Data(scenes, features, blank, cap_train, cap_test, q_train, q_test)
 
-    rep.section("1. From pixels to patches                          [post §1]")
+    rep.section("1. From pixels to patches                           [post §1]")
     pixels_to_patches(rep, encoder, data)
     rep.blank()
     rep.note("Inside the encoder, beside the language model it will feed:")
@@ -717,7 +717,7 @@ def main() -> None:
         base_ppl = passage_perplexity(lm, tokenizer, device)
     _release(encoder, lm)
 
-    rep.section("2. The connector                                   [post §2]")
+    rep.section("2. The connector                                    [post §2]")
     the_connector(rep, tokenizer, lm_config.hidden_size)
 
     rep.section("3. Stage 1: learning to describe                   [post §3]")
