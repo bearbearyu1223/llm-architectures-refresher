@@ -593,7 +593,7 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
     right picture.
     """
     orange = theme.series[1]
-    groups = [("stage 1 only", [results["zero_shot"][t] for t in TASKS], True)]
+    groups = [("stage 1 only, no questions", [results["zero_shot"][t] for t in TASKS], True)]
     for name in arm_names:
         groups.append((name, results["arms"][name]["scores"], False))
     fig, axes = plt.subplots(1, len(TASKS), figsize=(12.5, 4.6), sharey=True)
@@ -619,7 +619,8 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
                     ax.text(x, max(values) + 3, f"{mid:.0f}", ha="center", va="bottom",
                             fontsize=9.6, color=theme.ink, zorder=5)
         ax.set_xticks(range(len(groups)))
-        ax.set_xticklabels([n.replace(" + ", "\n+ ") for n, _, _ in groups], fontsize=9.6)
+        ax.set_xticklabels([n.replace(" + ", "\n+ ").replace(", ", "\n") for n, _, _ in groups],
+                           fontsize=9.4)
         ax.set_title({"count": "How many shapes?", "binding": "What color is the <shape>?",
                       "leftmost": "Color of the leftmost shape?"}[task], fontsize=11.5)
         ax.set_ylim(0, 112)

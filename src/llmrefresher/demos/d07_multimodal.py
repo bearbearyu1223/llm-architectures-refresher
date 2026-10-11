@@ -387,8 +387,15 @@ def stage_one(rep: Report, data: Data, tokenizer, device: torch.device, *,
 
 
 def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, state: dict | None,
-                  lora: bool, seeds: tuple[int, ...] = SEEDS, merge: bool = True) -> Arm:
-    """One stage-2 configuration, trained and scored at each seed."""
+                  lora: bool, seeds: tuple[int, ...] | None = None, merge: bool = True,
+                  steps: int | None = None) -> Arm:
+    """One stage-2 configuration, trained and scored at each seed.
+
+    ``state`` is the stage-1 connector to start from, or None to start the
+    connector from random, skipping stage 1.
+    """
+    seeds = SEEDS if seeds is None else seeds
+    steps = STAGE2_STEPS if steps is None else steps
     scores: dict[str, list[Scores]] = {t: [] for t in TASKS}
     logs: list[TrainLog] = []
     for seed in seeds:
@@ -398,8 +405,8 @@ def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, sta
         if lora:
             groups.append((trainable_parameters(model.lm), LORA_LR))
         log = train_vlm(
-            model, data.features, data.questions_train, steps=STAGE2_STEPS, batch_size=BATCH,
-            groups=groups, seed=seed, on_step=progress.training(f"{name}, seed {seed}", STAGE2_STEPS),
+            model, data.features, data.questions_train, steps=steps, batch_size=BATCH,
+            groups=groups, seed=seed, on_step=progress.training(f"{name}, seed {seed}", steps),
         )
         logs.append(log)
         for task in TASKS:
@@ -426,10 +433,14 @@ def zero_shot(data: Data, tokenizer, device: torch.device, state: dict) -> dict[
 def stage_two(rep: Report, arms: list[Arm], zero: dict[str, Scores]) -> None:
     """Every arm against every task, with both control columns."""
     first = arms[-1]
-    rep.kv("training", f"{STAGE2_STEPS} steps x {BATCH} questions, seeds {', '.join(map(str, SEEDS))}")
-    for arm in arms:
-        rep.kv(f"  {arm.name}", f"{arm.logs[0].trainable:,} trainable, "
-               f"{statistics.median(log.seconds_per_step for log in arm.logs):.2f} s/step")
+    rep.kv("batch", f"{BATCH} questions, seeds {', '.join(map(str, SEEDS))}")
+    rep.blank()
+    rep.table(
+        ["model", "starts from", "steps", "trainable", "s/step"],
+        [(arm.name, "random" if arm.name.startswith("no stage 1") else "stage 1",
+          arm.logs[0].steps, f"{arm.logs[0].trainable:,}",
+          f"{statistics.median(log.seconds_per_step for log in arm.logs):.2f}") for arm in arms],
+    )
     rep.blank()
     total = first.scores[TASKS[0]][0].total
     rep.note(f"Questions answered exactly right, of {total} per task on new pictures;")
@@ -462,8 +473,8 @@ def is_it_looking(rep: Report, arms: list[Arm]) -> None:
 # -- section 6 -----------------------------------------------------------------------
 
 
-def what_an_image_costs(rep: Report, lm_config, tokenizer, data: Data, merged: Arm,
-                        unmerged: Arm, logs: tuple[TrainLog, TrainLog]) -> None:
+def what_an_image_costs(rep: Report, lm_config, tokenizer, data: Data,
+                        stage1: dict[str, tuple[TrainLog, Scores]]) -> None:
     """Tokens per picture, the KV cache they take, and what merging changes."""
     layers = lm_config.num_hidden_layers
     kv_heads = lm_config.num_key_value_heads
@@ -472,7 +483,7 @@ def what_an_image_costs(rep: Report, lm_config, tokenizer, data: Data, merged: A
     caption = data.captions_test[0].answer
     caption_tokens = len(tokenizer(" " + caption, add_special_tokens=False).input_ids)
     rep.kv("KV cache per token, in bf16", f"{per_token:,} bytes")
-    rep.kv("  = K and V x layers x heads x dim x 2 B", f"2 x {layers} x {kv_heads} x {head_dim} x 2")
+    rep.note(f"  = 2 (K and V) x {layers} layers x {kv_heads} heads x {head_dim} dims x 2 bytes")
     rep.blank()
     rep.table(
         ["the same picture as", "tokens", "KV cache"],
@@ -484,16 +495,18 @@ def what_an_image_costs(rep: Report, lm_config, tokenizer, data: Data, merged: A
     )
     rep.note(f"caption: \"{caption}\"")
     rep.blank()
-    rep.note("Merged against unmerged, same recipe, seed 0:")
+    rep.note("Stage 1 twice, merged and not, same seed and data:")
     rep.blank()
-    rows = []
-    for task in TASKS:
-        rows.append((task, merged.scores[task][0].real, unmerged.scores[task][0].real))
-    s1m, s1u = logs
-    rows.append(("stage 1 s/step", f"{s1m.seconds_per_step:.2f}", f"{s1u.seconds_per_step:.2f}"))
-    rows.append(("stage 2 s/step", f"{merged.logs[0].seconds_per_step:.2f}",
-                 f"{unmerged.logs[0].seconds_per_step:.2f}"))
-    rep.table(["", "49 tokens", "196 tokens"], rows)
+    (m_log, m_after), (u_log, u_after) = stage1["49"], stage1["196"]
+    rep.table(
+        ["", "49 tokens", "196 tokens"],
+        [
+            ("connector parameters", f"{m_log.trainable:,}", f"{u_log.trainable:,}"),
+            (f"captions right, of {m_after.total}", m_after.real, u_after.real),
+            ("final loss (last-10 mean)", f"{m_log.final_loss:.4f}", f"{u_log.final_loss:.4f}"),
+            ("seconds per step", f"{m_log.seconds_per_step:.2f}", f"{u_log.seconds_per_step:.2f}"),
+        ],
+    )
     # LLaVA-1.5's count is not in its paper; it follows from its encoder's shape.
     rep.blank()
     rep.kv("LLaVA-1.5: 336 px, 14 px patches", f"(336 / 14)^2 = {(336 // 14) ** 2} tokens")
@@ -531,7 +544,7 @@ def draw_figures(results: dict) -> int:
     def pieces(text: str) -> list[str]:
         return [tokenizer.decode([i]) for i in tokenizer(text, add_special_tokens=False).input_ids]
 
-    arm_names = ["connector only", "connector + LoRA"]
+    arm_names = ["no stage 1", "connector only", "connector + LoRA"]
     for theme in THEMES:
         with styled(theme):
             figures.figure_overview(scene, question + " Answer:", answer, facts, theme)
@@ -594,25 +607,29 @@ def main() -> None:
     zero = zero_shot(data, tokenizer, device, state)
     projector_only = stage_two_arm("connector only", data, tokenizer, device, state=state, lora=False)
     with_lora = stage_two_arm("connector + LoRA", data, tokenizer, device, state=state, lora=True)
-    arms = [projector_only, with_lora]
+    # The control for stage 1 itself: the same questions, the connector from
+    # random, and as many steps as stages 1 and 2 together, so it isn't short-changed.
+    skipped = stage_two_arm("no stage 1", data, tokenizer, device, state=None,
+                            lora=False, steps=STAGE1_STEPS + STAGE2_STEPS)
+    arms = [skipped, projector_only, with_lora]
     stage_two(rep, arms, zero)
 
     rep.section("5. Is it looking?                                  [post §5]")
     is_it_looking(rep, arms)
 
     rep.section("6. What an image costs                             [post §6]")
-    state196, s1_log196, _, _ = stage_one(rep, data, tokenizer, device, merge=False, quiet=True)
-    unmerged = stage_two_arm("connector + LoRA, 196 tokens", data, tokenizer, device,
-                             state=state196, lora=True, seeds=(0,), merge=False)
-    what_an_image_costs(rep, lm_config, tokenizer, data, with_lora, unmerged, (s1_log, s1_log196))
+    _, s1_log196, _, s1_after196 = stage_one(rep, data, tokenizer, device, merge=False, quiet=True)
+    what_an_image_costs(rep, lm_config, tokenizer, data,
+                        {"49": (s1_log, s1_after), "196": (s1_log196, s1_after196)})
 
     results = {
         "stage1": {"before": asdict(s1_before), "after": asdict(s1_after),
                    "losses": list(s1_log.losses), "trainable": s1_log.trainable},
         "zero_shot": {t: asdict(zero[t]) for t in TASKS},
-        "arms": {arm.name: _arm_record(arm) for arm in [*arms, unmerged]},
-        "seconds_per_step": {"stage1_49": s1_log.seconds_per_step,
-                             "stage1_196": s1_log196.seconds_per_step},
+        "arms": {arm.name: _arm_record(arm) for arm in arms},
+        "stage1_196": {"after": asdict(s1_after196), "losses": list(s1_log196.losses),
+                       "seconds_per_step": s1_log196.seconds_per_step},
+        "stage1_seconds_per_step": s1_log.seconds_per_step,
     }
     save_results(results)
 
