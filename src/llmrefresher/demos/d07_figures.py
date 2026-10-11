@@ -41,6 +41,10 @@ class Facts:
     projector_params: int
     lora_params: int
     encoder_params: int  # the part that makes the patch vectors
+    vision_heads: int
+    vision_mlp: int
+    lm_heads: int
+    lm_mlp: int
 
     @classmethod
     def from_configs(cls, vision_model: str, language_model: str, *, rank: int,
@@ -84,6 +88,10 @@ class Facts:
             projector_params=merged_width * width + width + width * width + width,
             lora_params=lora_params,
             encoder_params=encoder_params,
+            vision_heads=vision.num_attention_heads,
+            vision_mlp=vision.intermediate_size,
+            lm_heads=lm.num_attention_heads,
+            lm_mlp=lm.intermediate_size,
         )
 
 
@@ -635,3 +643,150 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
     fig.text(0.98, -0.06, "trained models: median of three seeds; the line spans the lowest "
              "to the highest", ha="right", fontsize=9.0, color=theme.muted)
     save_both(fig, SLUG, "stage-two-results", theme)
+
+
+# -- 1b. inside the encoder ------------------------------------------------------------
+
+
+def figure_encoder(facts: Facts, theme: Theme) -> None:
+    """One encoder layer, repeated; and what a position may read, encoder against LM."""
+    blue, orange = theme.series[0], theme.series[1]
+    fig, ax = _canvas(12.5, 7.4)
+
+    # the stack, bottom to top
+    x0, w = 0.5, 4.6
+    cx = x0 + w / 2
+    ax.add_patch(plt.Rectangle((cx - 1.6, 0.55), 3.2, 0.32, facecolor=orange, edgecolor="none",
+                               zorder=3))
+    _lines(ax, cx, 0.25, [f"{facts.patches} patch vectors, each {facts.vision_width} wide, "
+                          "plus a learned position each"], color=theme.ink, size=9.6)
+    _arrow(ax, cx, 0.9, cx, 1.3, theme.secondary)
+
+    _box(ax, x0, 1.35, w, 3.95, theme.muted, lw=1.8)
+    ax.text(x0 + w - 0.12, 5.12, f"x {facts.vision_layers} layers", ha="right", va="center",
+            fontsize=11, fontweight="bold", color=theme.ink)
+    steps = [
+        (1.6, "LayerNorm", "rescale each vector", False),
+        (2.35, "self-attention", f"{facts.vision_heads} heads; each patch reads all", True),
+        (3.25, "LayerNorm", "rescale each vector", False),
+        (4.0, "MLP", f"{facts.vision_width} -> {facts.vision_mlp:,} -> {facts.vision_width}, GELU", True),
+    ]
+    for y, name, what, big in steps:
+        h = 0.6 if big else 0.42
+        _box(ax, x0 + 0.35, y, 3.0, h, theme.secondary if big else theme.muted, lw=1.3)
+        ax.text(x0 + 0.5, y + h / 2 + (0.1 if big else 0), name, ha="left", va="center",
+                fontsize=10.2, fontweight="bold" if big else "normal", color=theme.ink)
+        if big:
+            ax.text(x0 + 0.5, y + h / 2 - 0.15, what, ha="left", va="center", fontsize=8.8,
+                    color=theme.secondary)
+    for y0, y1 in ((2.02, 2.35), (2.95, 3.25), (3.67, 4.0)):
+        _arrow(ax, x0 + 1.85, y0, x0 + 1.85, y1, theme.secondary, lw=1.1)
+    # the residual paths: the input is added back after attention and after the MLP
+    # The residual paths: each sublayer's input is added back to its output, at a junction.
+    _arrow(ax, x0 + 1.85, 4.6, x0 + 1.85, 4.73, theme.secondary, lw=1.1)
+    for (y_from, y_to, label) in ((1.45, 3.1, "add the input back"), (3.17, 4.85, "add it back")):
+        ax.plot([x0 + 1.85, x0 + 4.05, x0 + 4.05], [y_from, y_from, y_to], color=theme.muted,
+                linewidth=1.1, zorder=2)
+        _arrow(ax, x0 + 4.05, y_to, x0 + 2.0, y_to, theme.muted, lw=1.1)
+        ax.add_patch(plt.Circle((x0 + 1.85, y_to), 0.12, facecolor=theme.surface,
+                                edgecolor=theme.secondary, linewidth=1.2, zorder=4))
+        ax.text(x0 + 1.85, y_to, "+", ha="center", va="center", fontsize=10, color=theme.ink,
+                zorder=5)
+        ax.text(x0 + 4.15, (y_from + y_to) / 2, label, rotation=90, ha="left", va="center",
+                fontsize=8.4, color=theme.muted)
+    _arrow(ax, cx, 5.32, cx, 5.72, theme.secondary)
+    _box(ax, cx - 1.2, 5.75, 2.4, 0.4, theme.muted, lw=1.2)
+    ax.text(cx, 5.95, "final LayerNorm", ha="center", va="center", fontsize=9.8, color=theme.ink)
+    _arrow(ax, cx, 6.18, cx, 6.5, theme.secondary)
+    ax.add_patch(plt.Rectangle((cx - 1.6, 6.52), 3.2, 0.32, facecolor=orange, edgecolor="none",
+                               zorder=3))
+    _lines(ax, cx, 7.1, [f"{facts.patches} vectors out, one per patch: to the connector"],
+           color=theme.ink, size=9.8, bold_first=True)
+    # the pooling head, not used
+    _arrow(ax, cx + 1.65, 6.68, cx + 2.35, 6.68, theme.muted)
+    _box(ax, cx + 2.4, 6.4, 1.75, 0.58, theme.muted, lw=1.1, dashed=True)
+    _lines(ax, cx + 3.275, 6.78, ["pooling head", "1 vector; unused"], color=theme.muted, size=8.8,
+           gap=0.22)
+
+    # what a position may read: full square against a triangle
+    n = 7
+    for title, sub, causal, left in (
+        ("vision encoder", "every patch reads every patch", False, 6.6),
+        ("language model", "each token reads itself and earlier ones", True, 9.65),
+    ):
+        size = 2.45
+        cell = size / n
+        top = 5.2
+        for r in range(n):
+            for c in range(n):
+                on = c <= r if causal else True
+                ax.add_patch(plt.Rectangle((left + c * cell + 0.02, top - (r + 1) * cell + 0.02),
+                                           cell - 0.04, cell - 0.04,
+                                           facecolor=blue if on else "none",
+                                           edgecolor="none" if on else theme.grid, linewidth=0.8,
+                                           zorder=3))
+        _lines(ax, left + size / 2, top + 0.55, [title], color=theme.ink, size=11,
+               bold_first=True)
+        _lines(ax, left + size / 2, top + 0.25, [sub], color=theme.secondary, size=9.2)
+        ax.text(left - 0.12, top - size / 2, "position", rotation=90, ha="right", va="center",
+                fontsize=8.8, color=theme.muted)
+        ax.text(left + size / 2, top - size - 0.18, "reads position", ha="center", va="top",
+                fontsize=8.8, color=theme.muted)
+        stats = (f"{facts.vision_layers} layers, width {facts.vision_width}, "
+                 f"{facts.vision_heads} heads") if not causal else (
+                 f"{facts.lm_layers} layers, width {facts.lm_width}, {facts.lm_heads} heads")
+        _lines(ax, left + size / 2, top - size - 0.6, [stats], color=theme.secondary, size=9.2)
+    _lines(ax, 9.3, 1.25, ["A picture is all there at once, so nothing needs hiding.",
+                           "A language model writes left to right, so a token",
+                           "can't read the ones that come after it."],
+           color=theme.secondary, size=9.8, gap=0.3)
+    ax.set_title("Inside the vision encoder: a transformer without the causal mask", loc="left",
+                 pad=10)
+    save_both(fig, SLUG, "encoder-inside", theme)
+
+
+# -- 6. any mix of inputs ----------------------------------------------------------------
+
+
+def figure_inputs(question: list[str], prefix: list[str], second: list[str], facts: Facts,
+                  theme: Theme) -> None:
+    """Text only, one picture and text, two pictures and text: one kind of sequence.
+
+    ``question`` starts with its newline token; the text-only row drops it.
+    """
+    orange = theme.series[1]
+    fig, ax = _canvas(12.5, 4.6)
+
+    def row(y, label, pieces):
+        ax.text(0.3, y + 0.5, label, ha="left", va="center", fontsize=10.6, fontweight="bold",
+                color=theme.ink)
+        x = 0.3
+        total = 0
+        for piece in pieces:
+            if piece == "IMAGE":
+                for _ in range(facts.merged):
+                    ax.add_patch(plt.Rectangle((x, y - 0.2), 0.035, 0.4, facecolor=orange,
+                                               edgecolor="none", zorder=3))
+                    x += 0.047
+                x += 0.06
+                total += facts.merged
+                continue
+            for tok in piece:
+                shown = tok.replace("\n", "\\n")
+                w = 0.12 + 0.075 * max(len(shown), 1)
+                _box(ax, x, y - 0.2, w, 0.4, theme.muted, lw=1.0)
+                ax.text(x + w / 2, y, shown, ha="center", va="center", fontsize=8.4,
+                        color=theme.ink, zorder=5)
+                x += w + 0.04
+                total += 1
+        ax.text(x + 0.15, y, f"{total} positions", ha="left", va="center", fontsize=9.6,
+                color=theme.secondary)
+
+    row(3.3, "text only: the connector isn't used, and the model is the downloaded Qwen",
+        [question[1:]])
+    row(2.0, "one picture and text", [prefix, "IMAGE", question])
+    row(0.7, "two pictures and text: as many as fit", [prefix, "IMAGE", second, "IMAGE", question])
+    ax.set_title("One model, any mix of text and pictures: it's all one sequence", loc="left",
+                 pad=10)
+    _crop(fig, ax, 0.25, 4.05)
+    save_both(fig, SLUG, "input-mixes", theme)

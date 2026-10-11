@@ -50,6 +50,7 @@ from ..lora import inject_lora, trainable_parameters
 from ..plotting import THEMES, figure_dir, styled
 from ..report import WIDTH, Report
 from ..training import TrainLog
+from .d06_lora import passage_perplexity
 from ..vlm import (
     IMAGE_SIZE,
     PATCH,
@@ -96,6 +97,8 @@ TEST_PER_TASK = 100
 # The scene the schematics draw. Any seed works; this one gives three shapes
 # with a clear leftmost and a caption that reads well.
 FIGURE_SCENE_SEED = 11
+# The question section 6 and its figure count positions for.
+INPUTS_QUESTION = "How many shapes are there?"
 
 
 # -- data ----------------------------------------------------------------------------
@@ -239,6 +242,7 @@ class Arm:
     name: str
     scores: dict[str, list[Scores]]
     logs: list[TrainLog]
+    ppl: list[float]  # text only: post 4's passage, after training
 
 
 # -- section 1 -----------------------------------------------------------------------
@@ -291,6 +295,72 @@ def pixels_to_patches(rep: Report, encoder: nn.Module, data: Data) -> None:
         "patch embedding is an ordinary matrix multiply on each patch's pixels: the "
         "same first step as looking up a word's embedding, with pixels in place of a "
         "token id."
+    )
+
+
+def inside_the_encoder(rep: Report, encoder: nn.Module, lm: nn.Module, tokenizer,
+                       data: Data) -> None:
+    """The encoder beside the language model, read from their modules, and one
+    measurement of the difference that matters most: what each position can see."""
+    vc, lc = encoder.config, lm.config
+    v_layer, l_layer = encoder.encoder.layers[0], lm.model.layers[0]
+    v_mlp = [n for n, m in v_layer.mlp.named_children() if isinstance(m, nn.Linear)]
+    l_mlp = [n for n, m in l_layer.mlp.named_children() if isinstance(m, nn.Linear)]
+    positions = encoder.embeddings.position_embedding.weight.shape[0]
+    rep.table(
+        ["", "vision encoder", "language model"],
+        [
+            ("layers", vc.num_hidden_layers, lc.num_hidden_layers),
+            ("width", vc.hidden_size, lc.hidden_size),
+            ("attention heads", vc.num_attention_heads, lc.num_attention_heads),
+            ("  key/value heads", vc.num_attention_heads, lc.num_key_value_heads),
+            ("MLP width", f"{vc.intermediate_size:,}", f"{lc.intermediate_size:,}"),
+            ("MLP matrices", len(v_mlp), len(l_mlp)),
+            ("MLP activation", vc.hidden_act, lc.hidden_act),
+            ("norm", type(v_layer.layer_norm1).__name__,
+             type(l_layer.input_layernorm).__name__.removeprefix("Qwen2")),
+            ("position", f"learned, {positions} rows",
+             "rotary" if hasattr(lm.model, "rotary_emb") else "?"),
+            ("causal mask", v_layer.self_attn.is_causal, l_layer.self_attn.is_causal),
+        ],
+    )
+    rep.blank()
+
+    # Change only the last position, and see whether the first one notices.
+    device = next(encoder.parameters()).device
+    picture = draw(data.scenes[data.captions_test[1].image])
+    pixels = to_pixels([picture])
+    changed = pixels.clone()
+    changed[:, :, -PATCH:, -PATCH:] = -1.0  # paint the bottom-right patch black
+    with torch.no_grad():
+        a = encoder(pixel_values=pixels.to(device)).last_hidden_state[0, 0]
+        b = encoder(pixel_values=changed.to(device)).last_hidden_state[0, 0]
+    vision_moved = float((a - b).norm() / a.norm())
+
+    one = tokenizer("a red circle and a blue square", return_tensors="pt").input_ids
+    two = tokenizer("a red circle and a blue triangle", return_tensors="pt").input_ids
+    assert one.shape == two.shape and torch.equal(one[0, :-1], two[0, :-1])
+    with torch.no_grad():
+        x = lm.model(one.to(device)).last_hidden_state[0, 0]
+        y = lm.model(two.to(device)).last_hidden_state[0, 0]
+    text_moved = float((x - y).norm() / x.norm())
+    grid = IMAGE_SIZE // PATCH
+    rep.note("Change only the last position; how far does the first one's output move?")
+    rep.blank()
+    rep.table(
+        ["model", "what changed", "first output moved"],
+        [
+            ("vision encoder", f"patch {grid * grid} of {grid * grid} painted black",
+             f"{vision_moved:.1%}"),
+            ("language model", f"token {one.shape[1]} of {one.shape[1]}: square -> triangle",
+             "exactly 0" if text_moved == 0 else f"{text_moved:.1e}"),
+        ],
+    )
+    rep.takeaway(
+        "The encoder is a transformer much like the language model, with one "
+        "difference that matters: no causal mask. Every patch reads every other "
+        "patch, so the first patch's vector moves when only the last one changes; "
+        "the language model's first word can't see the last."
     )
 
 
@@ -398,6 +468,7 @@ def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, sta
     steps = STAGE2_STEPS if steps is None else steps
     scores: dict[str, list[Scores]] = {t: [] for t in TASKS}
     logs: list[TrainLog] = []
+    ppl: list[float] = []
     for seed in seeds:
         model = build_vlm(tokenizer, device, merge=merge, seed=seed, projector_state=state,
                           lora=lora)
@@ -411,9 +482,12 @@ def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, sta
         logs.append(log)
         for task in TASKS:
             scores[task].append(score_all(model, data, data.questions_test[task]))
-        progress.status("    " + ", ".join(f"{t} {scores[t][-1].real}" for t in TASKS))
+        with torch.no_grad():
+            ppl.append(passage_perplexity(model.lm, tokenizer, device))
+        progress.status("    " + ", ".join(f"{t} {scores[t][-1].real}" for t in TASKS)
+                        + f", passage perplexity {ppl[-1]:.4f}")
         _release(model)
-    return Arm(name, scores, logs)
+    return Arm(name, scores, logs, ppl)
 
 
 def _median(values: list[int]) -> str:
@@ -473,6 +547,40 @@ def is_it_looking(rep: Report, arms: list[Arm]) -> None:
 # -- section 6 -----------------------------------------------------------------------
 
 
+def text_pictures_or_both(rep: Report, tokenizer, base_ppl: float, arms: list[Arm]) -> None:
+    """One model, three kinds of input; and what each arm did to text-only use."""
+    def count(text: str) -> int:
+        return len(tokenizer(text, add_special_tokens=False).input_ids)
+
+    question = QUESTION_PROMPT.format(q=INPUTS_QUESTION)
+    prefix, second, image = VisionLanguageModel.PREFIX, "\nImage:", 49
+    rows = [
+        ("text only", count(question.lstrip("\n")), 0),
+        ("one picture and text", count(prefix) + image + count(question), image),
+        ("two pictures and text",
+         count(prefix) + image + count(second) + image + count(question), 2 * image),
+    ]
+    rep.table(["input", "positions", "from pictures"], rows)
+    rep.blank()
+    rep.note("Text only, post 4's passage: perplexity after each kind of training")
+    rep.note("(lower is better; median of the seeds, range in brackets):")
+    rep.blank()
+    out = [("Qwen2.5-0.5B as downloaded", f"{base_ppl:.4f}")]
+    for arm in arms:
+        values = sorted(arm.ppl)
+        mid = statistics.median(values)
+        span = "" if values[0] == values[-1] else f" ({values[0]:.2f}-{values[-1]:.2f})"
+        out.append((arm.name, f"{mid:.4f}{span}"))
+    rep.table(["model", "passage perplexity"], out)
+    rep.takeaway(
+        "Text alone is just the language model's ordinary input. Where the language "
+        "model stayed frozen, its text is exactly what it was; LoRA bought its "
+        "small gains in stage 2 by changing that."
+    )
+
+
+
+
 def what_an_image_costs(rep: Report, lm_config, tokenizer, data: Data,
                         stage1: dict[str, tuple[TrainLog, Scores]]) -> None:
     """Tokens per picture, the KV cache they take, and what merging changes."""
@@ -521,6 +629,7 @@ def _arm_record(arm: Arm) -> dict:
         "seconds_per_step": [log.seconds_per_step for log in arm.logs],
         "trainable": arm.logs[0].trainable,
         "losses": [list(log.losses) for log in arm.logs],
+        "passage_perplexity": arm.ppl,
     }
 
 
@@ -555,7 +664,11 @@ def draw_figures(results: dict) -> int:
             figures.figure_stages(scene, describe(scene), question, answer, facts, theme)
             figures.figure_results(results, arm_names, theme)
             figures.figure_designs(theme)
-    return 7
+            figures.figure_encoder(facts, theme)
+            figures.figure_inputs(pieces(QUESTION_PROMPT.format(q=INPUTS_QUESTION)),
+                                  pieces(VisionLanguageModel.PREFIX), pieces("\nImage:"),
+                                  facts, theme)
+    return 9
 
 
 # -- main ----------------------------------------------------------------------------
@@ -594,10 +707,17 @@ def main() -> None:
 
     rep.section("1. From pixels to patches                          [post §1]")
     pixels_to_patches(rep, encoder, data)
-    _release(encoder)
+    rep.blank()
+    rep.note("Inside the encoder, beside the language model it will feed:")
+    rep.blank()
+    lm = _load_lm(device)
+    inside_the_encoder(rep, encoder, lm, tokenizer, data)
+    lm_config = lm.config
+    with torch.no_grad():
+        base_ppl = passage_perplexity(lm, tokenizer, device)
+    _release(encoder, lm)
 
-    rep.section("2. The connector                                    [post §2]")
-    lm_config = _load_lm(torch.device("cpu")).config
+    rep.section("2. The connector                                   [post §2]")
     the_connector(rep, tokenizer, lm_config.hidden_size)
 
     rep.section("3. Stage 1: learning to describe                   [post §3]")
@@ -617,7 +737,10 @@ def main() -> None:
     rep.section("5. Is it looking?                                  [post §5]")
     is_it_looking(rep, arms)
 
-    rep.section("6. What an image costs                             [post §6]")
+    rep.section("6. Text, a picture, or both                        [post §6]")
+    text_pictures_or_both(rep, tokenizer, base_ppl, arms)
+
+    rep.section("7. What an image costs                             [post §7]")
     _, s1_log196, _, s1_after196 = stage_one(rep, data, tokenizer, device, merge=False, quiet=True)
     what_an_image_costs(rep, lm_config, tokenizer, data,
                         {"49": (s1_log, s1_after), "196": (s1_log196, s1_after196)})
@@ -630,6 +753,7 @@ def main() -> None:
         "stage1_196": {"after": asdict(s1_after196), "losses": list(s1_log196.losses),
                        "seconds_per_step": s1_log196.seconds_per_step},
         "stage1_seconds_per_step": s1_log.seconds_per_step,
+        "base_passage_perplexity": base_ppl,
     }
     save_results(results)
 

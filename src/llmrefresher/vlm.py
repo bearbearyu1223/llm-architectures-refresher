@@ -272,9 +272,18 @@ class VisionLanguageModel(nn.Module):
     def embed(self, text: str) -> torch.Tensor:
         return self.lm.get_input_embeddings()(self.ids(text).to(self.device))
 
+    def interleave(self, pieces: Sequence[str | torch.Tensor]) -> torch.Tensor:
+        """Any mix of text and pictures, in order, as one ``(length, width)`` sequence.
+
+        Strings are tokenized and looked up in the vocabulary table; tensors are
+        image vectors already through the connector. Text alone is just the
+        language model's ordinary input, and nothing limits the number of pictures.
+        """
+        return torch.cat([self.embed(p) if isinstance(p, str) else p for p in pieces])
+
     def sequence(self, image: torch.Tensor, prompt: str) -> torch.Tensor:
-        """``Image:`` + image vectors + prompt, as one ``(length, width)`` sequence."""
-        return torch.cat([self.embed(self.PREFIX), image, self.embed(prompt)])
+        """``Image:`` + image vectors + prompt: the one layout this demo trains on."""
+        return self.interleave([self.PREFIX, image, prompt])
 
     def loss(self, features: torch.Tensor, items: Sequence[Example]) -> torch.Tensor:
         """Cross-entropy on the answer tokens only, scored at those positions only.
