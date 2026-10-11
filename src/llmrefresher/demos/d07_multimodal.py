@@ -33,6 +33,7 @@ import gc
 import json
 import random
 import statistics
+import sys
 import textwrap
 from dataclasses import asdict, dataclass
 
@@ -41,6 +42,8 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, SiglipVisionModel
 from transformers.utils import logging as hf_logging
 
+from . import d07_figures as figures
+from .d07_figures import Facts
 from .. import progress
 from ..device import get_device, peak_memory_bytes, reset_peak_memory, sync
 from ..lora import inject_lora, trainable_parameters
@@ -90,6 +93,9 @@ QUESTION_PROMPT = "\nQuestion: {q}\nAnswer:"
 TRAIN_SCENES = 3000
 TEST_CAPTIONS = 120
 TEST_PER_TASK = 100
+# The scene the schematics draw. Any seed works; this one gives three shapes
+# with a clear leftmost and a caption that reads well.
+FIGURE_SCENE_SEED = 11
 
 
 # -- data ----------------------------------------------------------------------------
@@ -513,12 +519,42 @@ def save_results(results: dict) -> None:
     results_path().write_text(json.dumps(results, indent=1))
 
 
+def draw_figures(results: dict) -> int:
+    """Every figure, in both themes. Needs the saved results, not the models."""
+    facts = Facts.from_configs(VISION_MODEL, LANGUAGE_MODEL, rank=RANK, targets=TARGETS)
+    # The example scene the schematics draw: fixed, so redraws match.
+    rng = random.Random(FIGURE_SCENE_SEED)
+    scene = make_scene(rng, 3)
+    question, answer = ask(scene, "leftmost", rng)
+    tokenizer = AutoTokenizer.from_pretrained(LANGUAGE_MODEL)
+
+    def pieces(text: str) -> list[str]:
+        return [tokenizer.decode([i]) for i in tokenizer(text, add_special_tokens=False).input_ids]
+
+    arm_names = ["connector only", "connector + LoRA"]
+    for theme in THEMES:
+        with styled(theme):
+            figures.figure_overview(scene, question + " Answer:", answer, facts, theme)
+            figures.figure_patches(scene, facts, theme)
+            figures.figure_connector(facts, theme)
+            figures.figure_sequence(pieces(VisionLanguageModel.PREFIX),
+                                    pieces(QUESTION_PROMPT.format(q=question)), answer, facts, theme)
+            figures.figure_stages(scene, describe(scene), question, answer, facts, theme)
+            figures.figure_results(results, arm_names, theme)
+            figures.figure_designs(theme)
+    return 7
+
+
 # -- main ----------------------------------------------------------------------------
 
 
 def main() -> None:
     hf_logging.disable_progress_bar()
     hf_logging.set_verbosity_error()
+    if "--figures" in sys.argv:
+        # Redraw from the last run's saved scores, without training anything.
+        print(f"wrote {draw_figures(json.loads(results_path().read_text()))} light/dark pairs")
+        return
     torch.manual_seed(0)
     rep = Report("07", "Multimodal: teaching a language model to see")
     rep.header()
@@ -581,10 +617,8 @@ def main() -> None:
     save_results(results)
 
     rep.section("Figures")
-    for theme in THEMES:
-        with styled(theme):
-            pass
-    rep.note(f"wrote 0 light/dark pairs to figures/{SLUG}/")
+    count = draw_figures(results)
+    rep.note(f"wrote {count} light/dark pairs to figures/{SLUG}/")
 
     reset_peak_memory(device)
     peak = peak_memory_bytes(device)
