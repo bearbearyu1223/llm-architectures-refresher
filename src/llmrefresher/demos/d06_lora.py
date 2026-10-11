@@ -213,7 +213,7 @@ def _load(device: torch.device) -> nn.Module:
 
     fp32 throughout, deliberately: this demo compares training runs, and mixed
     precision would add a second source of difference between them. Demo 07
-    takes the precision question up properly.
+    does not; QLoRA, later in the series, takes the precision question up.
     """
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32)
     return model.to(device)
