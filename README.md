@@ -35,12 +35,17 @@ uv sync --extra cuda
 Demos that require CUDA detect its absence and print a skip notice instead of
 crashing, so a full run on a Mac always completes.
 
-Three demos download a checkpoint from Hugging Face on first run: `demo04` and
-`demo06` use Qwen2.5-0.5B (about 1 GB), and `demo05` uses OLMoE-1B-7B (about 13 GB
-on disk, and about 13 GiB of memory in bfloat16, so plan for a 24 GiB machine).
+Four demos download a checkpoint from Hugging Face on first run: `demo04`,
+`demo06` and `demo07` use Qwen2.5-0.5B (about 1 GB), `demo07` also uses
+SigLIP-base (about 0.8 GB), and `demo05` uses OLMoE-1B-7B (about 13 GB on disk,
+and about 13 GiB of memory in bfloat16, so plan for a 24 GiB machine).
 
-`demo06` is the only one that *trains*, so it is far slower than the rest: about
-80 minutes, most of it a sweep over six LoRA ranks on two tasks, three seeds each.
+`demo06` and `demo07` *train*, so they are far slower than the rest. `demo06`
+takes about 80 minutes, most of it a sweep over six LoRA ranks on two tasks,
+three seeds each. `demo07` takes about two hours: eleven training runs of a
+small vision-language model, ten of them on 49 image tokens and one on 196.
+`uv run demo07 --figures` redraws its figures from the last run's saved scores
+without training.
 
 ## Forcing a device
 
@@ -77,6 +82,7 @@ src/llmrefresher/
 ├── quantizers.py  hand-written INT8, INT4 and NF4 formats (demo04)
 ├── lora.py        LoRA from the paper: frozen base, A and B, merge/unmerge
 ├── training.py    the small supervised trainer the fine-tuning posts share
+├── vlm.py         a vision-language model from parts: scenes, patches, connector
 └── demos/         one module per post, each with a main()
 tests/             unit tests for the demo arithmetic that needs no model
 figures/           generated plots, copied into the blog's assets

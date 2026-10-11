@@ -571,7 +571,7 @@ def main() -> None:
     torch.manual_seed(0)
     rep = Report("07", "Multimodal: teaching a language model to see")
     rep.header()
-    progress.status("demo07: about 10 training runs; progress goes to stderr, receipts to stdout")
+    progress.status("demo07: 11 training runs, about two hours on an Apple-silicon Mac; progress goes to stderr, receipts to stdout")
 
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(LANGUAGE_MODEL)
