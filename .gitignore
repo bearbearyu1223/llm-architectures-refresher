@@ -7,3 +7,4 @@ uv.lock.bak
 figures/**/*.png
 figures/**/*.pt
 !figures/.gitkeep
+figures/**/*.json
