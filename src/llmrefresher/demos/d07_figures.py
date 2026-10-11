@@ -619,8 +619,9 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
                     ax.text(x, max(values) + 3, f"{mid:.0f}", ha="center", va="bottom",
                             fontsize=9.6, color=theme.ink, zorder=5)
         ax.set_xticks(range(len(groups)))
-        ax.set_xticklabels([n.replace(" + ", "\n+ ").replace(", ", "\n") for n, _, _ in groups],
-                           fontsize=9.4)
+        short = {"stage 1 only, no questions": "stage 1,\nno questions", "no stage 1": "no\nstage 1",
+                 "connector only": "connector\nonly", "connector + LoRA": "connector\n+ LoRA"}
+        ax.set_xticklabels([short.get(n, n) for n, _, _ in groups], fontsize=9.4)
         ax.set_title({"count": "How many shapes?", "binding": "What color is the <shape>?",
                       "leftmost": "Color of the leftmost shape?"}[task], fontsize=11.5)
         ax.set_ylim(0, 112)

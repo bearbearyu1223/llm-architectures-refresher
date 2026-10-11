@@ -1,0 +1,174 @@
+==========================================================================
+DEMO 07: Multimodal: teaching a language model to see
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  vision encoder (frozen)            google/siglip-base-patch16-224
+  language model (frozen)            Qwen/Qwen2.5-0.5B
+  precision                          float32
+  pictures                           6,420 generated scenes, 224 x 224
+    stage 1 trains on                3,000 captions
+      tested on                      120 new pictures
+    stage 2 trains on                3,000 questions, 3 kinds
+      tested on                      100 new pictures per kind
+
+--------------------------------------------------------------------------
+1. From pixels to patches                          [post §1]
+--------------------------------------------------------------------------
+  step                                              result
+  ----------------------------------------------------------
+  a picture               224 x 224 pixels, 3 numbers each
+  numbers in the picture                           150,528
+  patch size                                16 x 16 pixels
+  patches                                    14 x 14 = 196
+  numbers in one patch                   16 x 16 x 3 = 768
+
+  patch embedding weight             768 x 768 = 589,824
+    as a convolution                 (768, 3, 16, 16), stride 16
+  conv vs one matmul per patch       max difference 2.3e-06
+  position embedding                 (196, 768), one per patch
+
+  encoder layers                     12, width 768, 12 heads
+  encoder parameters                 92,884,224
+    pooling head (not used here)     7,087,104
+    used to make the patch vectors   85,797,120
+  encoder output for one picture     196 vectors, each 768 wide
+
+  >> A picture reaches the transformer as 196 patch vectors, and the patch
+     embedding is an ordinary matrix multiply on each patch's pixels: the
+     same first step as looking up a word's embedding, with pixels in
+     place of a token id.
+
+--------------------------------------------------------------------------
+2. The connector                                    [post §2]
+--------------------------------------------------------------------------
+  step                                          shape
+  -----------------------------------------------------
+  encoder output                    196 vectors x 768
+  merge each 2 x 2 block           49 vectors x 3,072
+  projector layer 1                      3,072 -> 896
+  projector layer 2                        896 -> 896
+  what the language model reads      49 vectors x 896
+  one word's embedding, for scale      1 vector x 896
+
+  projector parameters, after merge  3,557,120
+    without the merge (768 in)       1,492,736
+
+  One question, as the language model receives it:
+
+  piece         positions   kind
+  --------------------------------
+  'Image:'              2   text
+  the picture          49  image
+  the question         13   text
+  TOTAL                64
+
+  >> The image is never turned into words. Its projected vectors are
+     placed in the sequence where token embeddings would go, and the
+     language model reads them with the same attention it uses on text.
+
+--------------------------------------------------------------------------
+3. Stage 1: learning to describe                   [post §3]
+--------------------------------------------------------------------------
+  trained: the connector only        3,557,120 parameters
+  frozen                             vision encoder and language model
+  training                           400 steps x 16 captions, lr 0.001
+  loss at step 1                     3.8180
+  loss at the end (mean of last 10)  0.0899
+  time per step                      1.02 s
+
+  Captions exactly right, on 120 new pictures:
+
+                  right picture  blank picture  wrong picture
+  -------------------------------------------------------------
+  before stage 1              0              0              0
+  after stage 1              87              1              0
+
+  What it writes, for the first three test pictures:
+
+  truth: a red triangle
+  model: a red triangle
+
+  truth: a blue triangle, a green square and a purple square
+  model: a blue triangle, a green square and a purple square
+
+  truth: a purple circle and a green triangle
+  model: a purple circle and a green triangle
+
+
+--------------------------------------------------------------------------
+4. Stage 2: learning to answer                     [post §4]
+--------------------------------------------------------------------------
+  batch                              16 questions, seeds 0, 1, 2
+
+  model             starts from  steps  trainable  s/step
+  ---------------------------------------------------------
+  no stage 1             random    800  3,557,120    0.91
+  connector only        stage 1    400  3,557,120    0.92
+  connector + LoRA      stage 1    400  7,956,224    1.11
+
+  Questions answered exactly right, of 100 per task on new pictures;
+  trained rows are the median of 3 seeds, with the range in brackets.
+
+  task                 model  right picture       blank  wrong picture
+  ----------------------------------------------------------------------
+  count         stage 1 only              0           0              0
+                  no stage 1    98 (98-100)  29 (29-29)     35 (34-35)
+              connector only     96 (91-99)   29 (0-29)     34 (34-34)
+            connector + LoRA     95 (91-96)  29 (29-29)     34 (34-35)
+  binding       stage 1 only             15           0              4
+                  no stage 1     63 (49-66)  15 (12-21)     18 (15-19)
+              connector only     97 (96-97)   14 (0-21)     16 (16-18)
+            connector + LoRA    99 (95-100)   13 (8-17)     18 (17-21)
+  leftmost      stage 1 only             23           0              2
+                  no stage 1     72 (69-73)  15 (15-18)       9 (7-13)
+              connector only     82 (81-95)   13 (0-18)        6 (5-7)
+            connector + LoRA     92 (90-93)   18 (0-18)        7 (6-8)
+
+--------------------------------------------------------------------------
+5. Is it looking?                                  [post §5]
+--------------------------------------------------------------------------
+  task                 model  right picture  best control  gap
+  --------------------------------------------------------------
+  count           no stage 1             98            35   63
+              connector only             96            34   62
+            connector + LoRA             95            34   61
+  binding         no stage 1             63            19   44
+              connector only             97            18   79
+            connector + LoRA             99            18   81
+  leftmost        no stage 1             72            15   57
+              connector only             82            13   69
+            connector + LoRA             92            18   74
+
+--------------------------------------------------------------------------
+6. What an image costs                             [post §6]
+--------------------------------------------------------------------------
+  KV cache per token, in bf16        12,288 bytes
+    = 2 (K and V) x 24 layers x 2 heads x 64 dims x 2 bytes
+
+  the same picture as   tokens  KV cache
+  ----------------------------------------
+  196 patch vectors        196  2.30 MiB
+  49 merged vectors         49  0.57 MiB
+  its caption in words       3  0.04 MiB
+  caption: "a red triangle"
+
+  Stage 1 twice, merged and not, same seed and data:
+
+                             49 tokens  196 tokens
+  --------------------------------------------------
+  connector parameters       3,557,120   1,492,736
+  captions right, of 120            87          70
+  final loss (last-10 mean)     0.0899      0.1205
+  seconds per step                1.02        3.08
+
+  LLaVA-1.5: 336 px, 14 px patches   (336 / 14)^2 = 576 tokens
+
+--------------------------------------------------------------------------
+Figures
+--------------------------------------------------------------------------
+  wrote 7 light/dark pairs to figures/07-multimodal/
+
+  device memory still allocated      0.35 GiB
