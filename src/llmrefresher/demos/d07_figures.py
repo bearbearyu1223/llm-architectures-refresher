@@ -609,7 +609,7 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
     modes = (("real", "right picture", orange, None),
              ("blank", "blank picture", theme.muted, None),
              ("shuffled", "wrong picture", "none", "////"),
-             ("none", "no picture", theme.grid, None))
+             ("none", "no picture", "none", "...."))
     for ax, task in zip(axes, TASKS, strict=True):
         for g, (_name, scores, single) in enumerate(groups):
             runs = [scores[TASKS.index(task)]] if single else scores[task]

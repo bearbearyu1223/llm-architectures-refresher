@@ -42,10 +42,11 @@ and about 13 GiB of memory in bfloat16, so plan for a 24 GiB machine).
 
 `demo06` and `demo07` *train*, so they are far slower than the rest. `demo06`
 takes about 80 minutes, most of it a sweep over six LoRA ranks on two tasks,
-three seeds each. `demo07` takes about two hours: eleven training runs of a
+three seeds each. `demo07` takes almost three hours: eleven training runs of a
 small vision-language model, ten of them on 49 image tokens and one on 196.
 `uv run demo07 --figures` redraws its figures from the last run's saved scores
-without training.
+without training, and `uv run demo07 --misses` checks where its wrong color
+answers came from.
 
 ## Forcing a device
 
@@ -68,7 +69,7 @@ speedup" is actually just measuring Python dispatch overhead.
 | `demo04` | Quantization | INT8 and NF4 implemented by hand on Qwen2.5-0.5B; activations carrying 10–85x outlier channels where weights carry 4–7x; NF4's codebook derived to within 6e-08 of bitsandbytes'; a 2.09x real shrink rather than 4x; and perplexity moving 0.21% while the worst token's prediction moves 68x the average |
 | `demo05` | Mixture-of-experts | OLMoE-1B-7B's parameters derived tensor by tensor, 93.1% of them experts and 17.0% active per token; a router score shown to be exactly a dot product; expert choice depending on the kind of text, against a noise floor; one token needing 8 of 64 experts while 256 tokens need 60.9; and how many GPUs a token must reach under expert parallelism |
 | `demo06` | LoRA | LoRA written from the paper and attached to Qwen2.5-0.5B; a full fine-tune's four copies of the model against an adapter's 0.89%; what rank buys on a rule task against a memorization task, at three seeds, and where the adapters pay; the singular values of all 168 of a full fine-tune's updates, showing none is low-rank even though a low-rank one suffices; what each fine-tune forgot, on post 4's passage; merging shown to change the output by float noise only; and fifty adapters over one base, with two of them served correctly in one mixed batch |
-| `demo07` | Multimodal | A vision-language model built from a frozen SigLIP encoder, a trained 2x2-merge connector and frozen Qwen2.5-0.5B; a ViT's patch embedding shown to be one matmul per patch; stage 1 captions exactly right 87 of 120 with blank and wrong-picture controls; stage 2 at three seeds, where captioning first lifts color-to-shape binding from 63 to 97 and LoRA adds little; and what a picture costs in tokens and KV cache, 196 against 49 |
+| `demo07` | Multimodal | A vision-language model built from a frozen SigLIP encoder, a trained 2x2-merge connector and frozen Qwen2.5-0.5B; a ViT's patch embedding shown to be one matmul per patch; stage 1 captions exactly right 91 of 120 with blank, wrong-picture and no-picture controls; stage 2 at three seeds; three color-shape pairs held out of training, where binding falls from 98 to 76, or to 40 without the captioning stage, and the wrong answers are another shape's color; and what a picture costs in tokens and KV cache, 196 against 49 |
 
 More land as the series is written.
 

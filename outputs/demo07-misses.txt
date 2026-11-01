@@ -1,0 +1,24 @@
+==========================================================================
+DEMO 07: Multimodal: where the wrong colors came from
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  Wrong color answers, first seed, right picture. Was the color it
+  said on some other shape in the same picture?
+
+  questions                      model  wrong  in picture  not in it
+  --------------------------------------------------------------------
+  binding, seen             no stage 1      3           3          0
+                        connector only      0           0          0
+                      connector + LoRA      1           1          0
+  leftmost, seen            no stage 1      7           7          0
+                        connector only     17          17          0
+                      connector + LoRA     17          15          2
+  binding, held out         no stage 1     23          14          9
+                        connector only     19          18          1
+                      connector + LoRA     24          22          2
+  leftmost, held out        no stage 1     23          23          0
+                        connector only     19          19          0
+                      connector + LoRA     16          15          1

@@ -839,9 +839,43 @@ def draw_figures(results: dict) -> int:
 # -- main ----------------------------------------------------------------------------
 
 
+def wrong_colors(rep: Report, results: dict) -> None:
+    """Where a wrong color answer came from: another shape in the picture, or nowhere.
+
+    Read from the saved first-seed misses; the scenes are regenerated from
+    their seeds, so this needs no model.
+    """
+    scenes = build_examples()["scenes"]
+    rep.note("Wrong color answers, first seed, right picture. Was the color it")
+    rep.note("said on some other shape in the same picture?")
+    rep.blank()
+    rows = []
+    for pool, label in (("seen", "seen"), ("heldout", "held out")):
+        for task in ("binding", "leftmost"):
+            for name in ("no stage 1", "connector only", "connector + LoRA"):
+                inside = absent = 0
+                for image, t, _, _, said in results["arms"][name]["misses"][pool]:
+                    if t != task:
+                        continue
+                    if said in {s.color for s in scenes[image]}:
+                        inside += 1
+                    else:
+                        absent += 1
+                first = name == "no stage 1"
+                rows.append((f"{task}, {label}" if first else "", name,
+                             inside + absent, inside, absent))
+    rep.table(["questions", "model", "wrong", "in picture", "not in it"], rows)
+
+
 def main() -> None:
     hf_logging.disable_progress_bar()
     hf_logging.set_verbosity_error()
+    if "--misses" in sys.argv:
+        # From the last run's saved wrong answers, without training anything.
+        rep = Report("07", "Multimodal: where the wrong colors came from")
+        rep.header()
+        wrong_colors(rep, json.loads(results_path().read_text()))
+        return
     if "--figures" in sys.argv:
         # Redraw from the last run's saved scores, without training anything.
         print(f"wrote {draw_figures(json.loads(results_path().read_text()))} light/dark pairs")
