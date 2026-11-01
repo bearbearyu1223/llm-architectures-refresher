@@ -1,0 +1,113 @@
+==========================================================================
+DEMO 07: Multimodal follow-up: held-out pairs, harder
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  seeds, paired                      0, 1, 2, 3, 4
+  fresh test questions               300 per pool, seeds 40-43
+  stage 2 + captions                 16 questions + 4 captions per step
+
+--------------------------------------------------------------------------
+A. Five seeds, fresh questions
+--------------------------------------------------------------------------
+  Stage 1 per seed: captions exactly right, of 120 each.
+
+  seed  seen pictures  held-out pictures
+  ----------------------------------------
+  0                91                 63
+  1                95                 56
+  2                85                 63
+  3                74                 37
+  4                88                 72
+
+  Binding, held-out pairs, right of 300, seed by seed:
+
+  seed  no stage 1  connector only  connector + captions
+  --------------------------------------------------------
+  0            205             237                   181
+  1            117             214                   259
+  2             61             231                   227
+  3             66             140                   206
+  4            107             179                   115
+
+  Leftmost, held-out pairs, right of 300, seed by seed:
+
+  seed  no stage 1  connector only  connector + captions
+  --------------------------------------------------------
+  0            239             254                   279
+  1            165             234                   278
+  2            187             240                   293
+  3            183             247                   264
+  4            229             241                   272
+
+  Median of 5 seeds, range in brackets, right of 300. Control is the
+  best of blank, wrong and no picture on held-out binding.
+
+  model                  binding seen       held out     control
+  ----------------------------------------------------------------
+  no stage 1            273 (231-298)   107 (61-205)  36 (23-76)
+  connector only        297 (286-300)  214 (140-237)  81 (44-98)
+  connector + captions  282 (212-298)  206 (115-259)  81 (40-98)
+
+  model                 leftmost seen       held out
+  ----------------------------------------------------
+  no stage 1            235 (204-260)  187 (165-239)
+  connector only        271 (265-272)  241 (234-254)
+  connector + captions  287 (279-288)  278 (264-293)
+
+  Seed by seed, held-out pairs: how often one version beat another.
+
+  version                      against      task  ahead in  median
+  ------------------------------------------------------------------
+  connector only            no stage 1   binding    5 of 5     +74
+                                        leftmost    5 of 5     +53
+  connector + captions  connector only   binding    2 of 5      -4
+                                        leftmost    5 of 5     +31
+
+--------------------------------------------------------------------------
+B. Does the picture's information reach the language model?
+--------------------------------------------------------------------------
+  A linear probe reads each shape's color and kind from the vectors
+  under it. Trained on shapes from training pictures only; tested on
+  shapes in held-out pictures, split by seen and held-out pairs.
+
+  read from               color: seen  held out  kind: seen  held out
+  ---------------------------------------------------------------------
+  encoder output (196)         100.0%     74.9%      100.0%     98.7%
+  stage 1 connector (49)       100.0%     88.9%      100.0%     90.0%
+  stage 2 connector (49)       100.0%     80.1%      100.0%     89.3%
+
+  probe trained on                   7,474 shapes in training pictures
+  tested on                          670 seen-pair, 542 held-out-pair shapes
+
+--------------------------------------------------------------------------
+C. Where the wrong colors came from
+--------------------------------------------------------------------------
+  How often each shape came in each color, over all training pictures:
+
+  shape      red  green  blue  yellow  purple  orange
+  -----------------------------------------------------
+  circle    1411      0  1379     931     868     881
+  square    1382   1368     0     939     918     921
+  triangle     0   1420  1362     957     903     930
+
+  Wrong held-out binding answers, all 5 seeds:
+
+  model                 wrong  color in picture  not in it
+  ----------------------------------------------------------
+  no stage 1              944               814        130
+  connector only          499               445         54
+  connector + captions    512               502         10
+
+  Of the wrong colors that were in the picture: did the color belong to
+  the nearest shape, and was it one of the two colors this kind of shape
+  came in most often in training? Beside each, what picking one of the
+  other shapes at random would give.
+
+  model                 in picture  nearest  chance  common  chance
+  -------------------------------------------------------------------
+  no stage 1                   814      506   523.2     378   303.2
+  connector only               445      274   281.8     174   169.3
+  connector + captions         502      313   320.0     150   177.7
