@@ -654,54 +654,71 @@ def figure_encoder(facts: Facts, theme: Theme) -> None:
     blue, orange = theme.series[0], theme.series[1]
     fig, ax = _canvas(12.5, 7.4)
 
-    # the stack, bottom to top
+    # -- left: the stack, bottom to top, on one spine at x = cx ---------------------
     x0, w = 0.5, 4.6
     cx = x0 + w / 2
-    ax.add_patch(plt.Rectangle((cx - 1.6, 0.55), 3.2, 0.32, facecolor=orange, edgecolor="none",
-                               zorder=3))
-    _lines(ax, cx, 0.25, [f"{facts.patches} patch vectors, each {facts.vision_width} wide, "
-                          "plus a learned position each"], color=theme.ink, size=9.6)
-    _arrow(ax, cx, 0.9, cx, 1.3, theme.secondary)
+    bw = 3.1  # inner box width, centered on the spine
+    skip_x = x0 + w - 0.45  # where the add-back paths run
 
-    _box(ax, x0, 1.35, w, 3.95, theme.muted, lw=1.8)
-    ax.text(x0 + w - 0.12, 5.12, f"x {facts.vision_layers} layers", ha="right", va="center",
-            fontsize=11, fontweight="bold", color=theme.ink)
-    steps = [
-        (1.6, "LayerNorm", "rescale each vector", False),
-        (2.35, "self-attention", f"{facts.vision_heads} heads; each patch reads all", True),
-        (3.25, "LayerNorm", "rescale each vector", False),
-        (4.0, "MLP", f"{facts.vision_width} -> {facts.vision_mlp:,} -> {facts.vision_width}, GELU", True),
-    ]
-    for y, name, what, big in steps:
-        h = 0.6 if big else 0.42
-        _box(ax, x0 + 0.35, y, 3.0, h, theme.secondary if big else theme.muted, lw=1.3)
-        ax.text(x0 + 0.5, y + h / 2 + (0.1 if big else 0), name, ha="left", va="center",
-                fontsize=10.2, fontweight="bold" if big else "normal", color=theme.ink)
-        if big:
-            ax.text(x0 + 0.5, y + h / 2 - 0.15, what, ha="left", va="center", fontsize=8.8,
-                    color=theme.secondary)
-    for y0, y1 in ((2.02, 2.35), (2.95, 3.25), (3.67, 4.0)):
-        _arrow(ax, x0 + 1.85, y0, x0 + 1.85, y1, theme.secondary, lw=1.1)
-    # the residual paths: the input is added back after attention and after the MLP
-    # The residual paths: each sublayer's input is added back to its output, at a junction.
-    _arrow(ax, x0 + 1.85, 4.6, x0 + 1.85, 4.73, theme.secondary, lw=1.1)
-    for (y_from, y_to, label) in ((1.45, 3.1, "add the input back"), (3.17, 4.85, "add it back")):
-        ax.plot([x0 + 1.85, x0 + 4.05, x0 + 4.05], [y_from, y_from, y_to], color=theme.muted,
-                linewidth=1.1, zorder=2)
-        _arrow(ax, x0 + 4.05, y_to, x0 + 2.0, y_to, theme.muted, lw=1.1)
-        ax.add_patch(plt.Circle((x0 + 1.85, y_to), 0.12, facecolor=theme.surface,
+    def bar(y):
+        ax.add_patch(plt.Rectangle((cx - 1.6, y), 3.2, 0.32, facecolor=orange,
+                                   edgecolor="none", zorder=3))
+
+    def step(y, h, name, what=None):
+        _box(ax, cx - bw / 2, y, bw, h, theme.secondary if what else theme.muted, lw=1.3)
+        ax.text(cx - bw / 2 + 0.15, y + h / 2 + (0.1 if what else 0), name, ha="left",
+                va="center", fontsize=10.2, fontweight="bold" if what else "normal",
+                color=theme.ink, zorder=5)
+        if what:
+            ax.text(cx - bw / 2 + 0.15, y + h / 2 - 0.15, what, ha="left", va="center",
+                    fontsize=8.8, color=theme.secondary, zorder=5)
+
+    def plus(y):
+        ax.add_patch(plt.Circle((cx, y), 0.12, facecolor=theme.surface,
                                 edgecolor=theme.secondary, linewidth=1.2, zorder=4))
-        ax.text(x0 + 1.85, y_to, "+", ha="center", va="center", fontsize=10, color=theme.ink,
-                zorder=5)
-        ax.text(x0 + 4.15, (y_from + y_to) / 2, label, rotation=90, ha="left", va="center",
-                fontsize=8.4, color=theme.muted)
-    _arrow(ax, cx, 5.32, cx, 5.72, theme.secondary)
+        ax.text(cx, y, "+", ha="center", va="center", fontsize=10, color=theme.ink, zorder=5)
+
+    def skip(y_from, y_to):
+        """Branch off the spine at y_from, rejoin it at the + at y_to."""
+        ax.add_patch(plt.Circle((cx, y_from), 0.045, facecolor=theme.secondary,
+                                edgecolor="none", zorder=4))
+        ax.plot([cx, skip_x, skip_x], [y_from, y_from, y_to], color=theme.muted,
+                linewidth=1.1, zorder=2)
+        _arrow(ax, skip_x, y_to, cx + 0.13, y_to, theme.muted, lw=1.1)
+        ax.text(skip_x + 0.1, (y_from + y_to) / 2, "add the input back", rotation=90,
+                ha="left", va="center", fontsize=8.4, color=theme.muted)
+
+    bar(0.55)
+    _lines(ax, cx, 0.25, [f"{facts.patches} patch vectors, each {facts.vision_width} wide, "
+                          "with a learned position added"], color=theme.ink, size=9.6)
+    box_lo, box_hi = 1.3, 5.5
+    _box(ax, x0, box_lo, w, box_hi - box_lo, theme.muted, lw=1.8)
+    ax.text(x0 + 0.15, box_hi - 0.2, f"\u00d7 {facts.vision_layers} layers", ha="left",
+            va="center", fontsize=11, fontweight="bold", color=theme.ink)
+
+    ln1, att, add1, ln2, mlp, add2 = 1.74, 2.34, 3.14, 3.66, 4.26, 5.08
+    _arrow(ax, cx, 0.9, cx, ln1, theme.secondary)  # into the box, through the branch point
+    step(ln1, 0.42, "LayerNorm")
+    _arrow(ax, cx, ln1 + 0.42, cx, att, theme.secondary, lw=1.1)
+    step(att, 0.6, "self-attention", f"{facts.vision_heads} heads; each patch reads all")
+    _arrow(ax, cx, att + 0.6, cx, add1 - 0.12, theme.secondary, lw=1.1)
+    plus(add1)
+    _arrow(ax, cx, add1 + 0.12, cx, ln2, theme.secondary, lw=1.1)
+    step(ln2, 0.42, "LayerNorm")
+    _arrow(ax, cx, ln2 + 0.42, cx, mlp, theme.secondary, lw=1.1)
+    step(mlp, 0.6, "MLP", f"{facts.vision_width} to {facts.vision_mlp:,} to "
+                          f"{facts.vision_width} wide, GELU")
+    _arrow(ax, cx, mlp + 0.6, cx, add2 - 0.12, theme.secondary, lw=1.1)
+    plus(add2)
+    skip(1.45, add1)
+    skip(add1 + 0.22, add2)
+
+    _arrow(ax, cx, add2 + 0.12, cx, 5.72, theme.secondary)  # out of the box
     _box(ax, cx - 1.2, 5.75, 2.4, 0.4, theme.muted, lw=1.2)
     ax.text(cx, 5.95, "final LayerNorm", ha="center", va="center", fontsize=9.8, color=theme.ink)
     _arrow(ax, cx, 6.18, cx, 6.5, theme.secondary)
-    ax.add_patch(plt.Rectangle((cx - 1.6, 6.52), 3.2, 0.32, facecolor=orange, edgecolor="none",
-                               zorder=3))
-    _lines(ax, cx, 7.1, [f"{facts.patches} vectors out, one per patch: to the connector"],
+    bar(6.52)
+    _lines(ax, cx, 7.1, [f"{facts.patches} vectors out, one per patch, to the connector"],
            color=theme.ink, size=9.8, bold_first=True)
     # the pooling head, not used
     _arrow(ax, cx + 1.65, 6.68, cx + 2.35, 6.68, theme.muted)
@@ -709,15 +726,29 @@ def figure_encoder(facts: Facts, theme: Theme) -> None:
     _lines(ax, cx + 3.275, 6.78, ["pooling head", "1 vector; unused"], color=theme.muted, size=8.8,
            gap=0.22)
 
-    # what a position may read: full square against a triangle
-    n = 7
-    for title, sub, causal, left in (
-        ("vision encoder", "every patch reads every patch", False, 6.6),
-        ("language model", "each token reads itself and earlier ones", True, 9.65),
+    # -- right: what each position may read, full square against a triangle ----------
+    n, size = 7, 2.45
+    cell = size / n
+    top = 5.75
+    panel_mid = 9.3
+    _lines(ax, panel_mid, 7.1, ["What each position can read"], color=theme.ink, size=10.6,
+           bold_first=True)
+    # key: filled = can read, outlined = can't
+    for k, (on, label) in enumerate(((True, "can read"), (False, "can't read"))):
+        kx = panel_mid - 1.25 + k * 1.45
+        ax.add_patch(plt.Rectangle((kx, 6.72), 0.2, 0.2, facecolor=blue if on else "none",
+                                   edgecolor="none" if on else theme.muted, linewidth=0.8,
+                                   zorder=3))
+        ax.text(kx + 0.3, 6.82, label, ha="left", va="center", fontsize=8.8,
+                color=theme.secondary)
+    for title, sub, causal, left, unit, shown, why in (
+        ("vision encoder", "every patch reads every patch", False, 6.6, "patch",
+         f"first {n} of {facts.patches} patches shown",
+         ["A picture is all there at once,", "so nothing needs hiding."]),
+        ("language model", "each token reads itself and earlier ones", True, 9.65, "token",
+         f"first {n} tokens shown",
+         ["It writes left to right, so a token", "can't read the ones after it."]),
     ):
-        size = 2.45
-        cell = size / n
-        top = 5.2
         for r in range(n):
             for c in range(n):
                 on = c <= r if causal else True
@@ -726,21 +757,18 @@ def figure_encoder(facts: Facts, theme: Theme) -> None:
                                            facecolor=blue if on else "none",
                                            edgecolor="none" if on else theme.grid, linewidth=0.8,
                                            zorder=3))
-        _lines(ax, left + size / 2, top + 0.55, [title], color=theme.ink, size=11,
-               bold_first=True)
-        _lines(ax, left + size / 2, top + 0.25, [sub], color=theme.secondary, size=9.2)
-        ax.text(left - 0.12, top - size / 2, "position", rotation=90, ha="right", va="center",
-                fontsize=8.8, color=theme.muted)
-        ax.text(left + size / 2, top - size - 0.18, "reads position", ha="center", va="top",
-                fontsize=8.8, color=theme.muted)
+        mid = left + size / 2
+        _lines(ax, mid, top + 0.55, [title], color=theme.ink, size=11, bold_first=True)
+        _lines(ax, mid, top + 0.25, [sub], color=theme.secondary, size=9.2)
+        ax.text(left - 0.12, top - size / 2, f"{unit} reading", rotation=90, ha="right",
+                va="center", fontsize=8.8, color=theme.muted)
+        _lines(ax, mid, top - size - 0.22, [f"{unit} being read", f"({shown})"],
+               color=theme.muted, size=8.8, gap=0.25)
         stats = (f"{facts.vision_layers} layers, width {facts.vision_width}, "
                  f"{facts.vision_heads} heads") if not causal else (
                  f"{facts.lm_layers} layers, width {facts.lm_width}, {facts.lm_heads} heads")
-        _lines(ax, left + size / 2, top - size - 0.6, [stats], color=theme.secondary, size=9.2)
-    _lines(ax, 9.3, 1.25, ["A picture is all there at once, so nothing needs hiding.",
-                           "A language model writes left to right, so a token",
-                           "can't read the ones that come after it."],
-           color=theme.secondary, size=9.8, gap=0.3)
+        _lines(ax, mid, top - size - 0.85, [stats], color=theme.secondary, size=9.2)
+        _lines(ax, mid, top - size - 1.35, why, color=theme.ink, size=9.6, gap=0.3)
     ax.set_title("Inside the vision encoder: a transformer without the causal mask", loc="left",
                  pad=10)
     save_both(fig, SLUG, "encoder-inside", theme)
