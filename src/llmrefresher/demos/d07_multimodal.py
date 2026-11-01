@@ -883,6 +883,10 @@ def wrong_colors(rep: Report, results: dict) -> None:
 def main() -> None:
     hf_logging.disable_progress_bar()
     hf_logging.set_verbosity_error()
+    if "--followup-figures" in sys.argv:
+        from .d07_followup import draw_followup_figures
+        print(f"wrote {draw_followup_figures()} light/dark pair")
+        return
     if "--followup" in sys.argv:
         # Five paired seeds, fresh test questions, captions in stage 2, a probe.
         from .d07_followup import run

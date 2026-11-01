@@ -357,3 +357,14 @@ def run() -> None:
         "scores": {a: {f"{t}|{h}": v for (t, h), v in scores[a].items()} for a in ARMS},
         "probe": probed, "sources": sources,
     }, indent=1))
+
+
+def draw_followup_figures() -> int:
+    """The follow-up's figure, from its saved results, in both themes."""
+    from ..plotting import THEMES, styled
+    from . import d07_figures as figures
+    fu = json.loads(results_path().read_text())
+    for theme in THEMES:
+        with styled(theme):
+            figures.figure_paired(fu, ARMS, theme)
+    return 1

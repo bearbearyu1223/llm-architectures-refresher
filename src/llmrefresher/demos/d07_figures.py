@@ -1059,3 +1059,41 @@ def figure_experiment(n: dict, theme: Theme) -> None:
     _crop(fig, ax, 1.15, 6.1)
     ax.set_title("The whole experiment", loc="left", pad=10)
     save_both(fig, SLUG, "experiment", theme)
+
+
+def figure_paired(fu: dict, arms: tuple[str, ...], theme: Theme) -> None:
+    """Held-out scores per seed, one line per seed across the three versions."""
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.4), sharey=True)
+    seeds = fu["seeds"]
+    total = None
+    for ax, task, title in zip(axes, ("binding", "leftmost"),
+                               ("What color is the <shape>?", "Color of the leftmost shape?"),
+                               strict=True):
+        runs = [fu["scores"][a][f"{task}|held out"] for a in arms]
+        total = fu.get("fresh", 300)
+        xs = np.arange(len(arms))
+        for i, _ in enumerate(seeds):
+            ys = [100 * r[i] / total for r in runs]
+            ax.plot(xs, ys, color=theme.muted, linewidth=1.1, alpha=0.8, zorder=2)
+            ax.scatter(xs, ys, s=22, color=theme.muted, zorder=3)
+        for x, r in zip(xs, runs, strict=True):
+            mid = float(np.median([100 * v / total for v in r]))
+            ax.plot([x - 0.18, x + 0.18], [mid, mid], color=theme.series[1], linewidth=3.0,
+                    zorder=4, label="median of five seeds" if (x == 0 and task == "binding") else None)
+            ax.text(x + 0.22, mid, f"{mid:.0f}", va="center", fontsize=10, color=theme.ink)
+        ax.set_xticks(xs)
+        ax.set_xticklabels([a.replace(" + ", "\n+ ").replace("connector only", "connector\nonly")
+                            .replace("no stage 1", "no\nstage 1") for a in arms], fontsize=9.6)
+        ax.set_xlim(-0.5, len(arms) - 0.3)
+        ax.set_title(title + "  (held-out pairs)", fontsize=11.5)
+        ax.set_ylim(0, 105)
+        ax.set_yticks([0, 25, 50, 75, 100])
+        ax.grid(axis="x", visible=False)
+    axes[0].set_ylabel("answered exactly right (%)")
+    fig.legend(loc="upper right", bbox_to_anchor=(0.98, 1.02), fontsize=10)
+    fig.suptitle("Five seeds, each a line: the same seed trained three ways", x=0.06, ha="left",
+                 fontsize=13, fontweight="bold", y=1.07, color=theme.ink)
+    fig.text(0.98, -0.06, "300 fresh questions per pool; a line joins the three versions "
+             "trained from the same seed, on the same questions in the same order",
+             ha="right", fontsize=9.0, color=theme.muted)
+    save_both(fig, SLUG, "paired-seeds", theme)
