@@ -605,10 +605,11 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
     for name in arm_names:
         groups.append((name, results["arms"][name]["scores"], False))
     fig, axes = plt.subplots(1, len(TASKS), figsize=(12.5, 4.6), sharey=True)
-    width = 0.26
+    width = 0.2
     modes = (("real", "right picture", orange, None),
              ("blank", "blank picture", theme.muted, None),
-             ("shuffled", "wrong picture", "none", "////"))
+             ("shuffled", "wrong picture", "none", "////"),
+             ("none", "no picture", theme.grid, None))
     for ax, task in zip(axes, TASKS, strict=True):
         for g, (_name, scores, single) in enumerate(groups):
             runs = [scores[TASKS.index(task)]] if single else scores[task]
@@ -616,7 +617,7 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
             for m, (key, label, fill, hatch) in enumerate(modes):
                 values = [100 * r[key] / total for r in runs]
                 mid = float(np.median(values))
-                x = g + (m - 1) * width
+                x = g + (m - 1.5) * width
                 ax.bar(x, mid, width * 0.9, color=fill, edgecolor=theme.muted if hatch else "none",
                        hatch=hatch, linewidth=0.8, label=label if (g == 0 and task == TASKS[0]) else None,
                        zorder=3)
@@ -636,7 +637,7 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
         ax.set_yticks([0, 25, 50, 75, 100])
         ax.grid(axis="x", visible=False)
     axes[0].set_ylabel("answered exactly right (%)")
-    fig.legend(loc="upper right", ncol=3, bbox_to_anchor=(0.98, 1.02), fontsize=10)
+    fig.legend(loc="upper right", ncol=4, bbox_to_anchor=(0.98, 1.02), fontsize=10)
     fig.suptitle("Stage 2: how often each model answers right, with and without the right "
                  "picture", x=0.06, ha="left", fontsize=13, fontweight="bold", y=1.07,
                  color=theme.ink)
@@ -790,3 +791,271 @@ def figure_inputs(question: list[str], prefix: list[str], second: list[str], fac
                  pad=10)
     _crop(fig, ax, 0.25, 4.05)
     save_both(fig, SLUG, "input-mixes", theme)
+
+
+# -- held-out pairs, controls, losses, failures ----------------------------------------
+
+
+def _shape_patch(ax, kind: str, color: str, cx: float, cy: float, r: float, z: int = 4):
+    """One shape drawn in its real color, centered at (cx, cy), about 2r across."""
+    from matplotlib.patches import Circle, Polygon, Rectangle
+
+    from ..vlm import COLORS
+
+    fill = tuple(v / 255 for v in COLORS[color])
+    if kind == "circle":
+        ax.add_patch(Circle((cx, cy), r, facecolor=fill, edgecolor="none", zorder=z))
+    elif kind == "square":
+        ax.add_patch(Rectangle((cx - r * 0.9, cy - r * 0.9), 1.8 * r, 1.8 * r, facecolor=fill,
+                               edgecolor="none", zorder=z))
+    else:
+        ax.add_patch(Polygon([(cx, cy + r), (cx - r, cy - r * 0.8), (cx + r, cy - r * 0.8)],
+                             closed=True, facecolor=fill, edgecolor="none", zorder=z))
+
+
+def figure_split(theme: Theme) -> None:
+    """The 18 color-shape pairs: 15 trained on, 3 never shown until the test."""
+    from ..vlm import COLORS, HELD_OUT, SHAPES
+
+    fig, ax = _canvas(12.5, 5.6)
+    colors = list(COLORS)
+    x0, y0, cell = 1.55, 1.0, 0.82
+    for j, color in enumerate(colors):
+        ax.text(x0 + (j + 0.5) * cell, y0 + 3 * cell + 0.22, color, ha="center", va="center",
+                fontsize=10.2, color=theme.ink)
+    for i, kind in enumerate(SHAPES):
+        y = y0 + (2 - i) * cell
+        ax.text(x0 - 0.15, y + cell / 2, kind, ha="right", va="center", fontsize=10.2,
+                color=theme.ink)
+        for j, color in enumerate(colors):
+            x = x0 + j * cell
+            held = (color, kind) in HELD_OUT
+            ax.add_patch(plt.Rectangle((x + 0.04, y + 0.04), cell - 0.08, cell - 0.08,
+                                       facecolor="none" if held else theme.grid,
+                                       edgecolor=theme.ink if held else "none",
+                                       linewidth=1.8, linestyle=(0, (3, 2)) if held else "solid",
+                                       zorder=3))
+            _shape_patch(ax, kind, color, x + cell / 2, y + cell / 2, cell * 0.27)
+    # legend under the grid
+    lx = x0
+    ax.add_patch(plt.Rectangle((lx, 0.35), 0.3, 0.3, facecolor=theme.grid, edgecolor="none"))
+    ax.text(lx + 0.42, 0.5, "15 pairs: in training pictures", va="center", fontsize=9.8,
+            color=theme.ink)
+    lx += 2.75
+    ax.add_patch(plt.Rectangle((lx, 0.35), 0.3, 0.3, facecolor="none", edgecolor=theme.ink,
+                               linewidth=1.6, linestyle=(0, (3, 2))))
+    ax.text(lx + 0.42, 0.5, "3 pairs: held out", va="center", fontsize=9.8, color=theme.ink)
+
+    # right: what each half of the data is for
+    rx = 7.2
+    _box(ax, rx, 2.95, 5.1, 1.55, theme.muted, lw=1.5)
+    _lines(ax, rx + 0.2, 4.2, ["Training, both stages",
+                              "Every picture is made of the 15 shaded pairs.",
+                              "Red, green and blue all appear, and so do",
+                              "triangles, circles and squares, just never as",
+                              "a red triangle, a green circle or a blue square."],
+           color=theme.ink, size=9.8, ha="left", gap=0.27, bold_first=True)
+    _box(ax, rx, 0.75, 5.1, 1.85, theme.ink, lw=1.5, dashed=True)
+    _lines(ax, rx + 0.2, 2.3, ["The held-out test",
+                              "New pictures, and each question is about a",
+                              "held-out pair: “What color is the triangle?”",
+                              "where the triangle is red. A model that has",
+                              "learned to bind reads the color off the shape;",
+                              "one that memorized pairs has never said “red” here."],
+           color=theme.ink, size=9.8, ha="left", gap=0.27, bold_first=True)
+    _crop(fig, ax, 0, 4.75)
+    ax.set_title("Three color-shape pairs are never shown in training", loc="left", pad=10)
+    save_both(fig, SLUG, "held-out-split", theme)
+
+
+def figure_controls(scene: Scene, other: Scene, question: str, answer: str,
+                    theme: Theme) -> None:
+    """One question, asked four ways. Only the first one lets the model see the answer."""
+    fig, ax = _canvas(12.5, 4.9)
+    cols = [
+        ("right picture", scene, "the real score", "it can read the answer"),
+        ("blank picture", (), "guessing, with an", "image slot that's empty"),
+        ("another scene's picture", other, "reading the wrong", "picture"),
+        ("no picture", None, "guessing from the", "question's words alone"),
+    ]
+    w = 3.05
+    for k, (title, sc, line1, line2) in enumerate(cols):
+        x = 0.2 + k * w
+        cx = x + w / 2 - 0.1
+        ax.text(cx, 4.45, title, ha="center", va="center", fontsize=11, fontweight="bold",
+                color=theme.ink)
+        if sc is None:
+            _box(ax, cx - 0.85, 2.3, 1.7, 1.7, theme.muted, dashed=True, lw=1.4)
+            ax.text(cx, 3.15, "nothing:\nno Image:,\nno vectors", ha="center", va="center",
+                    fontsize=9.4, color=theme.secondary)
+        else:
+            _picture(fig, ax, sc, cx - 0.85, 2.3, 1.7, frame=theme.axis)
+        ax.text(cx, 1.85, f"“{question}”", ha="center", va="center", fontsize=9.4,
+                color=theme.secondary)
+        ax.text(cx, 1.15, line1, ha="center", va="center", fontsize=10.0, color=theme.ink)
+        ax.text(cx, 0.85, line2, ha="center", va="center", fontsize=10.0, color=theme.ink)
+        if k:
+            ax.plot([x - 0.08, x - 0.08], [0.6, 4.6], color=theme.grid, linewidth=1.0)
+    ax.text(12.4, 0.25, f"right answer for the first picture: {answer}. The gap between the first "
+            "column's score and the best of the other three is what came from looking.",
+            ha="right", va="center", fontsize=9.0, color=theme.muted)
+    _crop(fig, ax, 0.05, 4.8)
+    ax.set_title("Every question is asked four ways", loc="left", pad=10)
+    save_both(fig, SLUG, "four-controls", theme)
+
+
+def figure_heldout(results: dict, arm_names: list[str], theme: Theme) -> None:
+    """Seen pairs against held-out pairs, per task and model, with the held-out control."""
+    blue, orange = theme.series[0], theme.series[1]
+    fig, axes = plt.subplots(1, len(TASKS), figsize=(12.5, 4.4), sharey=True)
+    width = 0.36
+    for ax, task in zip(axes, TASKS, strict=True):
+        for g, name in enumerate(arm_names):
+            arm = results["arms"][name]
+            for m, (key, label, color) in enumerate((("scores", "seen pairs", blue),
+                                                     ("heldout", "held-out pairs", orange))):
+                runs = arm[key][task]
+                values = [100 * r["real"] / r["total"] for r in runs]
+                mid = float(np.median(values))
+                x = g + (m - 0.5) * width
+                ax.bar(x, mid, width * 0.9, color=color, zorder=3,
+                       label=label if (g == 0 and task == TASKS[0]) else None)
+                ax.plot([x, x], [min(values), max(values)], color=theme.secondary, linewidth=1.0,
+                        zorder=4)
+                ax.text(x, max(values) + 2.5, f"{mid:.0f}", ha="center", va="bottom", fontsize=9.4,
+                        color=theme.ink, zorder=5)
+            held = arm["heldout"][task]
+            ctrl = float(np.median([100 * max(r["blank"], r["shuffled"], r["none"]) / r["total"]
+                                    for r in held]))
+            x = g + 0.5 * width
+            ax.plot([x - width * 0.5, x + width * 0.5], [ctrl, ctrl], color=theme.ink,
+                    linewidth=2.0, zorder=6,
+                    label="held-out: best control" if (g == 0 and task == TASKS[0]) else None)
+        ax.set_xticks(range(len(arm_names)))
+        short = {"no stage 1": "no\nstage 1", "connector only": "connector\nonly",
+                 "connector + LoRA": "connector\n+ LoRA"}
+        ax.set_xticklabels([short.get(n, n) for n in arm_names], fontsize=9.6)
+        ax.set_title({"count": "How many shapes?", "binding": "What color is the <shape>?",
+                      "leftmost": "Color of the leftmost shape?"}[task], fontsize=11.5)
+        ax.set_ylim(0, 112)
+        ax.set_yticks([0, 25, 50, 75, 100])
+        ax.grid(axis="x", visible=False)
+    axes[0].set_ylabel("answered exactly right (%)")
+    fig.legend(loc="upper right", ncol=3, bbox_to_anchor=(0.98, 1.02), fontsize=10)
+    fig.suptitle("Pairs it saw in training, and pairs it never saw", x=0.06, ha="left",
+                 fontsize=13, fontweight="bold", y=1.07, color=theme.ink)
+    fig.text(0.98, -0.06, "median of three seeds; the thin line spans the lowest to the highest",
+             ha="right", fontsize=9.0, color=theme.muted)
+    save_both(fig, SLUG, "held-out-results", theme)
+
+
+def figure_losses(results: dict, arm_names: list[str], theme: Theme) -> None:
+    """Training loss: stage 1 (49 and 196 tokens) and stage 2's three arms."""
+    def smooth(xs: list[float], k: int = 10) -> np.ndarray:
+        a = np.asarray(xs, dtype=float)
+        return np.convolve(a, np.ones(k) / k, mode="valid")
+
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12.5, 4.2))
+    s1 = results["stage1"]["losses"]
+    s196 = results["stage1_196"]["losses"]
+    a1.plot(np.arange(len(smooth(s1))) + 10, smooth(s1), color=theme.series[0], linewidth=1.8,
+            label="49 image tokens")
+    a1.plot(np.arange(len(smooth(s196))) + 10, smooth(s196), color=theme.muted, linewidth=1.8,
+            label="196 image tokens")
+    a1.set_title("Stage 1: captions, connector only", fontsize=11.5, loc="left")
+    colors = {"no stage 1": theme.muted, "connector only": theme.series[0],
+              "connector + LoRA": theme.series[1]}
+    for name in arm_names:
+        runs = results["arms"][name]["losses"]
+        n = min(len(r) for r in runs)
+        mid = np.median(np.asarray([r[:n] for r in runs]), axis=0)
+        a2.plot(np.arange(len(smooth(list(mid)))) + 10, smooth(list(mid)), color=colors[name],
+                linewidth=1.8, label=name + (" (from random)" if name == "no stage 1" else ""))
+    a2.set_title("Stage 2: questions", fontsize=11.5, loc="left")
+    from matplotlib.ticker import FuncFormatter, NullFormatter
+
+    for ax in (a1, a2):
+        ax.set_yscale("log")
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+        ax.set_xlabel("training step")
+        ax.legend(fontsize=9.6, frameon=False)
+    a1.set_ylabel("loss (log scale)")
+    fig.suptitle("Training loss, averaged over 10 steps", x=0.06, ha="left", fontsize=13,
+                 fontweight="bold", y=1.03, color=theme.ink)
+    fig.text(0.98, -0.04, "stage 2: median of three seeds at each step. Lower loss is not the "
+             "same as reading the picture; that needs the controls.", ha="right", fontsize=9.0,
+             color=theme.muted)
+    save_both(fig, SLUG, "training-loss", theme)
+
+
+def figure_failures(items: list[tuple[Scene, str, str, str]], theme: Theme) -> None:
+    """A few wrong answers with their pictures: question, right answer, what it said."""
+    n = len(items)
+    fig, ax = _canvas(12.5, 3.9)
+    w = 12.5 / n
+    for k, (scene, question, right, said) in enumerate(items):
+        cx = (k + 0.5) * w
+        _picture(fig, ax, scene, cx - 0.85, 1.55, 1.7, frame=theme.axis)
+        import textwrap
+
+        _lines(ax, cx, 1.3, textwrap.wrap(question, 22), color=theme.ink, size=9.2, gap=0.24)
+        ax.text(cx, 0.72, f"right: {right}", ha="center", va="center", fontsize=9.8,
+                color=theme.ink, fontweight="bold")
+        ax.text(cx, 0.4, f"said: {said or '(nothing)'}", ha="center", va="center", fontsize=9.8,
+                color=theme.series[1], fontweight="bold")
+    _crop(fig, ax, 0.15, 3.4)
+    ax.set_title("Some wrong answers on held-out pairs (connector only, first seed)", loc="left",
+                 pad=10)
+    save_both(fig, SLUG, "failures", theme)
+
+
+def figure_experiment(n: dict, theme: Theme) -> None:
+    """The whole experiment as a flow: data, the training runs, and the tests."""
+    blue, orange = theme.series[0], theme.series[1]
+    fig, ax = _canvas(12.5, 6.2)
+
+    def card(x, y, w, h, title, lines, edge, fill="none", dashed=False):
+        _box(ax, x, y, w, h, edge, fill=fill, lw=1.6, dashed=dashed)
+        ink = ink_for(fill) if fill != "none" else theme.ink
+        _lines(ax, x + 0.15, y + h - 0.25, [title], color=ink, size=10.4, ha="left",
+               bold_first=True)
+        _lines(ax, x + 0.15, y + h - 0.55, lines, color=ink, size=9.4, ha="left", gap=0.25)
+
+    for x, label in ((0.2, "1. Generated data"), (4.35, "2. Training runs"),
+                     (8.6, "3. Tests, on new pictures")):
+        ax.text(x, 5.85, label, fontsize=11.5, fontweight="bold", color=theme.ink, va="center")
+
+    card(0.2, 4.15, 3.6, 1.35, "Captions",
+         [f"{n['captions']:,} pictures, 1 to 4 shapes", "“a red square and a blue circle”",
+          "used by stage 1"], theme.muted)
+    card(0.2, 2.25, 3.6, 1.35, "Questions",
+         [f"{n['questions']:,} pictures, 2 to 4 shapes", "count, binding, leftmost",
+          "used by stage 2"], theme.muted)
+    _lines(ax, 0.2, 1.85, ["Training pictures never contain", "a held-out color-shape pair."],
+           color=theme.secondary, size=9.4, ha="left", gap=0.25)
+
+    card(4.35, 4.4, 3.85, 1.1, "Stage 1: connector on captions",
+         [f"{n['stage1']} steps, one run", "then a second run on 196 tokens"], blue, fill=blue)
+    card(4.35, 1.5, 3.85, 2.5, "Stage 2: questions, 3 seeds each",
+         [f"connector only: {n['stage2']} steps from stage 1",
+          f"connector + LoRA: {n['stage2']} steps from stage 1",
+          f"no stage 1: {n['stage1'] + n['stage2']} steps from random",
+          "", "the no-stage-1 run is the control", "for stage 1 itself"], blue)
+    _arrow(ax, 3.85, 4.85, 4.3, 4.85, theme.secondary)
+    _arrow(ax, 3.85, 2.9, 4.3, 2.9, theme.secondary)
+    _arrow(ax, 6.27, 4.35, 6.27, 4.05, theme.secondary)
+
+    card(8.6, 4.15, 3.7, 1.35, "Two test sets",
+         [f"seen pairs: {n['test']} per question,", f"{n['captions_test']} captions",
+          "held-out pairs: the same again"], orange, dashed=False)
+    card(8.6, 2.0, 3.7, 1.6, "Each asked four ways",
+         ["the right picture", "a blank picture", "another scene's picture",
+          "no picture at all"], orange)
+    _arrow(ax, 8.25, 4.85, 8.55, 4.85, theme.secondary)
+    _arrow(ax, 8.25, 2.8, 8.55, 2.8, theme.secondary)
+    _lines(ax, 8.6, 1.6, ["score = exact match, one word or", "one whole caption"],
+           color=theme.secondary, size=9.4, ha="left", gap=0.25)
+    _crop(fig, ax, 1.15, 6.1)
+    ax.set_title("The whole experiment", loc="left", pad=10)
+    save_both(fig, SLUG, "experiment", theme)

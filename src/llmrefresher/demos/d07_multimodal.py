@@ -777,6 +777,24 @@ def save_results(results: dict) -> None:
     results_path().write_text(json.dumps(results, indent=1))
 
 
+def _gallery(results: dict, per_task: int = 2) -> list[tuple[Scene, str, str, str]]:
+    """Wrong answers to show with their pictures: held-out questions, connector only.
+
+    The scenes are regenerated from their seeds, so the gallery needs only the
+    saved results, not the models.
+    """
+    scenes = build_examples()["scenes"]
+    shown: dict[str, int] = {}
+    out = []
+    for image, task, prompt, right, said in results["arms"]["connector only"]["misses"]["heldout"]:
+        if shown.get(task, 0) >= per_task:
+            continue
+        shown[task] = shown.get(task, 0) + 1
+        question = prompt.split("Question: ")[1].split("\n")[0]
+        out.append((scenes[image], question, right, said))
+    return out
+
+
 def draw_figures(results: dict) -> int:
     """Every figure, in both themes. Needs the saved results, not the models."""
     facts = Facts.from_configs(VISION_MODEL, LANGUAGE_MODEL, rank=RANK, targets=TARGETS)
@@ -790,6 +808,8 @@ def draw_figures(results: dict) -> int:
         return [tokenizer.decode([i]) for i in tokenizer(text, add_special_tokens=False).input_ids]
 
     arm_names = ["no stage 1", "connector only", "connector + LoRA"]
+    other = make_scene(random.Random(FIGURE_SCENE_SEED + 1), 3)
+    gallery = _gallery(results)
     for theme in THEMES:
         with styled(theme):
             figures.figure_overview(scene, question + " Answer:", answer, facts, theme)
@@ -804,7 +824,16 @@ def draw_figures(results: dict) -> int:
             figures.figure_inputs(pieces(QUESTION_PROMPT.format(q=INPUTS_QUESTION)),
                                   pieces(VisionLanguageModel.PREFIX), pieces("\nImage:"),
                                   facts, theme)
-    return 9
+            figures.figure_split(theme)
+            figures.figure_controls(scene, other, question, answer, theme)
+            figures.figure_heldout(results, arm_names, theme)
+            figures.figure_losses(results, arm_names, theme)
+            figures.figure_failures(gallery, theme)
+            figures.figure_experiment(
+                {"captions": TRAIN_SCENES, "questions": TRAIN_SCENES, "stage1": STAGE1_STEPS,
+                 "stage2": STAGE2_STEPS, "test": TEST_PER_TASK, "captions_test": TEST_CAPTIONS},
+                theme)
+    return 15
 
 
 # -- main ----------------------------------------------------------------------------
