@@ -127,6 +127,41 @@ def held_out(shape) -> bool:
     return (shape.color, shape.kind) in HELD_OUT
 
 
+def make_caption_pool(scenes: list[Scene], count: int, seed: int,
+                      unseen: bool = False) -> list[Example]:
+    """``count`` caption examples from their own seed; their scenes go on ``scenes``.
+
+    ``unseen`` pools have at least one held-out pair in every picture; the
+    others never have one.
+    """
+    rng = random.Random(seed)
+    out = []
+    while len(out) < count:
+        scene = make_scene(rng, rng.choice([1, 2, 3, 4]),
+                           avoid=frozenset() if unseen else HELD_OUT)
+        if unseen and not any(held_out(s) for s in scene):
+            continue
+        scenes.append(scene)
+        out.append(Example(len(scenes) - 1, CAPTION_PROMPT, describe(scene), "caption"))
+    return out
+
+
+def make_question_pool(scenes: list[Scene], count: int, seed: int, tasks: tuple[str, ...],
+                       unseen: bool = False) -> list[Example]:
+    """``count`` questions cycling through ``tasks``; ``unseen`` asks about held-out pairs."""
+    rng = random.Random(seed)
+    out: list[Example] = []
+    while len(out) < count:
+        scene = make_scene(rng, rng.choice([2, 3, 4]),
+                           avoid=frozenset() if unseen else HELD_OUT)
+        task = tasks[len(out) % len(tasks)]
+        qa = ask(scene, task, rng, about=held_out if unseen else None)
+        if qa is not None:
+            scenes.append(scene)
+            out.append(Example(len(scenes) - 1, QUESTION_PROMPT.format(q=qa[0]), qa[1], task))
+    return out
+
+
 def build_examples() -> dict:
     """Generate the scenes and the caption and question examples over them.
 
@@ -139,33 +174,11 @@ def build_examples() -> dict:
     """
     scenes: list[Scene] = []
 
-    def add(scene: Scene) -> int:
-        scenes.append(scene)
-        return len(scenes) - 1
+    def caption_pool(count, seed, unseen=False):
+        return make_caption_pool(scenes, count, seed, unseen)
 
-    def caption_pool(count: int, seed: int, unseen: bool = False) -> list[Example]:
-        rng = random.Random(seed)
-        out = []
-        while len(out) < count:
-            scene = make_scene(rng, rng.choice([1, 2, 3, 4]),
-                               avoid=frozenset() if unseen else HELD_OUT)
-            if unseen and not any(held_out(s) for s in scene):
-                continue
-            out.append(Example(add(scene), CAPTION_PROMPT, describe(scene), "caption"))
-        return out
-
-    def question_pool(count: int, seed: int, tasks: tuple[str, ...],
-                      unseen: bool = False) -> list[Example]:
-        rng = random.Random(seed)
-        out: list[Example] = []
-        while len(out) < count:
-            scene = make_scene(rng, rng.choice([2, 3, 4]),
-                               avoid=frozenset() if unseen else HELD_OUT)
-            task = tasks[len(out) % len(tasks)]
-            qa = ask(scene, task, rng, about=held_out if unseen else None)
-            if qa is not None:
-                out.append(Example(add(scene), QUESTION_PROMPT.format(q=qa[0]), qa[1], task))
-        return out
+    def question_pool(count, seed, tasks, unseen=False):
+        return make_question_pool(scenes, count, seed, tasks, unseen)
 
     return {
         "captions_train": caption_pool(TRAIN_SCENES, seed=1),
@@ -870,6 +883,11 @@ def wrong_colors(rep: Report, results: dict) -> None:
 def main() -> None:
     hf_logging.disable_progress_bar()
     hf_logging.set_verbosity_error()
+    if "--followup" in sys.argv:
+        # Five paired seeds, fresh test questions, captions in stage 2, a probe.
+        from .d07_followup import run
+        run()
+        return
     if "--misses" in sys.argv:
         # From the last run's saved wrong answers, without training anything.
         rep = Report("07", "Multimodal: where the wrong colors came from")

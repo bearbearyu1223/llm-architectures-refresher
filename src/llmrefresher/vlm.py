@@ -373,16 +373,21 @@ def train_vlm(
     groups: Iterable[tuple[Iterable[nn.Parameter], float]],
     seed: int,
     on_step: Callable[[int, float], None] | None = None,
+    extra: Sequence[Example] = (),
+    extra_per_batch: int = 0,
 ) -> TrainLog:
     """AdamW on whatever ``groups`` names, each with its own learning rate.
 
     The data order comes from ``seed`` alone, so two runs that differ only in
-    what they train see the same examples in the same order.
+    what they train see the same examples in the same order. ``extra`` adds
+    ``extra_per_batch`` more examples to every batch, drawn with their own
+    random stream, so the main examples' order is unchanged by adding them.
     """
     groups = [(list(params), lr) for params, lr in groups]
     trainable = [p for params, _ in groups for p in params]
     opt = torch.optim.AdamW([{"params": params, "lr": lr} for params, lr in groups])
     rng = random.Random(seed)
+    extra_rng = random.Random(seed + 10_000)
     device = model.device
     model.lm.train()
     reset_peak_memory(device)
@@ -391,6 +396,7 @@ def train_vlm(
     losses: list[float] = []
     for step in range(steps):
         batch = [examples[rng.randrange(len(examples))] for _ in range(batch_size)]
+        batch += [extra[extra_rng.randrange(len(extra))] for _ in range(extra_per_batch)]
         index = torch.tensor([item.image for item in batch])
         loss = model.loss(features[index], batch)
         loss.backward()
