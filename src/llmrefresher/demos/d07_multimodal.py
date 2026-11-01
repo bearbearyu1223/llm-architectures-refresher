@@ -52,7 +52,10 @@ from ..report import WIDTH, Report
 from ..training import TrainLog
 from .d06_lora import passage_perplexity
 from ..vlm import (
+    COLORS,
+    HELD_OUT,
     IMAGE_SIZE,
+    SHAPES,
     PATCH,
     TASKS,
     Example,
@@ -99,6 +102,7 @@ TEST_PER_TASK = 100
 FIGURE_SCENE_SEED = 11
 # The question section 6 and its figure count positions for.
 INPUTS_QUESTION = "How many shapes are there?"
+SHAPE_ORDER = {"circle": 0, "square": 1, "triangle": 2}
 
 
 # -- data ----------------------------------------------------------------------------
@@ -115,15 +119,23 @@ class Data:
     captions_test: list[Example]
     questions_train: list[Example]
     questions_test: dict[str, list[Example]]
+    captions_heldout: list[Example]  # every picture has a held-out pair in it
+    questions_heldout: dict[str, list[Example]]  # each question is about one
 
 
-def build_examples() -> tuple[list[Scene], list[Example], list[Example], list[Example],
-                              dict[str, list[Example]]]:
+def held_out(shape) -> bool:
+    return (shape.color, shape.kind) in HELD_OUT
+
+
+def build_examples() -> dict:
     """Generate the scenes and the caption and question examples over them.
 
-    Four disjoint pools, each from its own seed: captions to train on, captions
-    to test, questions to train on, questions to test. Test scenes are new
-    pictures, so a score is a score on images the model has never seen.
+    Six pools, each from its own seed. Training pictures and the ordinary test
+    pictures never contain a :data:`HELD_OUT` pair. The held-out pools do: every
+    held-out caption picture has at least one, and every held-out question is
+    about one (binding asks for its color, leftmost needs it leftmost, count
+    needs one in the picture). Test scenes are new pictures either way, so a
+    score is a score on images the model has never seen.
     """
     scenes: list[Scene] = []
 
@@ -131,31 +143,41 @@ def build_examples() -> tuple[list[Scene], list[Example], list[Example], list[Ex
         scenes.append(scene)
         return len(scenes) - 1
 
-    def caption_pool(count: int, seed: int) -> list[Example]:
+    def caption_pool(count: int, seed: int, unseen: bool = False) -> list[Example]:
         rng = random.Random(seed)
         out = []
-        for _ in range(count):
-            scene = make_scene(rng, rng.choice([1, 2, 3, 4]))
+        while len(out) < count:
+            scene = make_scene(rng, rng.choice([1, 2, 3, 4]),
+                               avoid=frozenset() if unseen else HELD_OUT)
+            if unseen and not any(held_out(s) for s in scene):
+                continue
             out.append(Example(add(scene), CAPTION_PROMPT, describe(scene), "caption"))
         return out
 
-    def question_pool(count: int, seed: int, tasks: tuple[str, ...]) -> list[Example]:
+    def question_pool(count: int, seed: int, tasks: tuple[str, ...],
+                      unseen: bool = False) -> list[Example]:
         rng = random.Random(seed)
         out: list[Example] = []
         while len(out) < count:
-            scene = make_scene(rng, rng.choice([2, 3, 4]))
+            scene = make_scene(rng, rng.choice([2, 3, 4]),
+                               avoid=frozenset() if unseen else HELD_OUT)
             task = tasks[len(out) % len(tasks)]
-            qa = ask(scene, task, rng)
+            qa = ask(scene, task, rng, about=held_out if unseen else None)
             if qa is not None:
                 out.append(Example(add(scene), QUESTION_PROMPT.format(q=qa[0]), qa[1], task))
         return out
 
-    captions_train = caption_pool(TRAIN_SCENES, seed=1)
-    captions_test = caption_pool(TEST_CAPTIONS, seed=2)
-    questions_train = question_pool(TRAIN_SCENES, seed=3, tasks=TASKS)
-    questions_test = {t: question_pool(TEST_PER_TASK, seed=4 + i, tasks=(t,))
-                      for i, t in enumerate(TASKS)}
-    return scenes, captions_train, captions_test, questions_train, questions_test
+    return {
+        "captions_train": caption_pool(TRAIN_SCENES, seed=1),
+        "captions_test": caption_pool(TEST_CAPTIONS, seed=2),
+        "questions_train": question_pool(TRAIN_SCENES, seed=3, tasks=TASKS),
+        "questions_test": {t: question_pool(TEST_PER_TASK, seed=4 + i, tasks=(t,))
+                           for i, t in enumerate(TASKS)},
+        "captions_heldout": caption_pool(TEST_CAPTIONS, seed=7, unseen=True),
+        "questions_heldout": {t: question_pool(TEST_PER_TASK, seed=8 + i, tasks=(t,), unseen=True)
+                              for i, t in enumerate(TASKS)},
+        "scenes": scenes,
+    }
 
 
 @torch.no_grad()
@@ -219,20 +241,37 @@ def build_vlm(tokenizer, device: torch.device, *, merge: bool, seed: int,
 
 @dataclass(frozen=True)
 class Scores:
-    """Exact-match hits with the real picture, a blank one, and a wrong one."""
+    """Exact-match hits with the real picture and the three controls.
+
+    The controls: an all-white picture, another scene's picture, and no picture
+    at all (only the question's words).
+    """
 
     real: int
     blank: int
     shuffled: int
+    none: int
     total: int
 
+    @property
+    def best_control(self) -> int:
+        return max(self.blank, self.shuffled, self.none)
 
-def score_all(model: VisionLanguageModel, data: Data, examples: list[Example]) -> Scores:
-    got = {
-        mode: score_vlm(model, data.features, examples, image=mode, blank=data.blank)[0]
-        for mode in ("real", "blank", "shuffled")
-    }
-    return Scores(got["real"], got["blank"], got["shuffled"], len(examples))
+
+Miss = tuple[int, str, str, str, str]  # image, task, prompt, right answer, what it said
+
+
+def score_all(model: VisionLanguageModel, data: Data, examples: list[Example],
+              misses: list[Miss] | None = None) -> Scores:
+    got = {}
+    for mode in ("real", "blank", "shuffled", "none"):
+        wrong: list = []
+        got[mode] = score_vlm(model, data.features, examples, image=mode, blank=data.blank,
+                              misses=wrong)[0]
+        if mode == "real" and misses is not None:
+            misses.extend((item.image, item.task, item.prompt, item.answer, said)
+                          for item, said in wrong)
+    return Scores(got["real"], got["blank"], got["shuffled"], got["none"], len(examples))
 
 
 @dataclass(frozen=True)
@@ -240,9 +279,11 @@ class Arm:
     """One stage-2 configuration's runs: per-task scores per seed, and the logs."""
 
     name: str
-    scores: dict[str, list[Scores]]
+    scores: dict[str, list[Scores]]  # the ordinary test pictures
+    heldout: dict[str, list[Scores]]  # questions about a pair never trained on
     logs: list[TrainLog]
     ppl: list[float]  # text only: post 4's passage, after training
+    misses: dict[str, list[Miss]]  # first seed's wrong answers, right picture, per pool
 
 
 # -- section 1 -----------------------------------------------------------------------
@@ -412,8 +453,12 @@ def the_connector(rep: Report, tokenizer, hidden: int) -> None:
 
 
 def stage_one(rep: Report, data: Data, tokenizer, device: torch.device, *,
-              merge: bool = True, quiet: bool = False) -> tuple[dict, TrainLog, Scores, Scores]:
-    """Train the connector on captions, everything else frozen. Returns its state."""
+              merge: bool = True, quiet: bool = False) -> tuple[dict, TrainLog, Scores, Scores, Scores]:
+    """Train the connector on captions, everything else frozen. Returns its state.
+
+    Also returns the captions scores before and after, and after on pictures
+    that contain a held-out pair.
+    """
     model = build_vlm(tokenizer, device, merge=merge, seed=0)
     before = score_all(model, data, data.captions_test)
     label = "stage 1, connector on captions" + ("" if merge else ", 196 tokens")
@@ -423,7 +468,9 @@ def stage_one(rep: Report, data: Data, tokenizer, device: torch.device, *,
         on_step=progress.training(label, STAGE1_STEPS),
     )
     after = score_all(model, data, data.captions_test)
-    progress.status(f"    captions exactly right: {after.real} of {after.total}")
+    unseen = score_all(model, data, data.captions_heldout)
+    progress.status(f"    captions exactly right: {after.real} of {after.total}, "
+                    f"held-out pictures {unseen.real} of {unseen.total}")
     if not quiet:
         rep.kv("trained: the connector only", f"{log.trainable:,} parameters")
         rep.kv("frozen", "vision encoder and language model")
@@ -432,12 +479,13 @@ def stage_one(rep: Report, data: Data, tokenizer, device: torch.device, *,
         rep.kv("loss at the end (mean of last 10)", f"{log.final_loss:.4f}")
         rep.kv("time per step", f"{log.seconds_per_step:.2f} s")
         rep.blank()
-        rep.note(f"Captions exactly right, on {before.total} new pictures:")
+        rep.note(f"Captions exactly right, of {before.total} new pictures each:")
         rep.blank()
         rep.table(
-            ["", "right picture", "blank picture", "wrong picture"],
-            [("before stage 1", before.real, before.blank, before.shuffled),
-             ("after stage 1", after.real, after.blank, after.shuffled)],
+            ["", "right picture", "blank", "wrong picture", "no picture"],
+            [("before stage 1", before.real, before.blank, before.shuffled, before.none),
+             ("after stage 1", after.real, after.blank, after.shuffled, after.none),
+             ("  held-out pairs", unseen.real, unseen.blank, unseen.shuffled, unseen.none)],
         )
         rep.blank()
         rep.note("What it writes, for the first three test pictures:")
@@ -453,7 +501,7 @@ def stage_one(rep: Report, data: Data, tokenizer, device: torch.device, *,
             rep.blank()
     state = {k: v.detach().cpu().clone() for k, v in model.projector.state_dict().items()}
     _release(model)
-    return state, log, before, after
+    return state, log, before, after, unseen
 
 
 def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, state: dict | None,
@@ -467,6 +515,8 @@ def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, sta
     seeds = SEEDS if seeds is None else seeds
     steps = STAGE2_STEPS if steps is None else steps
     scores: dict[str, list[Scores]] = {t: [] for t in TASKS}
+    heldout: dict[str, list[Scores]] = {t: [] for t in TASKS}
+    misses: dict[str, list[Miss]] = {"seen": [], "heldout": []}
     logs: list[TrainLog] = []
     ppl: list[float] = []
     for seed in seeds:
@@ -480,14 +530,19 @@ def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, sta
             groups=groups, seed=seed, on_step=progress.training(f"{name}, seed {seed}", steps),
         )
         logs.append(log)
+        first = seed == seeds[0]
         for task in TASKS:
-            scores[task].append(score_all(model, data, data.questions_test[task]))
+            scores[task].append(score_all(model, data, data.questions_test[task],
+                                          misses["seen"] if first else None))
+            heldout[task].append(score_all(model, data, data.questions_heldout[task],
+                                           misses["heldout"] if first else None))
         with torch.no_grad():
             ppl.append(passage_perplexity(model.lm, tokenizer, device))
-        progress.status("    " + ", ".join(f"{t} {scores[t][-1].real}" for t in TASKS)
-                        + f", passage perplexity {ppl[-1]:.4f}")
+        progress.status("    " + ", ".join(f"{t} {scores[t][-1].real}/{heldout[t][-1].real}"
+                                          for t in TASKS)
+                        + f" (seen/held-out), passage perplexity {ppl[-1]:.4f}")
         _release(model)
-    return Arm(name, scores, logs, ppl)
+    return Arm(name, scores, heldout, logs, ppl, misses)
 
 
 def _median(values: list[int]) -> str:
@@ -496,12 +551,14 @@ def _median(values: list[int]) -> str:
     return f"{int(statistics.median(values))} ({min(values)}-{max(values)})"
 
 
-def zero_shot(data: Data, tokenizer, device: torch.device, state: dict) -> dict[str, Scores]:
+def zero_shot(data: Data, tokenizer, device: torch.device,
+              state: dict) -> tuple[dict[str, Scores], dict[str, Scores]]:
     """The stage-1 model asked stage 2's questions before it has seen any."""
     model = build_vlm(tokenizer, device, merge=True, seed=0, projector_state=state)
-    out = {t: score_all(model, data, data.questions_test[t]) for t in TASKS}
+    seen = {t: score_all(model, data, data.questions_test[t]) for t in TASKS}
+    unseen = {t: score_all(model, data, data.questions_heldout[t]) for t in TASKS}
     _release(model)
-    return out
+    return seen, unseen
 
 
 def stage_two(rep: Report, arms: list[Arm], zero: dict[str, Scores]) -> None:
@@ -517,34 +574,102 @@ def stage_two(rep: Report, arms: list[Arm], zero: dict[str, Scores]) -> None:
     )
     rep.blank()
     total = first.scores[TASKS[0]][0].total
-    rep.note(f"Questions answered exactly right, of {total} per task on new pictures;")
-    rep.note(f"trained rows are the median of {len(first.logs)} seeds, with the range in brackets.")
+    rep.note(f"Questions answered exactly right with the right picture, of {total} per")
+    rep.note("task on new pictures. Seen: only pairs from training. Held out: each")
+    rep.note("question is about a color-shape pair no training picture contained.")
+    rep.note(f"Trained rows: median of {len(first.logs)} seeds, range in brackets.")
     rep.blank()
+    seen, unseen = zero
     rows = []
     for task in TASKS:
-        z = zero[task]
-        rows.append((task, "stage 1 only", z.real, z.blank, z.shuffled))
+        rows.append((task, "stage 1 only", seen[task].real, unseen[task].real))
         for arm in arms:
-            s = arm.scores[task]
-            rows.append(("", arm.name, _median([x.real for x in s]), _median([x.blank for x in s]),
-                         _median([x.shuffled for x in s])))
-    rep.table(["task", "model", "right picture", "blank", "wrong picture"], rows)
+            rows.append(("", arm.name, _median([x.real for x in arm.scores[task]]),
+                         _median([x.real for x in arm.heldout[task]])))
+    rep.table(["task", "model", "seen pairs", "held-out pairs"], rows)
 
 
 def is_it_looking(rep: Report, arms: list[Arm]) -> None:
-    """The gap between the right picture and the best control, per task."""
+    """Every control, and the gap between the right picture and the best one."""
+    rep.note("Seen pairs, median of the seeds. Controls: a blank picture, another")
+    rep.note("scene's picture, and no picture at all, only the question.")
+    rep.blank()
     rows = []
     for task in TASKS:
         for arm in arms:
             s = arm.scores[task]
-            real = statistics.median(x.real for x in s)
-            control = statistics.median(max(x.blank, x.shuffled) for x in s)
-            rows.append((task if arm is arms[0] else "", arm.name, int(real), int(control),
-                         int(real - control)))
-    rep.table(["task", "model", "right picture", "best control", "gap"], rows)
+
+            def med(key: str) -> int:
+                return int(statistics.median(getattr(x, key) for x in s))
+
+            control = int(statistics.median(x.best_control for x in s))
+            rows.append((task if arm is arms[0] else "", arm.name, med("real"), med("blank"),
+                         med("shuffled"), med("none"), med("real") - control))
+    rep.table(["task", "model", "right", "blank", "wrong", "none", "gap"], rows)
 
 
-# -- section 6 -----------------------------------------------------------------------
+# -- section 6: pairs it never saw -----------------------------------------------------
+
+
+def _pair_of(prompt: str, answer: str) -> tuple[str, str]:
+    """The (color, shape) a binding question is about: "What color is the <shape>?"."""
+    return answer, prompt.split("the ")[-1].split("?")[0]
+
+
+def pairs_never_seen(rep: Report, data: Data, arms: list[Arm],
+                     zero: tuple[dict[str, Scores], dict[str, Scores]],
+                     captions: Scores) -> None:
+    """Questions about a color-shape pair that no training picture contained."""
+    names = ", ".join(f"{c} {k}" for c, k in sorted(HELD_OUT, key=lambda p: SHAPE_ORDER[p[1]]))
+    rep.kv("never in a training picture", names)
+    rep.kv("stage 1 captions with one in it", f"{captions.real} of {captions.total} exactly right")
+    rep.blank()
+    rep.note("Right picture, median of the seeds. Control and gap are on the")
+    rep.note("held-out questions, against the best of blank, wrong and none.")
+    rep.blank()
+    rows = []
+    for task in TASKS:
+        for arm in arms:
+            seen = int(statistics.median(x.real for x in arm.scores[task]))
+            h = arm.heldout[task]
+            real = int(statistics.median(x.real for x in h))
+            control = int(statistics.median(x.best_control for x in h))
+            rows.append((task if arm is arms[0] else "", arm.name, seen, real, control,
+                         real - control))
+    rep.table(["task", "model", "seen", "held out", "control", "gap"], rows)
+
+    rep.blank()
+    rep.note("Binding on held-out pairs, first seed, by pair: right of asked.")
+    rep.blank()
+    asked: dict[tuple[str, str], int] = {}
+    for item in data.questions_heldout["binding"]:
+        pair = _pair_of(item.prompt, item.answer)
+        asked[pair] = asked.get(pair, 0) + 1
+    pairs = sorted(asked, key=lambda p: SHAPE_ORDER[p[1]])
+    rows = []
+    for arm in arms:
+        wrong: dict[tuple[str, str], int] = {}
+        for _, task, prompt, answer, _ in arm.misses["heldout"]:
+            if task == "binding":
+                pair = _pair_of(prompt, answer)
+                wrong[pair] = wrong.get(pair, 0) + 1
+        rows.append((arm.name, *(f"{asked[p] - wrong.get(p, 0)} of {asked[p]}" for p in pairs)))
+    rep.table(["model", *(f"{c} {k}" for c, k in pairs)], rows)
+
+    rep.blank()
+    rep.note("Some wrong answers, connector only, first seed (held-out questions):")
+    rep.blank()
+    misses = next(a for a in arms if a.name == "connector only").misses["heldout"]
+    shown: dict[str, int] = {}
+    for _, _, prompt, answer, said in misses:
+        q = prompt.split("Question: ")[1].split("\n")[0]
+        if shown.get(q, 0) >= 2:
+            continue
+        shown[q] = shown.get(q, 0) + 1
+        rep.note(f"{q:<36} right: {answer:<7} said: {said or '(nothing)'}")
+
+
+# -- section 7 -----------------------------------------------------------------------
 
 
 def text_pictures_or_both(rep: Report, tokenizer, base_ppl: float, arms: list[Arm]) -> None:
@@ -574,8 +699,8 @@ def text_pictures_or_both(rep: Report, tokenizer, base_ppl: float, arms: list[Ar
     rep.table(["model", "passage perplexity"], out)
     rep.takeaway(
         "Text alone is just the language model's ordinary input. Where the language "
-        "model stayed frozen, its text is exactly what it was; LoRA bought its "
-        "small gains in stage 2 by changing that."
+        "model stayed frozen, its text is exactly what it was; only the arm that "
+        "trains LoRA adapters can change it."
     )
 
 
@@ -618,6 +743,15 @@ def what_an_image_costs(rep: Report, lm_config, tokenizer, data: Data,
     # LLaVA-1.5's count is not in its paper; it follows from its encoder's shape.
     rep.blank()
     rep.kv("LLaVA-1.5: 336 px, 14 px patches", f"(336 / 14)^2 = {(336 // 14) ** 2} tokens")
+    rep.blank()
+    rep.note("The same patches at a higher resolution (tokens, and KV cache in bf16):")
+    rep.blank()
+    rows = []
+    for side in (224, 448):
+        n = (side // PATCH) ** 2
+        rows.append((f"{side} x {side} px", n, f"{n * per_token / MIB:.2f} MiB",
+                     n // 4, f"{n // 4 * per_token / MIB:.2f} MiB"))
+    rep.table(["picture", "patches", "KV cache", "merged 2 x 2", "KV cache"], rows)
 
 
 # -- results, kept so the figures can be redrawn without training ------------------
@@ -626,6 +760,8 @@ def what_an_image_costs(rep: Report, lm_config, tokenizer, data: Data,
 def _arm_record(arm: Arm) -> dict:
     return {
         "scores": {t: [asdict(x) for x in arm.scores[t]] for t in TASKS},
+        "heldout": {t: [asdict(x) for x in arm.heldout[t]] for t in TASKS},
+        "misses": arm.misses,
         "seconds_per_step": [log.seconds_per_step for log in arm.logs],
         "trainable": arm.logs[0].trainable,
         "losses": [list(log.losses) for log in arm.logs],
@@ -684,26 +820,28 @@ def main() -> None:
     torch.manual_seed(0)
     rep = Report("07", "Multimodal: teaching a language model to see")
     rep.header()
-    progress.status("demo07: 11 training runs, about two hours on an Apple-silicon Mac; progress goes to stderr, receipts to stdout")
+    progress.status("demo07: 11 training runs, about two and a half hours on an Apple-silicon Mac; progress goes to stderr, receipts to stdout")
 
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(LANGUAGE_MODEL)
-    scenes, cap_train, cap_test, q_train, q_test = build_examples()
+    pools = build_examples()
+    scenes = pools.pop("scenes")
 
     rep.kv("vision encoder (frozen)", VISION_MODEL)
     rep.kv("language model (frozen)", LANGUAGE_MODEL)
     rep.kv("precision", "float32")
     rep.kv("pictures", f"{len(scenes):,} generated scenes, {IMAGE_SIZE} x {IMAGE_SIZE}")
-    rep.kv("  stage 1 trains on", f"{len(cap_train):,} captions")
-    rep.kv("    tested on", f"{len(cap_test)} new pictures")
-    rep.kv("  stage 2 trains on", f"{len(q_train):,} questions, 3 kinds")
-    rep.kv("    tested on", f"{TEST_PER_TASK} new pictures per kind")
+    rep.kv("  stage 1 trains on", f"{len(pools['captions_train']):,} captions")
+    rep.kv("    tested on", f"{TEST_CAPTIONS} new pictures, twice")
+    rep.kv("  stage 2 trains on", f"{len(pools['questions_train']):,} questions, 3 kinds")
+    rep.kv("    tested on", f"{TEST_PER_TASK} new pictures per kind, twice")
+    rep.kv("  held out of training", f"{len(HELD_OUT)} of {len(COLORS) * len(SHAPES)} color-shape pairs")
 
     encoder = SiglipVisionModel.from_pretrained(VISION_MODEL).to(device).eval()
     progress.status(f"encoding {len(scenes):,} pictures once with the frozen encoder")
     features = encode(encoder, [draw(s) for s in scenes], device)
     blank = encode(encoder, [draw(())], device)[0]
-    data = Data(scenes, features, blank, cap_train, cap_test, q_train, q_test)
+    data = Data(scenes, features, blank, **pools)
 
     rep.section("1. From pixels to patches                           [post §1]")
     pixels_to_patches(rep, encoder, data)
@@ -721,7 +859,7 @@ def main() -> None:
     the_connector(rep, tokenizer, lm_config.hidden_size)
 
     rep.section("3. Stage 1: learning to describe                   [post §3]")
-    state, s1_log, s1_before, s1_after = stage_one(rep, data, tokenizer, device)
+    state, s1_log, s1_before, s1_after, s1_unseen = stage_one(rep, data, tokenizer, device)
 
     rep.section("4. Stage 2: learning to answer                     [post §4]")
     zero = zero_shot(data, tokenizer, device, state)
@@ -737,18 +875,24 @@ def main() -> None:
     rep.section("5. Is it looking?                                  [post §5]")
     is_it_looking(rep, arms)
 
-    rep.section("6. Text, a picture, or both                        [post §6]")
+    rep.section("6. Pairs it never saw                              [post §6]")
+    pairs_never_seen(rep, data, arms, zero, s1_unseen)
+
+    rep.section("7. Text, a picture, or both                        [post §7]")
     text_pictures_or_both(rep, tokenizer, base_ppl, arms)
 
-    rep.section("7. What an image costs                             [post §7]")
-    _, s1_log196, _, s1_after196 = stage_one(rep, data, tokenizer, device, merge=False, quiet=True)
+    rep.section("8. What an image costs                             [post §8]")
+    _, s1_log196, _, s1_after196, _ = stage_one(rep, data, tokenizer, device, merge=False,
+                                                quiet=True)
     what_an_image_costs(rep, lm_config, tokenizer, data,
                         {"49": (s1_log, s1_after), "196": (s1_log196, s1_after196)})
 
     results = {
         "stage1": {"before": asdict(s1_before), "after": asdict(s1_after),
                    "losses": list(s1_log.losses), "trainable": s1_log.trainable},
-        "zero_shot": {t: asdict(zero[t]) for t in TASKS},
+        "stage1_heldout": asdict(s1_unseen),
+        "zero_shot": {t: asdict(zero[0][t]) for t in TASKS},
+        "zero_shot_heldout": {t: asdict(zero[1][t]) for t in TASKS},
         "arms": {arm.name: _arm_record(arm) for arm in arms},
         "stage1_196": {"after": asdict(s1_after196), "losses": list(s1_log196.losses),
                        "seconds_per_step": s1_log196.seconds_per_step},

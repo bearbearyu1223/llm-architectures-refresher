@@ -38,7 +38,7 @@ from .device import peak_memory_bytes, reset_peak_memory, sync
 from .training import TrainLog
 
 __all__ = [
-    "COLORS", "SHAPES", "TASKS", "IMAGE_SIZE", "PATCH", "Shape", "Scene", "Example",
+    "COLORS", "SHAPES", "TASKS", "HELD_OUT", "IMAGE_SIZE", "PATCH", "Shape", "Scene", "Example",
     "make_scene", "draw", "describe", "ask", "to_pixels", "patchify", "merge_2x2",
     "Projector", "VisionLanguageModel", "train_vlm", "score_vlm",
 ]
@@ -62,6 +62,14 @@ NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four"}
 # The three questions stage 2 teaches. Each needs something a single-shape
 # picture never asks for: counting, tying a color to a shape, or position.
 TASKS = ("count", "binding", "leftmost")
+
+# Three color-shape pairs that never appear in any training picture, one per
+# shape and each in a different color, so every color and every shape is still
+# seen in training; only these pairings are not. Pictures that contain them are
+# the test of whether the model binds a color to a shape or memorized pairs.
+HELD_OUT: frozenset[tuple[str, str]] = frozenset(
+    {("red", "triangle"), ("green", "circle"), ("blue", "square")}
+)
 
 # Minimum horizontal distance between two shapes' centers, in pixels, so that
 # "leftmost" always has one clear answer.
@@ -92,12 +100,14 @@ class Example:
     task: str
 
 
-def make_scene(rng: random.Random, count: int) -> Scene:
+def make_scene(rng: random.Random, count: int,
+               avoid: frozenset[tuple[str, str]] = frozenset()) -> Scene:
     """``count`` shapes of distinct colors that don't overlap.
 
     Distinct colors make every color question have one answer. Shapes may repeat,
     which is what gives the binding task its difficulty: "the triangle" is only
-    asked about when there is exactly one.
+    asked about when there is exactly one. No shape is a (color, kind) pair in
+    ``avoid``; training pictures pass :data:`HELD_OUT` here.
     """
     while True:
         colors = rng.sample(list(COLORS), count)
@@ -115,7 +125,8 @@ def make_scene(rng: random.Random, count: int) -> Scene:
                 )
                 apart = all(abs((x + size / 2) - s.center_x) >= MIN_GAP_X for s in placed)
                 if clear and apart:
-                    placed.append(Shape(color, rng.choice(SHAPES), box))
+                    kinds = [k for k in SHAPES if (color, k) not in avoid]
+                    placed.append(Shape(color, rng.choice(kinds), box))
                     break
         if len(placed) == count:
             return tuple(placed)
@@ -150,14 +161,28 @@ def describe(scene: Scene) -> str:
     return ", ".join(names[:-1]) + " and " + names[-1]
 
 
-def ask(scene: Scene, task: str, rng: random.Random) -> tuple[str, str] | None:
-    """A stage-2 question about ``scene`` and its answer, or None if it doesn't apply."""
+def ask(scene: Scene, task: str, rng: random.Random,
+        about: Callable[[Shape], bool] | None = None) -> tuple[str, str] | None:
+    """A stage-2 question about ``scene`` and its answer, or None if it doesn't apply.
+
+    With ``about``, the question must concern a shape it accepts: binding asks
+    about one, leftmost needs the leftmost shape to be one, and count needs one
+    in the picture. The held-out test uses it to aim each question at a pair
+    the model never saw.
+    """
+    ok = about or (lambda s: True)
     if task == "count":
+        if not any(ok(s) for s in scene):
+            return None
         return "How many shapes are there?", NUMBER_WORDS[len(scene)]
     if task == "leftmost":
-        return "What color is the leftmost shape?", min(scene, key=lambda s: s.center_x).color
+        first = min(scene, key=lambda s: s.center_x)
+        if not ok(first):
+            return None
+        return "What color is the leftmost shape?", first.color
     if task == "binding":
-        unique = [s for s in scene if sum(t.kind == s.kind for t in scene) == 1]
+        unique = [s for s in scene
+                  if sum(t.kind == s.kind for t in scene) == 1 and ok(s)]
         if not unique:
             return None
         shape = rng.choice(unique)
@@ -315,10 +340,17 @@ class VisionLanguageModel(nn.Module):
         return F.cross_entropy(logits.float(), torch.cat(targets).to(self.device))
 
     @torch.no_grad()
-    def answer(self, features: torch.Tensor, prompt: str, max_new: int) -> str:
-        """Greedy decoding with a KV cache, stopping at EOS."""
+    def answer(self, features: torch.Tensor | None, prompt: str, max_new: int) -> str:
+        """Greedy decoding with a KV cache, stopping at EOS.
+
+        ``features=None`` asks with no picture at all: the prompt alone, without
+        ``Image:``, so the language model reads only the question's words.
+        """
         eos = self.tokenizer.eos_token_id
-        seq = self.sequence(self.image_tokens(features[None])[0], prompt)[None]
+        if features is None:
+            seq = self.interleave([prompt.lstrip("\n")])[None]
+        else:
+            seq = self.sequence(self.image_tokens(features[None])[0], prompt)[None]
         out = self.lm(inputs_embeds=seq, use_cache=True)
         produced: list[int] = []
         for _ in range(max_new):
@@ -384,6 +416,7 @@ def score_vlm(
     *,
     image: str = "real",
     blank: torch.Tensor | None = None,
+    misses: list[tuple[Example, str]] | None = None,
 ) -> tuple[int, int]:
     """Exact match, the series' rule: greedy, answer length + 2 tokens, strip, equal.
 
@@ -394,6 +427,9 @@ def score_vlm(
       without seeing anything.
     * ``"shuffled"``: a different scene's picture, the next one in the list.
       Right answers here are the ones a wrong picture happens to share.
+    * ``"none"``: no picture at all, only the question's words.
+
+    Wrong answers are appended to ``misses``, if given, as (example, what it said).
     """
     hits = 0
     for k, item in enumerate(examples):
@@ -403,9 +439,14 @@ def score_vlm(
             f = blank
         elif image == "shuffled":
             f = features[examples[(k + 1) % len(examples)].image]
+        elif image == "none":
+            f = None
         else:
             raise ValueError(image)
         want = len(model.ids(" " + item.answer))
         got = model.answer(f, item.prompt, max_new=want + 2)
-        hits += got.strip() == item.answer
+        right = got.strip() == item.answer
+        hits += right
+        if not right and misses is not None:
+            misses.append((item, " ".join(got.split())))
     return hits, len(examples)

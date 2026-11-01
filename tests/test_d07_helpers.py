@@ -103,3 +103,55 @@ def test_pixels_are_scaled_to_minus_one_one():
     assert px.shape == (1, 3, 224, 224)
     assert float(px.max()) == 1.0  # white background
     assert float(px.min()) >= -1.0
+
+
+# -- held-out pairs ------------------------------------------------------------------
+
+
+def test_held_out_pairs_leave_every_color_and_shape_in_training():
+    from llmrefresher.vlm import COLORS, HELD_OUT, SHAPES
+
+    assert len(HELD_OUT) == 3
+    assert {k for _, k in HELD_OUT} == set(SHAPES)  # one per shape
+    assert len({c for c, _ in HELD_OUT}) == 3  # each in a different color
+    assert all(c in COLORS for c, _ in HELD_OUT)
+
+
+def test_avoid_keeps_held_out_pairs_out_of_a_scene():
+    from llmrefresher.vlm import HELD_OUT
+
+    rng = random.Random(0)
+    for _ in range(500):
+        scene = make_scene(rng, rng.choice([1, 2, 3, 4]), avoid=HELD_OUT)
+        assert not any((s.color, s.kind) in HELD_OUT for s in scene)
+
+
+def test_ask_about_aims_the_question_at_an_accepted_shape():
+    rng = random.Random(3)
+    want = {("red", "triangle")}
+    hits = 0
+    for _ in range(400):
+        scene = make_scene(rng, 3)
+        qa = ask(scene, "binding", rng, about=lambda s: (s.color, s.kind) in want)
+        if qa is not None:
+            hits += 1
+            assert qa == ("What color is the triangle?", "red")
+    assert hits > 0
+
+
+def test_demo_pools_never_train_on_a_held_out_pair_and_always_test_one():
+    from llmrefresher.demos.d07_multimodal import build_examples, held_out
+
+    pools = build_examples()
+    scenes = pools["scenes"]
+    for key in ("captions_train", "questions_train", "captions_test"):
+        assert not any(held_out(s) for item in pools[key] for s in scenes[item.image])
+    for items in pools["questions_test"].values():
+        assert not any(held_out(s) for item in items for s in scenes[item.image])
+    assert all(any(held_out(s) for s in scenes[i.image]) for i in pools["captions_heldout"])
+    for item in pools["questions_heldout"]["binding"]:
+        kind = item.prompt.split("the ")[-1].split("?")[0]
+        assert (item.answer, kind) in {("red", "triangle"), ("green", "circle"), ("blue", "square")}
+    for item in pools["questions_heldout"]["leftmost"]:
+        first = min(scenes[item.image], key=lambda s: s.center_x)
+        assert held_out(first) and first.color == item.answer
