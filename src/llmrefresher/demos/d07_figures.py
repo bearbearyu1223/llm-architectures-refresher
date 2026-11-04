@@ -460,6 +460,13 @@ def figure_stages(scene: Scene, caption: str, question: str, answer: str, facts:
         _lines(ax, x0 + 4.675, 4.3, ["connector", "trained"], color=ink_for(blue), size=10.0,
                bold_first=True)
         _arrow(ax, x0 + 4.675, 3.5, x0 + 4.675, 3.0, orange)
+        # the gradient: back up through the frozen language model to the connector
+        ax.annotate("", xy=(x0 + 5.15, 3.5), xytext=(x0 + 5.15, 3.0),
+                    arrowprops=dict(arrowstyle="-|>", color=theme.muted, linewidth=1.3,
+                                    linestyle=(0, (3, 2)), shrinkA=0, shrinkB=0,
+                                    mutation_scale=12))
+        ax.text(x0 + 5.27, 3.25, "gradient", ha="left", va="center", fontsize=8.8,
+                color=theme.muted)
         _box(ax, x0 + 0.1, 1.45, 5.6, 1.5, theme.muted, lw=1.6)
         _lines(ax, x0 + 0.35, 2.7, ["language model"], color=theme.ink, size=10.0, ha="left",
                bold_first=True)
@@ -471,7 +478,9 @@ def figure_stages(scene: Scene, caption: str, question: str, answer: str, facts:
             ax.text(x0 + 5.55, 2.0, f"rank 8: {facts.lora_params:,} parameters", ha="right",
                     va="center", fontsize=9.0, color=theme.secondary, zorder=5)
         else:
-            _lines(ax, x0 + 0.35, 2.42, ["frozen"], color=theme.ink, size=9.6, ha="left")
+            _lines(ax, x0 + 0.35, 2.42, ["frozen: the gradient passes back through it,",
+                                         "but its weights never change"],
+                   color=theme.ink, size=9.6, ha="left", gap=0.25)
         _lines(ax, x0 + 0.35, 1.68, [f"reads: Image: [picture]{prompt}"], color=theme.secondary,
                size=9.2, ha="left")
         _lines(ax, x0 + 0.1, 1.0, ["learns to write:"], color=theme.secondary, size=9.6, ha="left")
