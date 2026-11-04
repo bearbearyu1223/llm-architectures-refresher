@@ -243,9 +243,12 @@ def figure_overview(scene: Scene, question: str, answer: str, facts: Facts, them
 
 
 def figure_patches(scene: Scene, facts: Facts, theme: Theme) -> None:
-    """One picture cut into a grid, one patch enlarged, flattened and embedded."""
+    """One picture cut into a grid, one patch enlarged, flattened and embedded.
+
+    Ends where the encoder's transformer layers begin, so it reads as input preparation.
+    """
     blue, orange = theme.series[0], theme.series[1]
-    fig, ax = _canvas(12.5, 5.2)
+    fig, ax = _canvas(13.6, 5.2)
     r, c = _busiest_patch(scene, facts.grid)
 
     _picture(fig, ax, scene, 0.35, 1.25, 3.2, grid=facts.grid, highlight=(r, c), edge=blue,
@@ -267,7 +270,7 @@ def figure_patches(scene: Scene, facts: Facts, theme: Theme) -> None:
     _lines(ax, px + ps / 2, 1.55, ["one patch, enlarged", f"{PATCH} x {PATCH} pixels x 3 colors"],
            color=theme.ink, bold_first=True)
 
-    # flattened into a row of numbers
+    # flattened into a row of numbers: still raw pixels
     _arrow(ax, 6.55, 2.9, 7.05, 2.9, theme.secondary)
     flat = patch.transpose(2, 0, 1).reshape(1, -1)  # channel first, as the encoder's weight
     fx, fy, fw, fh = 7.1, 2.75, 1.3, 0.3
@@ -276,29 +279,35 @@ def figure_patches(scene: Scene, facts: Facts, theme: Theme) -> None:
               interpolation="nearest")
     ax.add_patch(plt.Rectangle((fx, fy), fw, fh, facecolor="none", edgecolor=theme.secondary,
                                linewidth=1.0, zorder=4))
-    _lines(ax, fx + fw / 2, 3.55, ["flattened", f"{facts.patch_numbers} numbers in a row"],
+    _lines(ax, fx + fw / 2, 3.55, ["flattened", f"{facts.patch_numbers} raw pixel values"],
            color=theme.ink, bold_first=True, size=10.0)
     ax.text(fx, 2.48, "red", fontsize=8.6, color=theme.muted, ha="left")
     ax.text(fx + fw / 2, 2.48, "green", fontsize=8.6, color=theme.muted, ha="center")
     ax.text(fx + fw, 2.48, "blue", fontsize=8.6, color=theme.muted, ha="right")
 
-    # one matrix multiply, plus the position
-    _arrow(ax, 8.5, 2.9, 9.0, 2.9, theme.secondary)
-    _box(ax, 9.05, 2.35, 1.45, 1.1, theme.muted, lw=1.6)
-    _lines(ax, 9.775, 3.07, ["x one matrix", f"{facts.patch_numbers} -> {facts.vision_width}",
+    # one learned matrix, plus the position
+    _arrow(ax, 8.5, 2.9, 8.93, 2.9, theme.secondary)
+    _box(ax, 8.98, 2.35, 1.59, 1.1, theme.muted, lw=1.6)
+    _lines(ax, 9.775, 3.07, ["x learned matrix", f"{facts.patch_numbers} -> {facts.vision_width}",
                              "+ position"], color=theme.ink, size=9.8, gap=0.27)
-    _arrow(ax, 10.55, 2.9, 11.05, 2.9, theme.secondary)
+    _arrow(ax, 10.62, 2.9, 11.07, 2.9, theme.secondary)
     ax.add_patch(plt.Rectangle((11.15, 2.15), 0.16, 1.5, facecolor=orange, edgecolor="none",
                                zorder=3))
-    _lines(ax, 11.23, 1.85, ["one vector", f"{facts.vision_width} wide"], color=theme.ink,
+    _lines(ax, 11.23, 1.85, ["patch embedding", f"{facts.vision_width} wide"], color=theme.ink,
            bold_first=True, size=10.0)
 
-    _lines(ax, 9.0, 0.75, [f"Done for all {facts.patches} patches, this gives the encoder "
-                           f"{facts.patches} vectors to read,",
-                           "the way a sentence gives a language model one vector per token."],
+    # where the transformer starts
+    _arrow(ax, 11.6, 2.9, 12.1, 2.9, theme.secondary)
+    _box(ax, 12.15, 2.35, 1.3, 1.1, theme.muted, lw=1.4, dashed=True)
+    _lines(ax, 12.8, 3.07, ["next: the", "encoder's", f"{facts.vision_layers} layers"],
+           color=theme.muted, size=9.8, gap=0.27)
+
+    _lines(ax, 9.3, 0.75, ["This only prepares the input. Done for all "
+                           f"{facts.patches} patches, it gives the encoder {facts.patches} vectors,",
+                           "one per patch, the way a sentence gives a language model one per token."],
            color=theme.secondary, size=9.8, gap=0.3)
     _crop(fig, ax, 0.3, 4.75)
-    ax.set_title("From pixels to patch vectors: the first step of a vision transformer",
+    ax.set_title("From pixels to patch vectors: preparing a vision transformer's input",
                  loc="left", pad=10)
     save_both(fig, SLUG, "image-to-patches", theme)
 
