@@ -753,10 +753,10 @@ def figure_encoder(facts: Facts, theme: Theme) -> None:
     for title, sub, causal, left, unit, shown, why in (
         ("vision encoder", "every patch reads every patch", False, 6.6, "patch",
          f"first {n} of {facts.patches} patches shown",
-         ["A picture is all there at once,", "so nothing needs hiding."]),
+         ["bidirectional attention", "A picture is all there at once,", "so nothing needs hiding."]),
         ("language model", "each token reads itself and earlier ones", True, 9.65, "token",
          f"first {n} tokens shown",
-         ["It writes left to right, so a token", "can't read the ones after it."]),
+         ["causal attention", "It writes left to right, so a token", "can't read the ones after it."]),
     ):
         for r in range(n):
             for c in range(n):
@@ -777,8 +777,10 @@ def figure_encoder(facts: Facts, theme: Theme) -> None:
                  f"{facts.vision_heads} heads") if not causal else (
                  f"{facts.lm_layers} layers, width {facts.lm_width}, {facts.lm_heads} heads")
         _lines(ax, mid, top - size - 0.85, [stats], color=theme.secondary, size=9.2)
-        _lines(ax, mid, top - size - 1.35, why, color=theme.ink, size=9.6, gap=0.3)
-    ax.set_title("Inside the vision encoder: a transformer without the causal mask", loc="left",
+        _lines(ax, mid, top - size - 1.35, why, color=theme.ink, size=9.6, gap=0.3,
+               bold_first=True)
+    ax.set_title("Inside the vision encoder: same building blocks, a different attention rule",
+                 loc="left",
                  pad=10)
     save_both(fig, SLUG, "encoder-inside", theme)
 
