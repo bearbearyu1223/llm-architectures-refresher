@@ -347,7 +347,7 @@ def figure_connector(facts: Facts, theme: Theme) -> None:
                 fontsize=10, color=ink_for(blue), zorder=4)
         ax.text(bx + i * seg + seg / 2, by - 0.25, f"{facts.vision_width}", ha="center",
                 fontsize=9.2, color=theme.secondary)
-    _lines(ax, bx + 2 * seg, 3.35, ["merge: the four glued end to end",
+    _lines(ax, bx + 2 * seg, 3.35, ["the four glued end to end",
                                     f"one vector, {facts.merged_width:,} wide"],
            color=theme.ink, bold_first=True)
 
@@ -364,10 +364,21 @@ def figure_connector(facts: Facts, theme: Theme) -> None:
     _lines(ax, 11.03, 1.6, ["one image token", f"{facts.lm_width} wide, like a word's"],
            color=theme.ink, bold_first=True, size=10.0)
 
-    _lines(ax, 6.3, 0.35, [f"{facts.patches} patch vectors become {facts.merged} image tokens. "
-                           "Nothing is averaged: every number reaches the MLP."],
+    # the two operations, and what each one changes
+    for x, name, what, shape in (
+        (bx + 2 * seg, "1. merge", "fewer tokens, wider vectors",
+         f"{facts.patches} x {facts.vision_width} -> {facts.merged} x {facts.merged_width:,}"),
+        (9.3, "2. project", "match the language model's width",
+         f"{facts.merged} x {facts.merged_width:,} -> {facts.merged} x {facts.lm_width}"),
+    ):
+        ax.text(x, 4.42, name, ha="center", va="center", fontsize=11, fontweight="bold",
+                color=theme.ink, zorder=5)
+        _lines(ax, x, 4.13, [what, shape], color=theme.secondary, size=9.6, gap=0.27)
+
+    _lines(ax, 6.3, 0.35, ["Merging keeps every number of the four patches; the trained MLP then "
+                           f"compresses each {facts.merged_width:,} numbers to {facts.lm_width}."],
            color=theme.secondary, size=9.8)
-    _crop(fig, ax, 0.1, 4.2)
+    _crop(fig, ax, 0.1, 4.7)
     ax.set_title("The connector: merge four neighbours, then resize to the language model's width",
                  loc="left", pad=10)
     save_both(fig, SLUG, "connector", theme)
