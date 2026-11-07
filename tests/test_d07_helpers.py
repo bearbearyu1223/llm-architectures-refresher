@@ -203,3 +203,15 @@ def test_mixed_inputs_pick_a_triangle_picture_then_one_without():
     assert labels == ["text only", "one picture", "two pictures"]
     two = mixed_inputs(data)[2][1]
     assert [type(p).__name__ for p in two] == ["str", "Tensor", "str", "Tensor", "str"]
+
+
+def test_capacity_check_matches_the_merged_connector_size():
+    from llmrefresher.demos.d07_capacity import MERGED, WIDE, connector_parameters
+    from llmrefresher.vlm import Projector
+
+    assert MERGED == 3_557_120  # section 2's count
+    assert connector_parameters(768, 896) == 1_492_736
+    wide = connector_parameters(768, WIDE)
+    assert abs(wide - MERGED) < 768 + 1 + 896  # within one hidden unit
+    assert sum(p.numel() for p in Projector(768, 896, WIDE).parameters()) == wide
+    assert sum(p.numel() for p in Projector(3072, 896).parameters()) == MERGED

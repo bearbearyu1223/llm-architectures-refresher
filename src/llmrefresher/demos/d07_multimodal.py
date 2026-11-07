@@ -233,7 +233,8 @@ def _release(*objects: object) -> None:
 
 
 def build_vlm(tokenizer, device: torch.device, *, merge: bool, seed: int,
-              projector_state: dict | None = None, lora: bool = False) -> VisionLanguageModel:
+              projector_state: dict | None = None, lora: bool = False,
+              hidden: int | None = None) -> VisionLanguageModel:
     """Language model + connector. The connector starts random unless given a state.
 
     ``seed`` fixes the connector's starting weights and, with ``lora``, the
@@ -243,7 +244,7 @@ def build_vlm(tokenizer, device: torch.device, *, merge: bool, seed: int,
     lm = _load_lm(device)
     torch.manual_seed(seed)
     width = 768 * (4 if merge else 1)
-    projector = Projector(width, lm.config.hidden_size)
+    projector = Projector(width, lm.config.hidden_size, hidden)
     if projector_state is not None:
         projector.load_state_dict(projector_state)
     projector.to(device)
@@ -983,6 +984,11 @@ def main() -> None:
         # Five paired seeds, fresh test questions, captions in stage 2, a probe.
         from .d07_followup import run
         run()
+        return
+    if "--capacity" in sys.argv:
+        # Section 8's merge comparison with the connector's size held level.
+        from .d07_capacity import run as capacity
+        capacity()
         return
     if "--misses" in sys.argv:
         # From the last run's saved wrong answers, without training anything.

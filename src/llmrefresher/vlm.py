@@ -260,11 +260,12 @@ class Projector(nn.Module):
     token embeddings, so each output can sit where a word's embedding would.
     """
 
-    def __init__(self, in_features: int, out_features: int) -> None:
+    def __init__(self, in_features: int, out_features: int, hidden: int | None = None) -> None:
         super().__init__()
-        self.up = nn.Linear(in_features, out_features)
+        hidden = out_features if hidden is None else hidden
+        self.up = nn.Linear(in_features, hidden)
         self.act = nn.GELU()
-        self.out = nn.Linear(out_features, out_features)
+        self.out = nn.Linear(hidden, out_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.out(self.act(self.up(x)))
