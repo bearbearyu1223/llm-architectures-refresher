@@ -35,7 +35,7 @@ import random
 import statistics
 import sys
 import textwrap
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import torch
 import torch.nn as nn
@@ -319,6 +319,8 @@ class Arm:
     logs: list[TrainLog]
     ppl: list[float]  # text only: post 4's passage, after training
     misses: dict[str, list[Miss]]  # first seed's wrong answers, right picture, per pool
+    # First seed: what it wrote for text only, one picture, and two pictures (section 7).
+    samples: list[tuple[str, str]] = field(default_factory=list)
 
 
 # -- section 1 -----------------------------------------------------------------------
@@ -539,6 +541,35 @@ def stage_one(rep: Report, data: Data, tokenizer, device: torch.device, *,
     return state, log, before, after, unseen
 
 
+# Section 7's three inputs. Text alone, one picture, and two pictures with a
+# question the model was never trained on: which picture has the triangle.
+MIXED_TOKENS = 12
+
+
+def mixed_scenes(data: Data) -> tuple[int, int]:
+    """Two ordinary test pictures: the first with exactly one triangle, the next with none."""
+    images = [e.image for e in data.questions_test["binding"]]
+    one = next(i for i in images if sum(s.kind == "triangle" for s in data.scenes[i]) == 1)
+    none = next(i for i in images if all(s.kind != "triangle" for s in data.scenes[i]))
+    return one, none
+
+
+def mixed_inputs(data: Data) -> list[tuple[str, list, str]]:
+    """(label, pieces in order, the answer a reader would give) for the three inputs."""
+    one, none = mixed_scenes(data)
+    triangle = next(s.color for s in data.scenes[one] if s.kind == "triangle")
+    a, b = data.features[one], data.features[none]
+    prefix = VisionLanguageModel.PREFIX
+    return [
+        ("text only", ["Question: What is a transformer?\nAnswer:"], "(any sensible text)"),
+        ("one picture", [prefix, a, QUESTION_PROMPT.format(q="What color is the triangle?")],
+         triangle),
+        ("two pictures", [prefix, a, "\nImage:", b,
+                          QUESTION_PROMPT.format(q="Which picture has a triangle, the first or "
+                                                   "the second?")], "the first"),
+    ]
+
+
 def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, state: dict | None,
                   lora: bool, seeds: tuple[int, ...] | None = None, merge: bool = True,
                   steps: int | None = None) -> Arm:
@@ -566,6 +597,9 @@ def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, sta
         )
         logs.append(log)
         first = seed == seeds[0]
+        if first:
+            samples = [(label, " ".join(model.answer_mixed(pieces, MIXED_TOKENS).split()))
+                       for label, pieces, _ in mixed_inputs(data)]
         for task in TASKS:
             scores[task].append(score_all(model, data, data.questions_test[task],
                                           misses["seen"] if first else None))
@@ -577,7 +611,7 @@ def stage_two_arm(name: str, data: Data, tokenizer, device: torch.device, *, sta
                                           for t in TASKS)
                         + f" (seen/held-out), passage perplexity {ppl[-1]:.4f}")
         _release(model)
-    return Arm(name, scores, heldout, logs, ppl, misses)
+    return Arm(name, scores, heldout, logs, ppl, misses, samples)
 
 
 def _median(values: list[int]) -> str:
@@ -732,7 +766,8 @@ def pairs_never_seen(rep: Report, data: Data, arms: list[Arm],
 # -- section 7 -----------------------------------------------------------------------
 
 
-def text_pictures_or_both(rep: Report, tokenizer, base_ppl: float, arms: list[Arm]) -> None:
+def text_pictures_or_both(rep: Report, tokenizer, base_ppl: float, arms: list[Arm],
+                          data: Data) -> None:
     """One model, three kinds of input; and what each arm did to text-only use."""
     def count(text: str) -> int:
         return len(tokenizer(text, add_special_tokens=False).input_ids)
@@ -746,6 +781,14 @@ def text_pictures_or_both(rep: Report, tokenizer, base_ppl: float, arms: list[Ar
          count(prefix) + image + count(second) + image + count(question), 2 * image),
     ]
     rep.table(["input", "positions", "from pictures"], rows)
+    rep.blank()
+    rep.note(f"Three inputs to each trained model, first seed, greedy, at most {MIXED_TOKENS} tokens.")
+    rep.note("Two pictures: the first has a triangle, the second has none.")
+    for k, (label, pieces, right) in enumerate(mixed_inputs(data)):
+        question = pieces[-1].split("Question: ")[-1].split("\n")[0]
+        rep.blank()
+        rep.note(f"{label}: \"{question}\"  (a right answer: {right})")
+        rep.table(["model", "wrote"], [(arm.name, repr(arm.samples[k][1])) for arm in arms])
     rep.blank()
     rep.note("Text only, post 4's passage: perplexity after each kind of training")
     rep.note("(lower is better; median of the seeds, range in brackets):")
@@ -822,6 +865,7 @@ def _arm_record(arm: Arm) -> dict:
         "scores": {t: [asdict(x) for x in arm.scores[t]] for t in TASKS},
         "heldout": {t: [asdict(x) for x in arm.heldout[t]] for t in TASKS},
         "misses": arm.misses,
+        "samples": arm.samples,
         "seconds_per_step": [log.seconds_per_step for log in arm.logs],
         "trainable": arm.logs[0].trainable,
         "losses": [list(log.losses) for log in arm.logs],
@@ -1012,7 +1056,7 @@ def main() -> None:
     pairs_never_seen(rep, data, arms, zero, s1_unseen)
 
     rep.section("7. Text, a picture, or both                        [post §7]")
-    text_pictures_or_both(rep, tokenizer, base_ppl, arms)
+    text_pictures_or_both(rep, tokenizer, base_ppl, arms, data)
 
     rep.section("8. What an image costs                             [post §8]")
     _, s1_log196, _, s1_after196, _ = stage_one(rep, data, tokenizer, device, merge=False,

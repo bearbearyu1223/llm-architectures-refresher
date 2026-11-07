@@ -362,12 +362,23 @@ class VisionLanguageModel(nn.Module):
         ``features=None`` asks with no picture at all: the prompt alone, without
         ``Image:``, so the language model reads only the question's words.
         """
-        eos = self.tokenizer.eos_token_id
         if features is None:
-            seq = self.interleave([prompt.lstrip("\n")])[None]
+            seq = self.interleave([prompt.lstrip("\n")])
         else:
-            seq = self.sequence(self.image_tokens(features[None])[0], prompt)[None]
-        out = self.lm(inputs_embeds=seq, use_cache=True)
+            seq = self.sequence(self.image_tokens(features[None])[0], prompt)
+        return self.generate(seq, max_new)
+
+    @torch.no_grad()
+    def answer_mixed(self, pieces: Sequence[str | torch.Tensor], max_new: int) -> str:
+        """Greedy decoding from any mix of text and pictures (encoder features), in order."""
+        return self.generate(self.interleave(
+            [p if isinstance(p, str) else self.image_tokens(p[None])[0] for p in pieces]), max_new)
+
+    @torch.no_grad()
+    def generate(self, seq: torch.Tensor, max_new: int) -> str:
+        """Greedy decoding from one ``(length, width)`` input sequence, stopping at EOS."""
+        eos = self.tokenizer.eos_token_id
+        out = self.lm(inputs_embeds=seq[None], use_cache=True)
         produced: list[int] = []
         for _ in range(max_new):
             nxt = int(out.logits[0, -1].argmax())

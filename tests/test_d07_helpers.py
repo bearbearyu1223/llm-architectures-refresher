@@ -186,3 +186,20 @@ def test_is_it_looking_prints_every_model_and_both_new_tables(capsys):
     assert "gave shown picture's" in out
     assert " 92 " in out and " 61\n" in out  # median real, and real minus best control (31)
     assert "'three'" in out and "''" in out
+
+
+def test_mixed_inputs_pick_a_triangle_picture_then_one_without():
+    import torch
+
+    from llmrefresher.demos.d07_multimodal import Data, build_examples, mixed_inputs, mixed_scenes
+
+    raw = build_examples()
+    scenes = raw.pop("scenes")
+    data = Data(scenes, torch.zeros(len(scenes), 1, 1), torch.zeros(1, 1), **raw)
+    one, none = mixed_scenes(data)
+    assert sum(s.kind == "triangle" for s in scenes[one]) == 1
+    assert all(s.kind != "triangle" for s in scenes[none])
+    labels = [label for label, _, _ in mixed_inputs(data)]
+    assert labels == ["text only", "one picture", "two pictures"]
+    two = mixed_inputs(data)[2][1]
+    assert [type(p).__name__ for p in two] == ["str", "Tensor", "str", "Tensor", "str"]
