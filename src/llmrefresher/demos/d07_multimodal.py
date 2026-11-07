@@ -581,7 +581,7 @@ def stage_two(rep: Report, arms: list[Arm], zero: dict[str, Scores]) -> None:
     rep.blank()
     rep.table(
         ["model", "starts from", "steps", "trainable", "s/step"],
-        [(arm.name, "random" if arm.name.startswith("no stage 1") else "stage 1",
+        [(arm.name, "random" if arm.name == "QA only" else "stage 1",
           arm.logs[0].steps, f"{arm.logs[0].trainable:,}",
           f"{statistics.median(log.seconds_per_step for log in arm.logs):.2f}") for arm in arms],
     )
@@ -595,7 +595,7 @@ def stage_two(rep: Report, arms: list[Arm], zero: dict[str, Scores]) -> None:
     seen, unseen = zero
     rows = []
     for task in TASKS:
-        rows.append((task, "stage 1 only", seen[task].real, unseen[task].real))
+        rows.append((task, "Caption only", seen[task].real, unseen[task].real))
         for arm in arms:
             rows.append(("", arm.name, _median([x.real for x in arm.scores[task]]),
                          _median([x.real for x in arm.heldout[task]])))
@@ -670,9 +670,9 @@ def pairs_never_seen(rep: Report, data: Data, arms: list[Arm],
     rep.table(["model", *(f"{c} {k}" for c, k in pairs)], rows)
 
     rep.blank()
-    rep.note("Some wrong answers, connector only, first seed (held-out questions):")
+    rep.note("Some wrong answers, Caption → QA, first seed (held-out questions):")
     rep.blank()
-    misses = next(a for a in arms if a.name == "connector only").misses["heldout"]
+    misses = next(a for a in arms if a.name == "Caption → QA").misses["heldout"]
     shown: dict[str, int] = {}
     for _, _, prompt, answer, said in misses:
         q = prompt.split("Question: ")[1].split("\n")[0]
@@ -791,7 +791,7 @@ def save_results(results: dict) -> None:
 
 
 def _gallery(results: dict, per_task: int = 2) -> list[tuple[Scene, str, str, str]]:
-    """Wrong answers to show with their pictures: held-out questions, connector only.
+    """Wrong answers to show with their pictures: held-out questions, Caption → QA.
 
     The scenes are regenerated from their seeds, so the gallery needs only the
     saved results, not the models.
@@ -799,7 +799,7 @@ def _gallery(results: dict, per_task: int = 2) -> list[tuple[Scene, str, str, st
     scenes = build_examples()["scenes"]
     shown: dict[str, int] = {}
     out = []
-    for image, task, prompt, right, said in results["arms"]["connector only"]["misses"]["heldout"]:
+    for image, task, prompt, right, said in results["arms"]["Caption → QA"]["misses"]["heldout"]:
         if shown.get(task, 0) >= per_task:
             continue
         shown[task] = shown.get(task, 0) + 1
@@ -820,7 +820,7 @@ def draw_figures(results: dict) -> int:
     def pieces(text: str) -> list[str]:
         return [tokenizer.decode([i]) for i in tokenizer(text, add_special_tokens=False).input_ids]
 
-    arm_names = ["no stage 1", "connector only", "connector + LoRA"]
+    arm_names = ["QA only", "Caption → QA", "Caption → QA + LoRA"]
     other = make_scene(random.Random(FIGURE_SCENE_SEED + 1), 3)
     gallery = _gallery(results)
     for theme in THEMES:
@@ -866,7 +866,7 @@ def wrong_colors(rep: Report, results: dict) -> None:
     rows = []
     for pool, label in (("seen", "seen"), ("heldout", "held out")):
         for task in ("binding", "leftmost"):
-            for name in ("no stage 1", "connector only", "connector + LoRA"):
+            for name in ("QA only", "Caption → QA", "Caption → QA + LoRA"):
                 inside = absent = 0
                 for image, t, _, _, said in results["arms"][name]["misses"][pool]:
                     if t != task:
@@ -875,7 +875,7 @@ def wrong_colors(rep: Report, results: dict) -> None:
                         inside += 1
                     else:
                         absent += 1
-                first = name == "no stage 1"
+                first = name == "QA only"
                 rows.append((f"{task}, {label}" if first else "", name,
                              inside + absent, inside, absent))
     rep.table(["questions", "model", "wrong", "in picture", "not in it"], rows)
@@ -949,11 +949,11 @@ def main() -> None:
 
     rep.section("4. Stage 2: learning to answer                     [post §4]")
     zero = zero_shot(data, tokenizer, device, state)
-    projector_only = stage_two_arm("connector only", data, tokenizer, device, state=state, lora=False)
-    with_lora = stage_two_arm("connector + LoRA", data, tokenizer, device, state=state, lora=True)
+    projector_only = stage_two_arm("Caption → QA", data, tokenizer, device, state=state, lora=False)
+    with_lora = stage_two_arm("Caption → QA + LoRA", data, tokenizer, device, state=state, lora=True)
     # The control for stage 1 itself: the same questions, the connector from
     # random, and as many steps as stages 1 and 2 together, so it isn't short-changed.
-    skipped = stage_two_arm("no stage 1", data, tokenizer, device, state=None,
+    skipped = stage_two_arm("QA only", data, tokenizer, device, state=None,
                             lora=False, steps=STAGE1_STEPS + STAGE2_STEPS)
     arms = [skipped, projector_only, with_lora]
     stage_two(rep, arms, zero)

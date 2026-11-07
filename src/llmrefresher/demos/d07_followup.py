@@ -7,7 +7,7 @@ on fresh test questions, and adds one new training recipe decided in advance:
 
 1. Five seeds, paired. Seed ``s`` trains its own stage 1 (connector start and
    caption order from ``s``), then three stage-2 versions from seed ``s``:
-   no stage 1, connector only, and connector + captions (stage 2 with captions
+   QA only, Caption → QA, and Caption → QA + captions (stage 2 with captions
    mixed in, 4 per batch beside the usual 16 questions). The questions arrive
    in the same order in every version with the same seed, so the versions can
    be compared seed by seed.
@@ -57,7 +57,7 @@ from .d07_multimodal import (
 FOLLOWUP_SEEDS = (0, 1, 2, 3, 4)
 FRESH = 300  # questions per test pool
 CAPTIONS_PER_BATCH = 4  # stage 2 + captions: 16 questions and 4 captions per step
-ARMS = ("no stage 1", "connector only", "connector + captions")
+ARMS = ("QA only", "Caption → QA", "Caption → QA + captions")
 COLOR_NAMES = list(COLORS)
 SHAPE_NAMES = list(SHAPES)
 
@@ -276,11 +276,11 @@ def run() -> None:
         progress.status(f"    seed {seed}: captions {stage1[-1][0]}/{stage1[-1][1]} (seen/held-out)")
 
         for arm in ARMS:
-            start = None if arm == "no stage 1" else state
-            steps = 2 * STAGE2_STEPS if arm == "no stage 1" else STAGE2_STEPS
+            start = None if arm == "QA only" else state
+            steps = 2 * STAGE2_STEPS if arm == "QA only" else STAGE2_STEPS
             model = build_vlm(tokenizer, device, merge=True, seed=seed, projector_state=start)
             extra = dict(extra=data.captions_train, extra_per_batch=CAPTIONS_PER_BATCH) \
-                if arm == "connector + captions" else {}
+                if arm == "Caption → QA + captions" else {}
             train_vlm(model, data.features, data.questions_train, steps=steps, batch_size=BATCH,
                       groups=[(model.projector.parameters(), PROJECTOR_LR)], seed=seed,
                       on_step=progress.training(f"{arm}, seed {seed}", steps), **extra)
@@ -293,7 +293,7 @@ def run() -> None:
                     misses[arm].extend((image, right, said) for image, _, _, right, said in wrong)
                 else:
                     scores[arm][key].append(_right(model, data, examples))
-            if arm == "connector only" and seed == FOLLOWUP_SEEDS[0]:
+            if arm == "Caption → QA" and seed == FOLLOWUP_SEEDS[0]:
                 keep["stage 2 connector"] = _state(model)
             progress.status("    " + arm + ": " + ", ".join(
                 f"{t} {h} {scores[arm][(t, h)][-1]}" for t, h in pools))
@@ -327,7 +327,7 @@ def run() -> None:
     rep.note("Seed by seed, held-out pairs: how often one version beat another.")
     rep.blank()
     rows = []
-    for a, b in (("connector only", "no stage 1"), ("connector + captions", "connector only")):
+    for a, b in (("Caption → QA", "QA only"), ("Caption → QA + captions", "Caption → QA")):
         for task in ("binding", "leftmost"):
             diff = [x - y for x, y in zip(scores[a][(task, "held out")],
                                           scores[b][(task, "held out")], strict=True)]

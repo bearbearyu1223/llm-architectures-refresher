@@ -98,6 +98,16 @@ class Facts:
 # -- drawing helpers -----------------------------------------------------------------
 
 
+def arrow(text: str) -> str:
+    """The house font has no arrow glyph, so mathtext draws it."""
+    return text.replace("→", r"$\rightarrow$")
+
+
+def recipe_label(name: str) -> str:
+    """A recipe's name as a tick label: "Caption → QA + LoRA" on three lines."""
+    return arrow(name.replace(" ", "\n", 1).replace(" + ", "\n+ "))
+
+
 def _canvas(w: float, h: float):
     fig, ax = plt.subplots(figsize=(w, h))
     ax.set_xlim(0, w)
@@ -630,7 +640,7 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
     right picture.
     """
     orange = theme.series[1]
-    groups = [("stage 1 only, no questions", [results["zero_shot"][t] for t in TASKS], True)]
+    groups = [("Caption only", [results["zero_shot"][t] for t in TASKS], True)]
     for name in arm_names:
         groups.append((name, results["arms"][name]["scores"], False))
     fig, axes = plt.subplots(1, len(TASKS), figsize=(12.5, 4.6), sharey=True)
@@ -657,9 +667,7 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
                     ax.text(x, max(values) + 3, f"{mid:.0f}", ha="center", va="bottom",
                             fontsize=9.6, color=theme.ink, zorder=5)
         ax.set_xticks(range(len(groups)))
-        short = {"stage 1 only, no questions": "stage 1,\nno questions", "no stage 1": "no\nstage 1",
-                 "connector only": "connector\nonly", "connector + LoRA": "connector\n+ LoRA"}
-        ax.set_xticklabels([short.get(n, n) for n, _, _ in groups], fontsize=9.4)
+        ax.set_xticklabels([recipe_label(n) for n, _, _ in groups], fontsize=9.4)
         ax.set_title({"count": "How many shapes?", "binding": "What color is the <shape>?",
                       "leftmost": "Color of the leftmost shape?"}[task], fontsize=11.5)
         ax.set_ylim(0, 112)
@@ -991,9 +999,7 @@ def figure_heldout(results: dict, arm_names: list[str], theme: Theme) -> None:
                     linewidth=2.0, zorder=6,
                     label="held-out: best control" if (g == 0 and task == TASKS[0]) else None)
         ax.set_xticks(range(len(arm_names)))
-        short = {"no stage 1": "no\nstage 1", "connector only": "connector\nonly",
-                 "connector + LoRA": "connector\n+ LoRA"}
-        ax.set_xticklabels([short.get(n, n) for n in arm_names], fontsize=9.6)
+        ax.set_xticklabels([recipe_label(n) for n in arm_names], fontsize=9.6)
         ax.set_title({"count": "How many shapes?", "binding": "What color is the <shape>?",
                       "leftmost": "Color of the leftmost shape?"}[task], fontsize=11.5)
         ax.set_ylim(0, 112)
@@ -1009,10 +1015,6 @@ def figure_heldout(results: dict, arm_names: list[str], theme: Theme) -> None:
 
 
 # The recipe names section 4 uses, keyed by the name the demo prints.
-# The house font has no arrow, so mathtext draws it.
-RECIPES = {"stage 1 only": "Caption\nonly", "no stage 1": "QA\nonly",
-           "connector only": "Caption\n$\\rightarrow$ QA",
-           "connector + LoRA": "Caption\n$\\rightarrow$ QA\n+ LoRA"}
 
 
 def figure_recipes(results: dict, arm_names: list[str], theme: Theme) -> None:
@@ -1021,14 +1023,14 @@ def figure_recipes(results: dict, arm_names: list[str], theme: Theme) -> None:
     The caption-only model is one run with no seeds, so it has no range line.
     """
     blue, orange = theme.series[0], theme.series[1]
-    names = ["stage 1 only", *arm_names]
+    names = ["Caption only", *arm_names]
     fig, axes = plt.subplots(1, len(TASKS), figsize=(12.5, 4.6), sharey=True)
     width = 0.38
     for ax, task in zip(axes, TASKS, strict=True):
         for g, name in enumerate(names):
             for m, (key, label, color) in enumerate((("scores", "seen pairs", blue),
                                                      ("heldout", "held-out pairs", orange))):
-                if name == "stage 1 only":
+                if name == "Caption only":
                     one = results["zero_shot" if key == "scores" else "zero_shot_heldout"][task]
                     values = [100 * one["real"] / one["total"]]
                 else:
@@ -1043,7 +1045,7 @@ def figure_recipes(results: dict, arm_names: list[str], theme: Theme) -> None:
                 ax.text(x, max(values) + 2.0, f"{mid:.0f}", ha="center", va="bottom", fontsize=8.8,
                         color=theme.ink, zorder=5)
         ax.set_xticks(range(len(names)))
-        ax.set_xticklabels([RECIPES[n] for n in names], fontsize=9.2)
+        ax.set_xticklabels([recipe_label(n) for n in names], fontsize=9.2)
         ax.set_title({"count": "How many shapes?", "binding": "What color is the <shape>?",
                       "leftmost": "Color of the leftmost shape?"}[task], fontsize=11.5)
         ax.set_ylim(0, 112)
@@ -1072,14 +1074,14 @@ def figure_losses(results: dict, arm_names: list[str], theme: Theme) -> None:
     a1.plot(np.arange(len(smooth(s196))) + 10, smooth(s196), color=theme.muted, linewidth=1.8,
             label="196 image tokens")
     a1.set_title("Stage 1: captions, connector only", fontsize=11.5, loc="left")
-    colors = {"no stage 1": theme.muted, "connector only": theme.series[0],
-              "connector + LoRA": theme.series[1]}
+    colors = {"QA only": theme.muted, "Caption → QA": theme.series[0],
+              "Caption → QA + LoRA": theme.series[1]}
     for name in arm_names:
         runs = results["arms"][name]["losses"]
         n = min(len(r) for r in runs)
         mid = np.median(np.asarray([r[:n] for r in runs]), axis=0)
         a2.plot(np.arange(len(smooth(list(mid)))) + 10, smooth(list(mid)), color=colors[name],
-                linewidth=1.8, label=name + (" (from random)" if name == "no stage 1" else ""))
+                linewidth=1.8, label=arrow(name) + (" (from random)" if name == "QA only" else ""))
     a2.set_title("Stage 2: questions", fontsize=11.5, loc="left")
     from matplotlib.ticker import FuncFormatter, NullFormatter
 
@@ -1114,7 +1116,7 @@ def figure_failures(items: list[tuple[Scene, str, str, str]], theme: Theme) -> N
         ax.text(cx, 0.4, f"said: {said or '(nothing)'}", ha="center", va="center", fontsize=9.8,
                 color=theme.series[1], fontweight="bold")
     _crop(fig, ax, 0.15, 3.4)
-    ax.set_title("Some wrong answers on held-out pairs (connector only, first seed)", loc="left",
+    ax.set_title(arrow("Some wrong answers on held-out pairs (Caption → QA, first seed)"), loc="left",
                  pad=10)
     save_both(fig, SLUG, "failures", theme)
 
@@ -1147,10 +1149,10 @@ def figure_experiment(n: dict, theme: Theme) -> None:
     card(4.35, 4.4, 3.85, 1.1, "Stage 1: connector on captions",
          [f"{n['stage1']} steps, one run", "then a second run on 196 tokens"], blue, fill=blue)
     card(4.35, 1.5, 3.85, 2.5, "Stage 2: questions, 3 seeds each",
-         [f"connector only: {n['stage2']} steps from stage 1",
-          f"connector + LoRA: {n['stage2']} steps from stage 1",
-          f"no stage 1: {n['stage1'] + n['stage2']} steps from random",
-          "", "the no-stage-1 run is the control", "for stage 1 itself"], blue)
+         [arrow(f"Caption → QA: {n['stage2']} steps after stage 1"),
+          arrow("Caption → QA + LoRA: the same, with LoRA"),
+          f"QA only: {n['stage1'] + n['stage2']} steps from random",
+          "", "QA only is the control", "for stage 1 itself"], blue)
     _arrow(ax, 3.85, 4.85, 4.3, 4.85, theme.secondary)
     _arrow(ax, 3.85, 2.9, 4.3, 2.9, theme.secondary)
     _arrow(ax, 6.27, 4.35, 6.27, 4.05, theme.secondary)
@@ -1191,8 +1193,7 @@ def figure_paired(fu: dict, arms: tuple[str, ...], theme: Theme) -> None:
                     zorder=4, label="median of five seeds" if (x == 0 and task == "binding") else None)
             ax.text(x + 0.22, mid, f"{mid:.0f}", va="center", fontsize=10, color=theme.ink)
         ax.set_xticks(xs)
-        ax.set_xticklabels([a.replace(" + ", "\n+ ").replace("connector only", "connector\nonly")
-                            .replace("no stage 1", "no\nstage 1") for a in arms], fontsize=9.6)
+        ax.set_xticklabels([recipe_label(a) for a in arms], fontsize=9.6)
         ax.set_xlim(-0.5, len(arms) - 0.3)
         ax.set_title(title + "  (held-out pairs)", fontsize=11.5)
         ax.set_ylim(0, 105)
