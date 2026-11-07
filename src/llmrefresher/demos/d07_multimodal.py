@@ -840,13 +840,14 @@ def draw_figures(results: dict) -> int:
             figures.figure_split(theme)
             figures.figure_controls(scene, other, question, answer, theme)
             figures.figure_heldout(results, arm_names, theme)
+            figures.figure_recipes(results, arm_names, theme)
             figures.figure_losses(results, arm_names, theme)
             figures.figure_failures(gallery, theme)
             figures.figure_experiment(
                 {"captions": TRAIN_SCENES, "questions": TRAIN_SCENES, "stage1": STAGE1_STEPS,
                  "stage2": STAGE2_STEPS, "test": TEST_PER_TASK, "captions_test": TEST_CAPTIONS},
                 theme)
-    return 15
+    return 16
 
 
 # -- main ----------------------------------------------------------------------------

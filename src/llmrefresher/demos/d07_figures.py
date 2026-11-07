@@ -1008,6 +1008,56 @@ def figure_heldout(results: dict, arm_names: list[str], theme: Theme) -> None:
     save_both(fig, SLUG, "held-out-results", theme)
 
 
+# The recipe names section 4 uses, keyed by the name the demo prints.
+# The house font has no arrow, so mathtext draws it.
+RECIPES = {"stage 1 only": "Caption\nonly", "no stage 1": "QA\nonly",
+           "connector only": "Caption\n$\\rightarrow$ QA",
+           "connector + LoRA": "Caption\n$\\rightarrow$ QA\n+ LoRA"}
+
+
+def figure_recipes(results: dict, arm_names: list[str], theme: Theme) -> None:
+    """Section 4's four recipes: seen and held-out scores per task, with the seed range.
+
+    The caption-only model is one run with no seeds, so it has no range line.
+    """
+    blue, orange = theme.series[0], theme.series[1]
+    names = ["stage 1 only", *arm_names]
+    fig, axes = plt.subplots(1, len(TASKS), figsize=(12.5, 4.6), sharey=True)
+    width = 0.38
+    for ax, task in zip(axes, TASKS, strict=True):
+        for g, name in enumerate(names):
+            for m, (key, label, color) in enumerate((("scores", "seen pairs", blue),
+                                                     ("heldout", "held-out pairs", orange))):
+                if name == "stage 1 only":
+                    one = results["zero_shot" if key == "scores" else "zero_shot_heldout"][task]
+                    values = [100 * one["real"] / one["total"]]
+                else:
+                    values = [100 * r["real"] / r["total"] for r in results["arms"][name][key][task]]
+                mid = float(np.median(values))
+                x = g + (m - 0.5) * width
+                ax.bar(x, mid, width * 0.9, color=color, zorder=3,
+                       label=label if (g == 0 and task == TASKS[0]) else None)
+                if len(values) > 1:
+                    ax.plot([x, x], [min(values), max(values)], color=theme.secondary,
+                            linewidth=1.0, zorder=4)
+                ax.text(x, max(values) + 2.0, f"{mid:.0f}", ha="center", va="bottom", fontsize=8.8,
+                        color=theme.ink, zorder=5)
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels([RECIPES[n] for n in names], fontsize=9.2)
+        ax.set_title({"count": "How many shapes?", "binding": "What color is the <shape>?",
+                      "leftmost": "Color of the leftmost shape?"}[task], fontsize=11.5)
+        ax.set_ylim(0, 112)
+        ax.set_yticks([0, 25, 50, 75, 100])
+        ax.grid(axis="x", visible=False)
+    axes[0].set_ylabel("answered exactly right (%)")
+    fig.legend(loc="upper right", ncol=2, bbox_to_anchor=(0.98, 1.02), fontsize=10)
+    fig.suptitle("Four training recipes, on pairs seen in training and pairs never seen",
+                 x=0.06, ha="left", fontsize=13, fontweight="bold", y=1.07, color=theme.ink)
+    fig.text(0.98, -0.08, "trained recipes: median of three seeds, the thin line spans the lowest "
+             "to the highest; caption only: one run", ha="right", fontsize=9.0, color=theme.muted)
+    save_both(fig, SLUG, "stage-two-recipes", theme)
+
+
 def figure_losses(results: dict, arm_names: list[str], theme: Theme) -> None:
     """Training loss: stage 1 (49 and 196 tokens) and stage 2's three arms."""
     def smooth(xs: list[float], k: int = 10) -> np.ndarray:
