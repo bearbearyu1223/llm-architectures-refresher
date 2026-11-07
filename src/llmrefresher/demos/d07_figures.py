@@ -555,8 +555,8 @@ def figure_designs(theme: Theme) -> None:
     # (a) projector: every image vector becomes a token
     ax = axes[0, 0]
     panel(ax, "1. Project every patch into the sequence", "LLaVA, Qwen2-VL, this post",
-          ["Simple, and the language model sees every patch.",
-           "Cost: one token per patch (or per 2 x 2 block)."])
+          ["Every patch (or 2 x 2 block) becomes one token in the sequence.",
+           "Simple, but the token count grows with the picture."])
     ax.add_patch(plt.Rectangle((0.3, 2.35), 1.3, 0.55, facecolor=orange, alpha=0.35,
                                edgecolor="none"))
     ax.text(0.95, 2.62, "patch vectors", ha="center", va="center", fontsize=9.2, color=theme.ink)
@@ -568,62 +568,87 @@ def figure_designs(theme: Theme) -> None:
     lm(ax, end + 0.25, 1.25, 1.6, 0.85)
     _arrow(ax, end + 0.02, 1.66, end + 0.23, 1.66, theme.secondary)
 
-    # (b) resampler: a fixed number of learned queries
+    # (b) learned queries: a few vectors attend to every patch; only they go on
     ax = axes[0, 1]
-    panel(ax, "2. Summarize into a fixed number of tokens",
-          "Flamingo's Perceiver Resampler (64), BLIP-2's Q-Former (32)",
-          ["Learned queries read the patches and keep a summary.",
-           "The token count stays fixed however many patches there are."])
-    ax.add_patch(plt.Rectangle((0.3, 2.35), 1.3, 0.55, facecolor=orange, alpha=0.35,
-                               edgecolor="none"))
-    ax.text(0.95, 2.62, "patch vectors", ha="center", va="center", fontsize=9.2, color=theme.ink)
-    _box(ax, 1.9, 2.3, 1.7, 0.65, blue, fill=blue, lw=1.2)
-    ax.text(2.75, 2.62, "learned queries", ha="center", va="center", fontsize=9.4,
-            color=ink_for(blue))
-    _arrow(ax, 1.62, 2.62, 1.88, 2.62, theme.secondary)
-    end = tokens(ax, 0.3, 1.45, 3, 4, 4)
-    _arrow(ax, 2.75, 2.27, 1.1, 1.92, orange)
-    lm(ax, end + 0.25, 1.25, 1.6, 0.85)
-    _arrow(ax, end + 0.02, 1.66, end + 0.23, 1.66, theme.secondary)
+    panel(ax, "2. Summarize with learned queries",
+          "BLIP-2 (32 queries); Flamingo (64), which feeds design 3",
+          ["A few learned queries attend to all the patches;",
+           "only their outputs go on, however many patches there were."])
+    patches = [0.3 + 0.2 * k for k in range(14)]
+    for x in patches:
+        ax.add_patch(plt.Rectangle((x, 2.75), 0.16, 0.3, facecolor=orange, alpha=0.35,
+                                   edgecolor="none"))
+    ax.text(3.2, 2.9, "patch vectors", ha="left", va="center", fontsize=9.0, color=theme.secondary)
+    queries = [0.75 + 0.55 * k for k in range(4)]
+    for qx in queries:
+        for x in patches:
+            ax.plot([x + 0.08, qx + 0.15], [2.74, 2.36], color=blue, linewidth=0.45, alpha=0.45,
+                    zorder=1)
+        _box(ax, qx, 2.06, 0.3, 0.3, blue, fill=blue, lw=1.0)
+        ax.text(qx + 0.15, 2.21, "q", ha="center", va="center", fontsize=9.0,
+                color=ink_for(blue), zorder=5)
+    ax.text(3.2, 2.21, "learned queries", ha="left", va="center", fontsize=9.0,
+            color=theme.secondary)
+    end = tokens(ax, 0.3, 1.2, 3, 4, 4)
+    _arrow(ax, 1.65, 2.03, 1.0, 1.65, orange)
+    lm(ax, end + 0.25, 1.0, 1.6, 0.85)
+    _arrow(ax, end + 0.02, 1.41, end + 0.23, 1.41, theme.secondary)
 
-    # (c) cross-attention: the image never enters the sequence
+    # (c) cross-attention: the picture stays outside the sequence
     ax = axes[1, 0]
-    panel(ax, "3. Let the language model look across at the image",
-          "Flamingo, Llama 3's vision models",
-          ["New cross-attention layers between the frozen ones read",
-           "the image; the text sequence stays text only."])
+    panel(ax, "3. Let the language model attend to the picture",
+          "Flamingo (on design 2's outputs), Llama 3's vision models",
+          ["The sequence stays text only. New cross-attention layers",
+           "between the frozen ones read the image vectors beside it."])
     for k in range(4):
-        y = 1.15 + k * 0.48
+        y = 1.35 + k * 0.45
         cross = k % 2 == 1
-        _box(ax, 0.3, y, 2.6, 0.36, blue if cross else theme.muted,
+        _box(ax, 0.3, y, 2.6, 0.34, blue if cross else theme.muted,
              fill=blue if cross else "none", lw=1.2)
-        ax.text(1.6, y + 0.18, "cross-attention, trained" if cross else "layer, frozen",
+        ax.text(1.6, y + 0.17, "cross-attention, trained" if cross else "layer, frozen",
                 ha="center", va="center", fontsize=9.0,
                 color=ink_for(blue) if cross else theme.ink)
         if cross:
-            _arrow(ax, 3.7, y + 0.18, 2.95, y + 0.18, orange)
-    ax.add_patch(plt.Rectangle((3.75, 1.2), 1.0, 1.8, facecolor=orange, alpha=0.35,
+            _arrow(ax, 3.7, y + 0.17, 2.95, y + 0.17, orange)
+    x = 0.55
+    for _ in range(12):
+        _box(ax, x, 0.92, 0.14, 0.26, theme.muted, lw=0.9, round_=False)
+        x += 0.17
+    ax.text(x + 0.05, 1.05, "text only", ha="left", va="center", fontsize=8.8,
+            color=theme.secondary)
+    _arrow(ax, 1.6, 1.19, 1.6, 1.33, theme.secondary)
+    ax.add_patch(plt.Rectangle((3.75, 1.4), 1.0, 1.6, facecolor=orange, alpha=0.35,
                                edgecolor="none"))
-    ax.text(4.25, 2.1, "image\nvectors", ha="center", va="center", fontsize=9.2, color=theme.ink)
+    ax.text(4.25, 2.2, "image\nvectors,\noutside the\nsequence", ha="center", va="center",
+            fontsize=8.8, color=theme.ink)
 
-    # (d) early fusion: images as discrete tokens
+    # (d) discrete tokens: a picture becomes token IDs, like words
     ax = axes[1, 1]
-    panel(ax, "4. Turn the image into tokens from a codebook",
+    panel(ax, "4. Turn the picture into token IDs",
           "Chameleon: 1,024 tokens per 512 x 512 picture, codebook of 8,192",
-          ["Images and text share one vocabulary and one model,",
-           "trained together from the start, so it can also draw."])
-    _box(ax, 0.3, 2.35, 1.3, 0.55, theme.muted, lw=1.2)
-    ax.text(0.95, 2.62, "image tokenizer", ha="center", va="center", fontsize=9.2,
+          ["The picture becomes IDs from a codebook, like words from a",
+           "vocabulary; trained to predict both, it can generate pictures."])
+    _box(ax, 0.3, 2.4, 1.7, 0.55, theme.muted, lw=1.2)
+    ax.text(1.15, 2.67, "image tokenizer", ha="center", va="center", fontsize=9.2,
             color=theme.ink)
-    end = tokens(ax, 0.3, 1.45, 3, 12, 4)
-    _arrow(ax, 0.95, 2.32, 1.3, 1.92, orange)
-    lm(ax, end + 0.25, 1.25, 1.6, 0.85, label="one model")
-    _arrow(ax, end + 0.02, 1.66, end + 0.23, 1.66, theme.secondary)
+    x = 0.3
+    for tok, img in (("a", False), ("photo", False), (":", False), ("812", True), ("4031", True),
+                     ("77", True), ("5120", True), ("…", True)):
+        w = 0.16 + 0.085 * len(tok)
+        _box(ax, x, 1.2, w, 0.42, orange if img else theme.muted, lw=1.1, round_=False)
+        ax.text(x + w / 2, 1.41, tok, ha="center", va="center", fontsize=8.6,
+                color=orange if img else theme.ink, fontweight="bold" if img else "normal")
+        x += w + 0.05
+    _arrow(ax, 1.15, 2.37, 1.6, 1.65, orange)
+    lm(ax, x + 0.25, 1.0, 1.5, 0.85, label="one model")
+    _arrow(ax, x + 0.02, 1.41, x + 0.23, 1.41, theme.secondary)
+    ax.text(x + 1.0, 2.2, "next token:\ntext or image", ha="center", va="center", fontsize=8.8,
+            color=theme.secondary)
 
-    fig.suptitle("Four ways to give a language model a picture", x=0.125, ha="left",
+    fig.suptitle("Four ways to connect a picture to a language model", x=0.125, ha="left",
                  fontsize=13, fontweight="bold", color=theme.ink, y=0.95)
-    fig.text(0.9, 0.06, "schematic: block counts are illustrative; gray: frozen or text, "
-             "blue: trained, orange: from the picture", ha="right", fontsize=9.0,
+    fig.text(0.9, 0.06, "schematic: block counts and token IDs are illustrative; gray: frozen or "
+             "text, blue: trained, orange: from the picture", ha="right", fontsize=9.0,
              color=theme.muted)
     save_both(fig, SLUG, "connector-designs", theme)
 
