@@ -850,13 +850,24 @@ def figure_inputs(question: list[str], prefix: list[str], second: list[str], fac
         ax.text(x + 0.15, y, f"{total} positions", ha="left", va="center", fontsize=9.6,
                 color=theme.secondary)
 
-    row(3.3, "text only: the connector isn't used, and the model is the downloaded Qwen",
-        [question[1:]])
+    row(3.3, "text only: SigLIP and the connector aren't used", [question[1:]])
     row(2.0, "one picture and text", [prefix, "IMAGE", question])
     row(0.7, "two pictures and text: as many as fit", [prefix, "IMAGE", second, "IMAGE", question])
+    # The key: two paths in, one kind of position out.
+    y = -0.15
+    _box(ax, 0.3, y - 0.15, 0.3, 0.3, theme.muted, lw=1.0)
+    ax.text(0.72, y, "text token: looked up in Qwen's vocabulary table", ha="left", va="center",
+            fontsize=9.6, color=theme.secondary)
+    for k in range(3):
+        ax.add_patch(plt.Rectangle((5.0 + 0.047 * k, y - 0.15), 0.035, 0.3, facecolor=orange,
+                                   edgecolor="none", zorder=3))
+    ax.text(5.28, y, "image token: made by SigLIP and the connector", ha="left", va="center",
+            fontsize=9.6, color=theme.secondary)
+    ax.text(12.4, y, f"every position: one {facts.lm_width}-wide vector", ha="right", va="center",
+            fontsize=9.6, color=theme.secondary)
     ax.set_title("One model, any mix of text and pictures: it's all one sequence", loc="left",
                  pad=10)
-    _crop(fig, ax, 0.25, 4.05)
+    _crop(fig, ax, -0.45, 4.05)
     save_both(fig, SLUG, "input-mixes", theme)
 
 
