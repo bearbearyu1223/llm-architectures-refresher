@@ -599,7 +599,7 @@ def figure_designs(theme: Theme) -> None:
     panel(ax, "3. Let the language model attend to the picture",
           "Flamingo (on design 2's outputs), Llama 3's vision models",
           ["The sequence stays text only. New cross-attention layers",
-           "between the frozen ones read the image vectors beside it."])
+           "between the frozen ones read the picture's vectors beside it."])
     for k in range(4):
         y = 1.35 + k * 0.45
         cross = k % 2 == 1
@@ -619,7 +619,7 @@ def figure_designs(theme: Theme) -> None:
     _arrow(ax, 1.6, 1.19, 1.6, 1.33, theme.secondary)
     ax.add_patch(plt.Rectangle((3.75, 1.4), 1.0, 1.6, facecolor=orange, alpha=0.35,
                                edgecolor="none"))
-    ax.text(4.25, 2.2, "image\nvectors,\noutside the\nsequence", ha="center", va="center",
+    ax.text(4.25, 2.2, "picture's\nvectors,\noutside the\nsequence", ha="center", va="center",
             fontsize=8.8, color=theme.ink)
 
     # (d) discrete tokens: a picture becomes token IDs, like words
