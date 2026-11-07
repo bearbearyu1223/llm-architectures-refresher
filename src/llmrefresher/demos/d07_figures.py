@@ -20,7 +20,7 @@ import numpy as np
 from transformers import AutoConfig
 
 from ..plotting import Theme, ink_for, save_both
-from ..vlm import IMAGE_SIZE, PATCH, TASKS, Scene, draw
+from ..vlm import IMAGE_SIZE, PATCH, TASKS, Scene, answer_for, draw
 
 SLUG = "07-multimodal"
 
@@ -939,11 +939,12 @@ def figure_controls(scene: Scene, other: Scene, question: str, answer: str,
                     theme: Theme) -> None:
     """One question, asked four ways. Only the first one lets the model see the answer."""
     fig, ax = _canvas(12.5, 4.9)
+    shown = answer_for(other, question)
     cols = [
-        ("right picture", scene, "the real score", "it can read the answer"),
-        ("blank picture", (), "guessing, with an", "image slot that's empty"),
-        ("another scene's picture", other, "reading the wrong", "picture"),
-        ("no picture", None, "guessing from the", "question's words alone"),
+        ("right picture", scene, "the normal test:", f"the answer is {answer}"),
+        ("blank picture", (), "no shapes or colors", "to read"),
+        ("another scene's picture", other, "a different scene:", f"its answer is {shown}"),
+        ("no picture", None, "only the question's", "words reach the model"),
     ]
     w = 3.05
     for k, (title, sc, line1, line2) in enumerate(cols):
@@ -963,8 +964,8 @@ def figure_controls(scene: Scene, other: Scene, question: str, answer: str,
         ax.text(cx, 0.85, line2, ha="center", va="center", fontsize=10.0, color=theme.ink)
         if k:
             ax.plot([x - 0.08, x - 0.08], [0.6, 4.6], color=theme.grid, linewidth=1.0)
-    ax.text(12.4, 0.25, f"right answer for the first picture: {answer}. The gap between the first "
-            "column's score and the best of the other three is what came from looking.",
+    ax.text(12.4, 0.25, f"Every answer is scored against the right picture's answer, {answer}. "
+            "The gap is the first column's score minus the best of the other three.",
             ha="right", va="center", fontsize=9.0, color=theme.muted)
     _crop(fig, ax, 0.05, 4.8)
     ax.set_title("Every question is asked four ways", loc="left", pad=10)
