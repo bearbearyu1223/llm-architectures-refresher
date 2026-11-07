@@ -941,10 +941,10 @@ def figure_controls(scene: Scene, other: Scene, question: str, answer: str,
     fig, ax = _canvas(12.5, 4.9)
     shown = answer_for(other, question)
     cols = [
-        ("right picture", scene, "the normal test:", f"the answer is {answer}"),
+        ("right picture", scene, "the normal test", f"right answer: {answer}"),
         ("blank picture", (), "no shapes or colors", "to read"),
-        ("another scene's picture", other, "a different scene:", f"its answer is {shown}"),
-        ("no picture", None, "only the question's", "words reach the model"),
+        ("wrong picture", other, "does the answer change?", f"this picture's answer: {shown}"),
+        ("no picture", None, "the words alone:", "no image tokens at all"),
     ]
     w = 3.05
     for k, (title, sc, line1, line2) in enumerate(cols):
@@ -954,7 +954,7 @@ def figure_controls(scene: Scene, other: Scene, question: str, answer: str,
                 color=theme.ink)
         if sc is None:
             _box(ax, cx - 0.85, 2.3, 1.7, 1.7, theme.muted, dashed=True, lw=1.4)
-            ax.text(cx, 3.15, "nothing:\nno Image:,\nno vectors", ha="center", va="center",
+            ax.text(cx, 3.15, "nothing here", ha="center", va="center",
                     fontsize=9.4, color=theme.secondary)
         else:
             _picture(fig, ax, sc, cx - 0.85, 2.3, 1.7, frame=theme.axis)
