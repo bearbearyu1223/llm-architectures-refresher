@@ -155,3 +155,34 @@ def test_demo_pools_never_train_on_a_held_out_pair_and_always_test_one():
     for item in pools["questions_heldout"]["leftmost"]:
         first = min(scenes[item.image], key=lambda s: s.center_x)
         assert held_out(first) and first.color == item.answer
+
+
+def test_answer_for_reads_the_scene_it_is_given():
+    """Scoring a wrong-picture answer needs the shown picture's own answer."""
+    from llmrefresher.vlm import Shape, answer_for
+
+    scene = (Shape("red", "circle", (120, 10, 160, 50)), Shape("green", "triangle", (20, 10, 60, 50)),
+             Shape("blue", "circle", (70, 10, 110, 50)))
+    assert answer_for(scene, "How many shapes are there?") == "three"
+    assert answer_for(scene, "What color is the leftmost shape?") == "green"
+    assert answer_for(scene, "What color is the triangle?") == "green"
+    assert answer_for(scene, "What color is the circle?") is None  # two circles
+    assert answer_for(scene, "What color is the square?") is None  # no square
+
+
+def test_is_it_looking_prints_every_model_and_both_new_tables(capsys):
+    from llmrefresher.demos.d07_multimodal import Arm, Scores, is_it_looking
+    from llmrefresher.report import Report
+    from llmrefresher.vlm import TASKS
+
+    def s(real, swap=(10, 7, 1), none_first="three"):
+        return Scores(real, 30, 31, 0, 100, *swap, none_first)
+
+    arms = [Arm(name, {t: [s(90), s(94), s(92)] for t in TASKS}, {t: [s(50)] for t in TASKS},
+                [], [], {}) for name in ("QA only", "Caption → QA")]
+    is_it_looking(Report("07", "t"), arms, ({t: s(40, (10, 2, 0), "") for t in TASKS}, {}))
+    out = capsys.readouterr().out
+    assert "Caption only" in out and "Caption → QA" in out
+    assert "gave shown picture's" in out
+    assert " 92 " in out and " 61\n" in out  # median real, and real minus best control (31)
+    assert "'three'" in out and "''" in out

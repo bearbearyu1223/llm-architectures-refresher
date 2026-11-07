@@ -40,7 +40,7 @@ from .training import TrainLog
 __all__ = [
     "COLORS", "SHAPES", "TASKS", "HELD_OUT", "IMAGE_SIZE", "PATCH", "Shape", "Scene", "Example",
     "make_scene", "draw", "describe", "ask", "to_pixels", "patchify", "merge_2x2",
-    "Projector", "VisionLanguageModel", "train_vlm", "score_vlm",
+    "Projector", "VisionLanguageModel", "train_vlm", "score_vlm", "answer_for",
 ]
 
 IMAGE_SIZE = 224
@@ -188,6 +188,22 @@ def ask(scene: Scene, task: str, rng: random.Random,
         shape = rng.choice(unique)
         return f"What color is the {shape.kind}?", shape.color
     raise ValueError(task)
+
+
+def answer_for(scene: Scene, question: str) -> str | None:
+    """The right answer to ``question`` about ``scene``, or None if it has none.
+
+    Used to score a wrong-picture answer against the picture the model was
+    actually shown. A binding question has no answer for a scene without
+    exactly one shape of the asked kind.
+    """
+    if question == "How many shapes are there?":
+        return NUMBER_WORDS[len(scene)]
+    if question == "What color is the leftmost shape?":
+        return min(scene, key=lambda s: s.center_x).color
+    kind = question.removeprefix("What color is the ").removesuffix("?")
+    same = [s for s in scene if s.kind == kind]
+    return same[0].color if len(same) == 1 else None
 
 
 # -- turning pixels into the encoder's input ---------------------------------------
@@ -423,6 +439,7 @@ def score_vlm(
     image: str = "real",
     blank: torch.Tensor | None = None,
     misses: list[tuple[Example, str]] | None = None,
+    said: list[str] | None = None,
 ) -> tuple[int, int]:
     """Exact match, the series' rule: greedy, answer length + 2 tokens, strip, equal.
 
@@ -436,6 +453,7 @@ def score_vlm(
     * ``"none"``: no picture at all, only the question's words.
 
     Wrong answers are appended to ``misses``, if given, as (example, what it said).
+    Every answer, right or wrong, is appended to ``said``, if given, in order.
     """
     hits = 0
     for k, item in enumerate(examples):
@@ -453,6 +471,8 @@ def score_vlm(
         got = model.answer(f, item.prompt, max_new=want + 2)
         right = got.strip() == item.answer
         hits += right
+        if said is not None:
+            said.append(" ".join(got.split()))
         if not right and misses is not None:
             misses.append((item, " ".join(got.split())))
     return hits, len(examples)

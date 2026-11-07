@@ -62,6 +62,7 @@ from ..vlm import (
     Projector,
     Scene,
     VisionLanguageModel,
+    answer_for,
     ask,
     describe,
     draw,
@@ -265,6 +266,14 @@ class Scores:
     shuffled: int
     none: int
     total: int
+    # The wrong picture, scored against the picture shown: of the questions
+    # whose answer differs between the two pictures, how often the model gave
+    # the shown picture's answer, and how often the question's own.
+    swap_asked: int = 0
+    swap_followed: int = 0
+    swap_kept: int = 0
+    # What it wrote for the first question with no picture at all.
+    none_first: str = ""
 
     @property
     def best_control(self) -> int:
@@ -276,15 +285,28 @@ Miss = tuple[int, str, str, str, str]  # image, task, prompt, right answer, what
 
 def score_all(model: VisionLanguageModel, data: Data, examples: list[Example],
               misses: list[Miss] | None = None) -> Scores:
-    got = {}
+    got, said = {}, {}
     for mode in ("real", "blank", "shuffled", "none"):
         wrong: list = []
+        said[mode] = []
         got[mode] = score_vlm(model, data.features, examples, image=mode, blank=data.blank,
-                              misses=wrong)[0]
+                              misses=wrong, said=said[mode])[0]
         if mode == "real" and misses is not None:
-            misses.extend((item.image, item.task, item.prompt, item.answer, said)
-                          for item, said in wrong)
-    return Scores(got["real"], got["blank"], got["shuffled"], got["none"], len(examples))
+            misses.extend((item.image, item.task, item.prompt, item.answer, text)
+                          for item, text in wrong)
+    asked = followed = kept = 0
+    if examples and examples[0].task != "caption":
+        for k, item in enumerate(examples):
+            shown = data.scenes[examples[(k + 1) % len(examples)].image]
+            question = item.prompt.split("Question: ")[1].split("\n")[0]
+            other = answer_for(shown, question)
+            if other is None or other == item.answer:
+                continue
+            asked += 1
+            followed += said["shuffled"][k] == other
+            kept += said["shuffled"][k] == item.answer
+    return Scores(got["real"], got["blank"], got["shuffled"], got["none"], len(examples),
+                  asked, followed, kept, said["none"][0] if said["none"] else "")
 
 
 @dataclass(frozen=True)
@@ -602,23 +624,48 @@ def stage_two(rep: Report, arms: list[Arm], zero: dict[str, Scores]) -> None:
     rep.table(["task", "model", "seen pairs", "held-out pairs"], rows)
 
 
-def is_it_looking(rep: Report, arms: list[Arm]) -> None:
-    """Every control, and the gap between the right picture and the best one."""
+def is_it_looking(rep: Report, arms: list[Arm],
+                  zero: tuple[dict[str, Scores], dict[str, Scores]]) -> None:
+    """Every control, the gap, the wrong picture scored both ways, and no-picture answers."""
     rep.note("Seen pairs, median of the seeds. Controls: a blank picture, another")
     rep.note("scene's picture, and no picture at all, only the question.")
     rep.blank()
+
+    def med(runs: list[Scores], key: str) -> int:
+        return int(statistics.median(getattr(x, key) for x in runs))
+
+    groups = [("Caption only", {t: [zero[0][t]] for t in TASKS})]
+    groups += [(arm.name, arm.scores) for arm in arms]
     rows = []
     for task in TASKS:
-        for arm in arms:
-            s = arm.scores[task]
-
-            def med(key: str) -> int:
-                return int(statistics.median(getattr(x, key) for x in s))
-
+        for g, (name, scores) in enumerate(groups):
+            s = scores[task]
             control = int(statistics.median(x.best_control for x in s))
-            rows.append((task if arm is arms[0] else "", arm.name, med("real"), med("blank"),
-                         med("shuffled"), med("none"), med("real") - control))
+            rows.append((task if g == 0 else "", name, med(s, "real"), med(s, "blank"),
+                         med(s, "shuffled"), med(s, "none"), med(s, "real") - control))
     rep.table(["task", "model", "right", "blank", "wrong", "none", "gap"], rows)
+    rep.blank()
+    rep.note("The wrong picture, scored against both pictures. Only questions whose")
+    rep.note("answer differs between the two pictures count. Median of the seeds.")
+    rep.blank()
+    rows = []
+    for task in TASKS:
+        for g, (name, scores) in enumerate(groups):
+            s = scores[task]
+            asked, followed, kept = (med(s, "swap_asked"), med(s, "swap_followed"),
+                                     med(s, "swap_kept"))
+            rows.append((task if g == 0 else "", name, asked, followed, kept))
+    rep.table(["task", "model", "asked", "gave shown picture's", "gave original's"], rows)
+    rep.blank()
+    rep.note("No picture at all: what each model wrote for the first question of")
+    rep.note("each kind, first seed. Scoring needs exactly the one-word answer.")
+    rep.blank()
+    rows = []
+    for task in TASKS:
+        for g, (name, scores) in enumerate(groups):
+            first = scores[task][0]
+            rows.append((task if g == 0 else "", name, repr(first.none_first)))
+    rep.table(["task", "model", "wrote"], rows)
 
 
 # -- section 6: pairs it never saw -----------------------------------------------------
@@ -959,7 +1006,7 @@ def main() -> None:
     stage_two(rep, arms, zero)
 
     rep.section("5. Is it looking?                                  [post §5]")
-    is_it_looking(rep, arms)
+    is_it_looking(rep, arms, zero)
 
     rep.section("6. Pairs it never saw                              [post §6]")
     pairs_never_seen(rep, data, arms, zero, s1_unseen)
