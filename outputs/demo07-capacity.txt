@@ -1,0 +1,25 @@
+==========================================================================
+DEMO 07: Multimodal capacity check: tokens or connector size?
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  seeds                              0, 1, 2
+  training                           stage 1 only: 400 steps x 16 captions, connector only
+  wider MLP hidden width             2,136 (the others: 896)
+
+  Stage 1 captions exactly right, of 120 new pictures; median of
+  3 seeds, range in brackets. Loss: mean of the last 10 steps.
+
+  connector              tokens  parameters  captions right  final loss  s/step
+  -------------------------------------------------------------------------------
+  49 tokens                  49   3,557,120      91 (85-95)      0.0745    0.97
+  196 tokens                196   1,492,736      80 (76-91)      0.0925    2.96
+  196 tokens, wider MLP     196   3,557,336      87 (76-96)      0.0797    2.97
+
+  connector              seed 0  seed 1  seed 2
+  -----------------------------------------------
+  49 tokens                  91      95      85
+  196 tokens                 76      80      91
+  196 tokens, wider MLP      96      76      87
