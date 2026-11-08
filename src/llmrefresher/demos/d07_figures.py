@@ -703,8 +703,8 @@ def figure_results(results: dict, arm_names: list[str], theme: Theme) -> None:
     fig.suptitle("Stage 2: how often each model answers right, with and without the right "
                  "picture", x=0.06, ha="left", fontsize=13, fontweight="bold", y=1.07,
                  color=theme.ink)
-    fig.text(0.98, -0.06, "trained models: median of three seeds; the line spans the lowest "
-             "to the highest", ha="right", fontsize=9.0, color=theme.muted)
+    fig.text(0.98, -0.06, "trained on questions: median of three seeds, the line spans the lowest "
+             "to the highest; Caption only: one run", ha="right", fontsize=9.0, color=theme.muted)
     save_both(fig, SLUG, "stage-two-results", theme)
 
 
