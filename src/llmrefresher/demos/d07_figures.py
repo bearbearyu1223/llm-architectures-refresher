@@ -1043,7 +1043,11 @@ def figure_heldout(results: dict, arm_names: list[str], theme: Theme) -> None:
         ax.set_yticks([0, 25, 50, 75, 100])
         ax.grid(axis="x", visible=False)
     axes[0].set_ylabel("answered exactly right (%)")
-    fig.legend(loc="upper right", ncol=3, bbox_to_anchor=(0.98, 1.02), fontsize=10)
+    # Legend in the order the bars read: seen, held-out, then the control line.
+    handles, labels = axes[0].get_legend_handles_labels()
+    order = [labels.index(k) for k in ("seen pairs", "held-out pairs", "held-out: best control")]
+    fig.legend([handles[k] for k in order], [labels[k] for k in order], loc="upper right", ncol=3,
+               bbox_to_anchor=(0.98, 1.02), fontsize=10)
     fig.suptitle("Pairs it saw in training, and pairs it never saw", x=0.06, ha="left",
                  fontsize=13, fontweight="bold", y=1.07, color=theme.ink)
     fig.text(0.98, -0.06, "median of three seeds; the thin line spans the lowest to the highest",
@@ -1224,23 +1228,39 @@ def figure_paired(fu: dict, arms: tuple[str, ...], theme: Theme) -> None:
             ys = [100 * r[i] / total for r in runs]
             ax.plot(xs, ys, color=theme.muted, linewidth=1.1, alpha=0.8, zorder=2)
             ax.scatter(xs, ys, s=22, color=theme.muted, zorder=3)
-        for x, r in zip(xs, runs, strict=True):
+        first = task == "binding"
+        seen = [fu["scores"][a][f"{task}|seen"] for a in arms]
+        for x, r, sr in zip(xs, runs, seen, strict=True):
             mid = float(np.median([100 * v / total for v in r]))
             ax.plot([x - 0.18, x + 0.18], [mid, mid], color=theme.series[1], linewidth=3.0,
-                    zorder=4, label="median of five seeds" if (x == 0 and task == "binding") else None)
+                    zorder=4, label="held-out pairs" if (x == 0 and first) else None)
             ax.text(x + 0.22, mid, f"{mid:.0f}", va="center", fontsize=10, color=theme.ink)
+            # Seen pairs: the median only, drawn left of the seed dots so the labels don't meet.
+            sm = float(np.median([100 * v / total for v in sr]))
+            ax.plot([x - 0.42, x - 0.26], [sm, sm], color=theme.series[0], linewidth=3.0, zorder=4,
+                    label="seen pairs" if (x == 0 and first) else None)
+            ax.text(x - 0.46, sm, f"{sm:.0f}", va="center", ha="right", fontsize=10,
+                    color=theme.ink)
+            if first:  # the demo scores controls on held-out binding only
+                cm = float(np.median([100 * v / total for v in fu["controls"][arms[x]]]))
+                ax.plot([x - 0.18, x + 0.18], [cm, cm], color=theme.ink, linewidth=2.0, zorder=4,
+                        label="held-out: best control" if x == 0 else None)
+                ax.text(x + 0.22, cm, f"{cm:.0f}", va="center", fontsize=10, color=theme.ink)
         ax.set_xticks(xs)
         ax.set_xticklabels([recipe_label(a) for a in arms], fontsize=9.6)
-        ax.set_xlim(-0.5, len(arms) - 0.3)
-        ax.set_title(title + "  (held-out pairs)", fontsize=11.5)
+        ax.set_xlim(-0.75, len(arms) - 0.3)
+        ax.set_title(title, fontsize=11.5)
         ax.set_ylim(0, 105)
         ax.set_yticks([0, 25, 50, 75, 100])
         ax.grid(axis="x", visible=False)
     axes[0].set_ylabel("answered exactly right (%)")
-    fig.legend(loc="upper right", bbox_to_anchor=(0.98, 1.02), fontsize=10)
+    handles, labels = axes[0].get_legend_handles_labels()
+    order = [labels.index(k) for k in ("seen pairs", "held-out pairs", "held-out: best control")]
+    fig.legend([handles[k] for k in order], [labels[k] for k in order], loc="upper right",
+               ncol=3, bbox_to_anchor=(0.98, 1.02), fontsize=10)
     fig.suptitle("Five seeds, each a line: the same seed trained three ways", x=0.06, ha="left",
                  fontsize=13, fontweight="bold", y=1.07, color=theme.ink)
-    fig.text(0.98, -0.06, "300 fresh questions per pool; a line joins the three versions "
-             "trained from the same seed, on the same questions in the same order",
+    fig.text(0.98, -0.06, "300 fresh questions per pool; gray: held-out pairs, a line joins the three versions "
+             "trained from the same seed; colored dashes: medians of five seeds",
              ha="right", fontsize=9.0, color=theme.muted)
     save_both(fig, SLUG, "paired-seeds", theme)
