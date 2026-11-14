@@ -1,0 +1,259 @@
+==========================================================================
+DEMO 08: Learning from rewards: a minimal GRPO run
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  model                              Qwen/Qwen2.5-0.5B-Instruct
+  precision                          float32
+  task                               a x b, a and b in 10..99
+  reward                             1 if the answer is the right integer
+  format-valid                       a lone integer: 1081, 1,081 or 1081.
+  train / test problems              256 / 200, disjoint
+
+--------------------------------------------------------------------------
+1. A sequence's log-probability                     [post §1]
+--------------------------------------------------------------------------
+  Question: What is 23 x 47? Answer with just the number.
+
+  prompt tokens (chat template)      45, all masked out
+  answer tokens scored               5: the digits, then <|im_end|>
+
+  answer token         token  log-prob    prob
+  ----------------------------------------------
+  0                      '1'   -0.3165  0.7287
+  1                      '0'   -0.0163  0.9838
+  2                      '8'   -2.8617  0.0572
+  3                      '1'   -0.0305  0.9700
+  4             '<|im_end|>'   -0.0036  0.9964
+
+  sequence log-prob (sum)            -3.2286
+  probability of the whole answer    0.0396
+  cross-entropy (mean of -log-prob)  0.6457
+
+  same, for the wrong answer "1091"  -7.1006
+
+  >> The sequence log-prob is a sum over answer tokens only. SFT raises it
+     for an answer it is given; GRPO raises it for answers the model
+     sampled that scored above their group, and lowers it for those below.
+
+--------------------------------------------------------------------------
+2. The baseline                                     [post §2]
+--------------------------------------------------------------------------
+  test problems                      200, none of them in training
+
+  decoding          answers  right  format-valid
+  ------------------------------------------------
+  greedy                200  37.5%         91.0%
+  sampled, T = 1.0     1600  34.3%         86.8%
+
+  problems right in >=1 of 8 samples 117/200 (58.5%)
+    of the problems greedy gets wrong 44/125 (35.2%)
+
+  Sampled answers that are not a lone integer, first three:
+    "35 x 11 = 385"
+    "35 x 11 = 385"
+    "35 x 11 = 385"
+
+  >> The model sometimes gets the arithmetic right. Reinforcement learning
+     can only make more likely what it already samples.
+
+--------------------------------------------------------------------------
+3. Groups and advantages                            [post §3]
+--------------------------------------------------------------------------
+  G = 8 answers each, T = 1.0. Questions picked by
+  estimated pass rate: lowest, nearest 50%, highest.
+
+  31 x 51 = 1581   (pass rate estimate 0.00)
+  #  response  reward  advantage
+  --------------------------------
+  1    "1641"       0     +0.000
+  2    "1501"       0     +0.000
+  3    "1601"       0     +0.000
+  4    "1601"       0     +0.000
+  5    "1661"       0     +0.000
+  6    "1591"       0     +0.000
+  7    "1691"       0     +0.000
+  8    "1661"       0     +0.000
+  mean 0.000   std 0.000   (r - mean) / (std + 0.0001)
+
+  46 x 32 = 1472   (pass rate estimate 0.50)
+  #    response  reward  advantage
+  ----------------------------------
+  1  "New York"       0     -0.935
+  2      "1352"       0     -0.935
+  3      "1472"       1     +0.935
+  4      "1452"       0     -0.935
+  5      "1472"       1     +0.935
+  6      "1452"       0     -0.935
+  7      "1472"       1     +0.935
+  8      "1472"       1     +0.935
+  mean 0.500   std 0.535   (r - mean) / (std + 0.0001)
+
+  12 x 24 = 288   (pass rate estimate 1.00)
+  #  response  reward  advantage
+  --------------------------------
+  1     "288"       1     +0.000
+  2     "288"       1     +0.000
+  3     "288"       1     +0.000
+  4     "288"       1     +0.000
+  5     "288"       1     +0.000
+  6     "288"       1     +0.000
+  7     "288"       1     +0.000
+  8     "288"       1     +0.000
+  mean 1.000   std 0.000   (r - mean) / (std + 0.0001)
+
+  Pass rates of the 256 train questions (16 samples each):
+    never right                      97
+    always right                     25
+    in between                       134
+    mean pass rate                   0.326
+
+  Share of groups with all rewards equal (zero advantage, no signal):
+
+  G   groups  measured  analytic
+  --------------------------------
+  2     2048     0.854     0.856
+  4     1024     0.733     0.738
+  8      512     0.611     0.635
+  16     256     0.492     0.553
+
+  measured: 16 fresh samples per question, cut into groups of G.
+  analytic: mean over questions of p^G + (1-p)^G, with each p
+  estimated from 16 other samples. p^G + (1-p)^G is convex in p,
+  so plugging in an estimated p overstates it (Jensen's inequality).
+
+  >> Only groups with a mix of right and wrong answers move the model.
+     Bigger groups waste fewer questions, at the cost of more samples per
+     question.
+
+--------------------------------------------------------------------------
+4. One update by hand                               [post §4]
+--------------------------------------------------------------------------
+  The group for 46 x 32 from section 3, adapters fresh, lr 3e-05.
+  2 gradient steps on the same 8 answers (GRPO's inner steps).
+
+  step  ratio min  ratio max  clipped  surrogate         KL      loss
+  ---------------------------------------------------------------------
+  1        1.0000     1.0000     0.0%    +0.0000  -1.44e-08   +0.0000
+  2        0.0001     1.4386    28.9%    +0.0580   4.52e+02  +18.0031
+
+  Step 1: the policy is the sampler, so every ratio is exactly 1, and
+  the adapters start at zero, so the KL is 0 (to float rounding).
+  Step 2 scores the same answers again. Where a token's log-prob fell
+  below the reference's, the KL term exp(r) - r - 1, r = ref - logp,
+  grows exponentially in r; where a ratio crossed the clip in the
+  advantage's direction, that token's surrogate gradient is zero.
+
+  response    reward    adv  log-prob    after  change
+  ------------------------------------------------------
+  "New York"       0  -0.94   -15.361  -16.150  -0.789
+  "1352"           0  -0.94    -3.002   -7.167  -4.165
+  "1472"           1  +0.94    -0.593   -0.049  +0.544
+  "1452"           0  -0.94    -2.984   -6.749  -3.765
+  "1472"           1  +0.94    -0.593   -0.049  +0.544
+  "1452"           0  -0.94    -2.984   -6.749  -3.765
+  "1472"           1  +0.94    -0.593   -0.049  +0.544
+  "1472"           1  +0.94    -0.593   -0.049  +0.544
+
+  right answers whose log-prob rose  4 of 4
+  wrong answers whose log-prob fell  4 of 4
+
+  >> No value network and no labels: the group's own mean is the baseline.
+     Answers above it are made more likely, answers below it less.
+
+--------------------------------------------------------------------------
+5. Training                                         [post §5]
+--------------------------------------------------------------------------
+  policy                             the model + LoRA, r=8, 7 projections
+  reference (for the KL)             the same model, adapters off
+  per step                           8 questions x G=8 = 64 answers
+  inner steps per batch              1
+  KL beta                            0.04
+  clip epsilon                       0.2 (inactive at 1 inner step)
+  optimizer                          AdamW, lr 3e-05, no weight decay
+  steps per run                      60 (480 draws from 256 questions)
+  sampling                           T = 1.0, at most 24 tokens
+
+  GRPO, seed 0
+
+  step  mean reward  no-signal groups  KL to ref  length
+  --------------------------------------------------------
+  10          0.498             65.0%     0.1767    4.97
+  20          0.503             71.2%     0.2318    4.81
+  30          0.456             63.7%     0.2335    4.95
+  40          0.464             50.0%     0.3226    4.97
+  50          0.519             68.8%     0.5564    4.95
+  60          0.537             73.8%     0.2401    4.90
+
+  GRPO, seed 1
+
+  step  mean reward  no-signal groups  KL to ref  length
+  --------------------------------------------------------
+  10          0.425             55.0%     0.1995    5.08
+  20          0.562             56.2%     0.2615    4.90
+  30          0.575             65.0%     0.2693    4.71
+  40          0.528             72.5%     0.3355    5.07
+  50          0.586             60.0%     0.2506    4.84
+  60          0.591             66.2%     0.2588    4.94
+
+  control: shuffled rewards, seed 0
+
+  step  mean reward  no-signal groups  KL to ref  length
+  --------------------------------------------------------
+  10          0.391              3.8%     0.0493    5.72
+  20          0.362              2.5%     0.0734    5.42
+  30          0.277             16.2%     0.2406    5.45
+  40          0.166             28.7%     0.3828    6.15
+  50          0.159             27.5%     0.4323    7.05
+  60          0.183             27.5%     0.4983    7.63
+
+  Each row averages the 10 steps up to it. no-signal groups:
+  all G training rewards equal (for the control, the shuffled ones).
+  length: answer tokens, <|im_end|> included.
+
+  Test set, greedy, 200 problems never trained on:
+
+  model                              right  format-valid  change
+  ----------------------------------------------------------------
+  untrained                          37.5%         91.0%
+  GRPO, seed 0                       50.5%         98.0%   +13.0
+  GRPO, seed 1                       59.0%         99.0%   +21.5
+  control: shuffled rewards, seed 0  33.5%         89.0%    -4.0
+
+  >> The reward is the only thing that tells the model which answers were
+     right. Shuffle it across the batch, keeping its mean, and the same
+     training loop has nothing to learn from.
+
+--------------------------------------------------------------------------
+6. What changed                                     [post §6]
+--------------------------------------------------------------------------
+  Test problems, untrained vs GRPO, seed 0 (greedy):
+
+  problem  answer         untrained  trained
+  --------------------------------------------
+  35 x 11     385             "435"    "385"
+  26 x 83    2158  "26 x 83 = 2118"   "2158"
+  94 x 69    6486            "6386"   "6486"
+  17 x 90    1530  "17 x 90 = 1530"   "1530"
+  20 x 94    1880            "1880"   "1860"
+  56 x 72    4032            "3952"   "4032"
+
+  Where the accuracy change came from, test set:
+
+  wrong -> right    seed 0  seed 1  shuffled, seed 0
+  ----------------------------------------------------
+  arithmetic fixed      27      42                 8
+  format fixed           5       5                 0
+  broken                 6       4                16
+  net                   26      43                -8
+
+  arithmetic fixed: a wrong lone integer became the right one.
+  format fixed: not a lone integer became the right one.
+  broken: right became wrong. net: problems gained.
+
+  >> Splitting the gain shows what the reward actually taught: to state
+     the answer in the checkable form, to get the product right, or both.
+
+  device memory still allocated      1.86 GiB

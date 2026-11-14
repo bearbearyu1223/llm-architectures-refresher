@@ -32,6 +32,7 @@ demo04 = "llmrefresher.demos.d04_quantization:main"
 demo05 = "llmrefresher.demos.d05_moe:main"
 demo06 = "llmrefresher.demos.d06_lora:main"
 demo07 = "llmrefresher.demos.d07_multimodal:main"
+demo08 = "llmrefresher.demos.d08_rewards:main"
 
 [build-system]
 requires = ["hatchling"]
