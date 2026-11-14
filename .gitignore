@@ -8,3 +8,6 @@ figures/**/*.png
 figures/**/*.pt
 !figures/.gitkeep
 figures/**/*.json
+
+# research:code-reviewer writes its failing tests here; never committed
+tests/review/
