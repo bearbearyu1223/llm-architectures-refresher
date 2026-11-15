@@ -11,7 +11,12 @@ import pytest
 import torch
 
 from llmrefresher.demos.d08_rewards import (
+    FULL,
+    QUICK,
     analytic_zero_variance,
+    change_summary,
+    first_per_problem,
+    fixes_from_sampled,
     group_advantages,
     grpo_objective,
     make_problems,
@@ -19,7 +24,9 @@ from llmrefresher.demos.d08_rewards import (
     parse_answer,
     response_mask,
     score,
+    short_label,
     show,
+    shuffle_within_groups,
     transitions,
     zero_variance_fraction,
 )
@@ -187,6 +194,67 @@ def test_transitions():
         "arithmetic fixed": 1, "format fixed": 1, "broken": 1, "net": 1}
 
 
+def test_fixes_from_sampled():
+    before = ((False, True), (False, False), (True, True), (False, True), (False, True))
+    after = ((True, True), (True, True), (False, True), (False, True), (True, True))
+    sampled = (True, False, True, True, True)
+    # Fixed: problems 0, 1 and 4. Of those, 0 and 4 had a right sample.
+    assert fixes_from_sampled(before, after, sampled) == (2, 3)
+    # The total agrees with transitions().
+    split = transitions(before, after)
+    assert split["arithmetic fixed"] + split["format fixed"] == 3
+
+
+def test_first_per_problem_takes_one_sample_from_each_problem():
+    # 4 samples per problem; problem 0 has three flagged, problem 1 none,
+    # problems 2, 3 and 4 one each.
+    flags = [True, True, False, True,
+             False, False, False, False,
+             False, False, True, False,
+             True, False, False, False,
+             False, True, False, False]
+    assert first_per_problem(flags, 4) == [0, 10, 12]
+    assert first_per_problem(flags, 4, limit=5) == [0, 10, 12, 17]
+    assert first_per_problem([False] * 8, 4) == []
+
+
+def test_shuffle_within_groups_keeps_each_groups_rewards():
+    rewards = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
+    moved = False
+    gen = torch.Generator().manual_seed(1000)
+    for _ in range(20):
+        out = shuffle_within_groups(rewards, gen)
+        assert torch.equal(out.sort(dim=1).values, rewards.sort(dim=1).values)
+        assert zero_variance_fraction(out) == zero_variance_fraction(rewards)
+        moved |= not torch.equal(out, rewards)
+    assert moved  # it does reorder
+    a = shuffle_within_groups(rewards, torch.Generator().manual_seed(7))
+    b = shuffle_within_groups(rewards, torch.Generator().manual_seed(7))
+    assert torch.equal(a, b)  # deterministic given the generator's seed
+
+
 def test_show_is_ascii_and_bounded():
     s = show("23 × 47 = 1081\nso the answer is 1081", 20)
     assert s.isascii() and len(s) == 20 and s.startswith('"23 x 47')
+
+
+def test_change_summary_in_points():
+    # Untrained 37.5%; runs at 50.5%, 59.0%, 47.0%: +13.0, +21.5, +9.5 points.
+    mean, low, high = change_summary(0.375, [0.505, 0.59, 0.47])
+    assert math.isclose(mean, (13.0 + 21.5 + 9.5) / 3)
+    assert math.isclose(low, 9.5) and math.isclose(high, 21.5)
+    # One run: mean, min and max are that run's change; a drop is negative.
+    assert all(math.isclose(x, -5.0) for x in change_summary(0.5, [0.45]))
+
+
+def test_sizes_have_the_expected_seeds():
+    assert FULL.seeds == (0, 1, 2) and FULL.control_seeds == (0, 1, 2)
+    assert QUICK.seeds == (0,) and QUICK.control_seeds == (0,)
+
+
+def test_short_label():
+    assert short_label("GRPO, seed 2") == "seed 2"
+    assert short_label("control: shuffled rewards, seed 1") == "ctrl 1"

@@ -16,10 +16,13 @@ Claims from the post, each with a receipt:
 4. One update, by hand: the right answers' log-probabilities go up and the
    wrong ones' go down.
 5. Training with LoRA raises test accuracy on problems it never trained on.
-   The control trains identically except that each batch's rewards are
-   shuffled across its answers (same mean, no information), and does not.
+   The controls train identically except that each group's rewards are
+   shuffled among its own answers (same groups with signal, no information
+   about which answer earned it). Three real runs and three controls, each
+   on its own seed, so the summary is a range of three, not an error bar.
 6. The gain splits into answers whose format was fixed and answers whose
-   arithmetic was fixed.
+   arithmetic was fixed, and into problems the starting model already got
+   right in some of its samples (sharpening) and problems it never did.
 
 The reward is checkable: the answer either parses as the right integer or it
 doesn't. There is no learned judge, no value network and no library trainer;
@@ -42,7 +45,7 @@ import re
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -87,13 +90,14 @@ class Sizes:
     census_samples: int   # section 3: samples per train problem, twice
     steps: int            # section 5: GRPO steps per run
     log_every: int
-    seeds: tuple[int, ...]
+    seeds: tuple[int, ...]          # section 5: one real GRPO run per seed
+    control_seeds: tuple[int, ...]  # section 5: one shuffled-reward control per seed
 
 
 FULL = Sizes(train=256, test=200, test_samples=8, census_samples=16, steps=60,
-             log_every=10, seeds=(0, 1))
+             log_every=10, seeds=(0, 1, 2), control_seeds=(0, 1, 2))
 QUICK = Sizes(train=32, test=40, test_samples=4, census_samples=16, steps=4,
-              log_every=2, seeds=(0,))
+              log_every=2, seeds=(0,), control_seeds=(0,))
 
 Problem = tuple[int, int]
 
@@ -252,6 +256,67 @@ def transitions(
             out["broken"] += 1
     out["net"] = out["arithmetic fixed"] + out["format fixed"] - out["broken"]
     return out
+
+
+def fixes_from_sampled(
+    before: tuple[tuple[bool, bool], ...],
+    after: tuple[tuple[bool, bool], ...],
+    sampled_right: tuple[bool, ...],
+) -> tuple[int, int]:
+    """``(fixed problems the model already sampled right, all fixed problems)``.
+
+    "Fixed" is wrong before, right after: arithmetic fixed plus format fixed, as
+    in :func:`transitions`. ``sampled_right`` flags, per problem, that the
+    starting model was right in at least one of its sampled answers. A fix
+    inside that set sharpens something the model could already do; a fix
+    outside it is something none of its samples showed.
+    """
+    fixed = [not was and now for (was, _), (now, _) in zip(before, after, strict=True)]
+    inside = sum(f and s for f, s in zip(fixed, sampled_right, strict=True))
+    return inside, sum(fixed)
+
+
+def first_per_problem(flags: list[bool], samples: int, limit: int = 3) -> list[int]:
+    """Indices of the first flagged sample of each problem, for the first ``limit`` problems.
+
+    Samples are laid out ``samples`` per problem, consecutively.
+    """
+    picked: list[int] = []
+    seen: set[int] = set()
+    for i, flag in enumerate(flags):
+        if flag and i // samples not in seen:
+            seen.add(i // samples)
+            picked.append(i)
+            if len(picked) == limit:
+                break
+    return picked
+
+
+def shuffle_within_groups(rewards: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """Each row's rewards in a random order, drawn from ``generator``.
+
+    Every group keeps its own rewards, so its mean, its spread and whether it
+    has any signal at all are unchanged; only which answer gets which reward
+    is random.
+    """
+    order = torch.rand(rewards.shape, generator=generator).argsort(dim=1)
+    return rewards.gather(1, order)
+
+
+def change_summary(base: float, accuracies: list[float]) -> tuple[float, float, float]:
+    """``(mean, min, max)`` change in accuracy over ``base``, in percentage points.
+
+    ``base`` and ``accuracies`` are fractions (0.375 for 37.5%), one accuracy
+    per run.
+    """
+    changes = [100 * (a - base) for a in accuracies]
+    return sum(changes) / len(changes), min(changes), max(changes)
+
+
+def short_label(run_label: str) -> str:
+    """A run's column label in section 6: "seed N" for GRPO, "ctrl N" for a control."""
+    return (run_label.replace("control: shuffled rewards, seed ", "ctrl ")
+            .replace("GRPO, seed ", "seed "))
 
 
 def show(text: str, width: int) -> str:
@@ -509,6 +574,10 @@ class Eval:
 
     texts: tuple[str, ...]
     outcomes: tuple[tuple[bool, bool], ...]  # (correct, valid) per problem
+    # Baseline only (section 2), empty otherwise: per problem, right in at least
+    # one of ``samples`` sampled answers.
+    sampled_right: tuple[bool, ...] = ()
+    samples: int = 0
 
     @property
     def accuracy(self) -> float:
@@ -608,17 +677,17 @@ def the_baseline(rep: Report, model, tokenizer, test, sizes: Sizes, device) -> E
            _pct(int(any_right.sum()), n))
     rep.kv("  of the problems greedy gets wrong",
            _pct(int((any_right & greedy_wrong).sum()), int(greedy_wrong.sum())))
-    invalid = [t for t, v in zip(sampled.texts, sampled.valid.tolist(), strict=True) if not v]
+    invalid = first_per_problem([not v for v in sampled.valid.tolist()], k)
     if invalid:
         rep.blank()
-        rep.note("Sampled answers that are not a lone integer, first three:")
-        for t in invalid[:3]:
-            rep.note(f"  {show(t, 66)}")
+        rep.note("Sampled answers not a lone integer, first three, one per problem:")
+        for i in invalid:
+            rep.note(f"  {show(sampled.texts[i], 66)}")
     rep.takeaway(
         "The model sometimes gets the arithmetic right. Reinforcement learning "
         "can only make more likely what it already samples."
     )
-    return base
+    return replace(base, sampled_right=tuple(any_right.tolist()), samples=k)
 
 
 # --------------------------------------------------------------------------
@@ -728,15 +797,17 @@ def one_update(rep: Report, model, tokenizer, examples: Batch, device) -> None:
     adv = group_advantages(group.correct.view(1, GROUP)).flatten().to(device)
 
     reset_adapters(model, seed=0)
-    opt = _optimizer(model)
-    ref = all_logprobs(model, group, reference=True)
-    before = (all_logprobs(model, group) * group.mask).sum(dim=1).cpu()
-    steps = grpo_update(model, opt, group, adv, ref, HAND_STEPS)
-    after = (all_logprobs(model, group) * group.mask).sum(dim=1).cpu()
-    reset_adapters(model, seed=0)
+    try:
+        opt = _optimizer(model)
+        ref = all_logprobs(model, group, reference=True)
+        before = (all_logprobs(model, group) * group.mask).sum(dim=1).cpu()
+        steps = grpo_update(model, opt, group, adv, ref, HAND_STEPS)
+        after = (all_logprobs(model, group) * group.mask).sum(dim=1).cpu()
+    finally:
+        reset_adapters(model, seed=0)  # the adapters are shared with section 5
 
     a, b = group.problems[0]
-    rep.note(f"The group for {a} x {b} from section 3, adapters fresh, lr {LR:g}.")
+    rep.note(f"The group for {a} x {b} from post §4, adapters fresh, lr {LR:g}.")
     rep.note(f"{HAND_STEPS} gradient steps on the same {GROUP} answers (GRPO's inner steps).")
     rep.blank()
     rep.table(
@@ -798,12 +869,13 @@ def grpo_train(
     model, tokenizer, train, test, *, seed: int, shuffled: bool, sizes: Sizes, device,
     label: str,
 ) -> Run:
-    """GRPO from fresh adapters. ``shuffled`` is the control.
+    """GRPO from fresh adapters. ``shuffled`` makes it a control run.
 
-    The control samples, scores and steps exactly like the real run, but before
-    computing advantages it permutes the batch's rewards across all P x G
-    answers. Every step keeps the same mean reward and the same number of 1s;
-    which answer gets which reward is random.
+    A control run samples, scores and steps exactly like the real run, but before
+    computing advantages it shuffles each group's rewards among that group's G
+    answers (:func:`shuffle_within_groups`). Every group keeps its own rewards,
+    so the same groups have signal as in an unshuffled run, with the same
+    advantage magnitudes; only which answer gets which reward is random.
     """
     reset_adapters(model, seed)
     opt = _optimizer(model)
@@ -819,8 +891,7 @@ def grpo_train(
                          seed=seed * 100_003 + step, device=device)
         rewards = batch.correct.view(PROMPTS_PER_STEP, GROUP)
         if shuffled:
-            perm = torch.randperm(rewards.numel(), generator=shuffler)
-            rewards = rewards.flatten()[perm].view(PROMPTS_PER_STEP, GROUP)
+            rewards = shuffle_within_groups(rewards, shuffler)
         adv = group_advantages(rewards).flatten().to(device)
         ref = all_logprobs(model, batch, reference=True)
         terms = grpo_update(model, opt, batch, adv, ref, INNER_STEPS)
@@ -854,11 +925,13 @@ def training(rep: Report, model, tokenizer, train, test, base: Eval, sizes: Size
                             f"{len(train)} questions)")
     rep.kv("sampling", f"T = {TEMPERATURE}, at most {MAX_NEW_TOKENS} tokens")
 
+    # Every run starts from its own seed (adapters, question order, rollouts,
+    # shuffles), so the order they run in does not change any of them.
     runs = [grpo_train(model, tokenizer, train, test, seed=s, shuffled=False, sizes=sizes,
                        device=device, label=f"GRPO, seed {s}") for s in sizes.seeds]
-    runs.append(grpo_train(model, tokenizer, train, test, seed=sizes.seeds[0], shuffled=True,
-                           sizes=sizes, device=device,
-                           label=f"control: shuffled rewards, seed {sizes.seeds[0]}"))
+    runs += [grpo_train(model, tokenizer, train, test, seed=s, shuffled=True, sizes=sizes,
+                        device=device, label=f"control: shuffled rewards, seed {s}")
+             for s in sizes.control_seeds]
 
     for run in runs:
         rep.blank()
@@ -869,7 +942,8 @@ def training(rep: Report, model, tokenizer, train, test, base: Eval, sizes: Size
                     f"{r.length:.2f}") for r in run.log])
     rep.blank()
     rep.note(f"Each row averages the {sizes.log_every} steps up to it. no-signal groups:")
-    rep.note("all G training rewards equal (for the control, the shuffled ones).")
+    rep.note("all G training rewards equal. A control shuffles rewards only within")
+    rep.note("each group, so this share is the one its unshuffled rewards would give.")
     rep.note("length: answer tokens, <|im_end|> included.")
     rep.blank()
     rep.note(f"Test set, greedy, {len(test)} problems never trained on:")
@@ -880,10 +954,25 @@ def training(rep: Report, model, tokenizer, train, test, base: Eval, sizes: Size
                      f"{100 * run.after.valid_rate:.1f}%",
                      f"{100 * (run.after.accuracy - base.accuracy):+.1f}"))
     rep.table(["model", "right", "format-valid", "change"], rows)
+    rep.blank()
+    rep.note("Change in test accuracy over the untrained model, points:")
+    rep.blank()
+    groups = [("GRPO", [r for r in runs if not r.shuffled]),
+              ("control: shuffled rewards", [r for r in runs if r.shuffled])]
+    rows = []
+    for name, group in groups:
+        mean, low, high = change_summary(base.accuracy, [r.after.accuracy for r in group])
+        rows.append((name, len(group), f"{mean:+.1f}", f"{low:+.1f}", f"{high:+.1f}"))
+    rep.table(["model", "runs", "mean", "min", "max"], rows)
+    rep.blank()
+    counts = sorted({len(group) for _, group in groups})
+    each = " and ".join(str(c) for c in counts)
+    rep.note(f"{each} run{'s' if counts != [1] else ''} each: min to max is a range, "
+             "not an error bar.")
     rep.takeaway(
-        "The reward is the only thing that tells the model which answers were "
-        "right. Shuffle it across the batch, keeping its mean, and the same "
-        "training loop has nothing to learn from."
+        "The shuffled controls improved too, so part of the gain comes from "
+        "the loop itself. Only the real reward says which answers were right, "
+        "and the real runs gained more than any control."
     )
     return runs
 
@@ -910,15 +999,36 @@ def what_changed(rep: Report, test, base: Eval, runs: list[Run], count: int = 6)
     rep.note("Where the accuracy change came from, test set:")
     rep.blank()
     splits = [transitions(base.outcomes, run.after.outcomes) for run in runs]
-    names = [run.label.replace("control: shuffled rewards", "shuffled").replace("GRPO, ", "")
-             for run in runs]
+    names = [short_label(run.label) for run in runs]
+    rep.note("seed N: GRPO, seed N. ctrl N: control (shuffled rewards), seed N.")
+    rep.blank()
     rows = [(key, *(s[key] for s in splits))
             for key in ("arithmetic fixed", "format fixed", "broken", "net")]
-    rep.table(["wrong -> right", *names], rows)
+    rep.table(["test answers", *names], rows)
     rep.blank()
     rep.note("arithmetic fixed: a wrong lone integer became the right one.")
     rep.note("format fixed: not a lone integer became the right one.")
     rep.note("broken: right became wrong. net: problems gained.")
+
+    k = base.samples
+    greedy_wrong = [not c for c, _ in base.outcomes]
+    pool = sum(w and s for w, s in zip(greedy_wrong, base.sampled_right, strict=True))
+    found = [fixes_from_sampled(base.outcomes, run.after.outcomes, base.sampled_right)
+             for run in runs]
+    rep.blank()
+    rep.note(f"Fixed problems (arithmetic + format), split by post §2's set: the {pool}")
+    rep.note(f"problems the untrained model got wrong greedily but right in >=1 of {k}")
+    rep.note("samples.")
+    rep.blank()
+    rep.table(
+        ["fixed problems", *names],
+        [("all fixed", *(total for _, total in found)),
+         (f"  in the {pool}", *(inside for inside, _ in found)),
+         (f"  outside the {pool}", *(total - inside for inside, total in found))],
+    )
+    rep.blank()
+    rep.note(f"A fix in the {pool} sharpens an answer the model could already sample;")
+    rep.note(f"a fix outside them is one none of its {k} samples showed.")
     rep.takeaway(
         "Splitting the gain shows what the reward actually taught: to state the "
         "answer in the checkable form, to get the product right, or both."
@@ -947,7 +1057,7 @@ def main() -> None:
     rep = Report("08", "Learning from rewards: a minimal GRPO run"
                  + (" (--quick)" if quick else ""))
     rep.header()
-    runs_count = len(sizes.seeds) + 1
+    runs_count = len(sizes.seeds) + len(sizes.control_seeds)
     progress.status(f"demo08{' --quick' if quick else ''}: {runs_count} GRPO runs of "
                     f"{sizes.steps} steps; progress on stderr, receipts on stdout")
 
@@ -969,17 +1079,18 @@ def main() -> None:
     rep.section("2. The baseline                                     [post §2]")
     base = the_baseline(rep, model, tokenizer, test, sizes, device)
 
-    rep.section("3. Groups and advantages                            [post §3]")
+    # Post §3 (from rewards to a gradient) has no demo section of its own.
+    rep.section("3. Groups and advantages                            [post §4]")
     cen = census(model, tokenizer, train, sizes, device)
     examples = groups_and_advantages(rep, model, tokenizer, train, cen, device)
 
-    rep.section("4. One update by hand                               [post §4]")
+    rep.section("4. One update by hand                               [post §5]")
     one_update(rep, model, tokenizer, examples, device)
 
-    rep.section("5. Training                                         [post §5]")
+    rep.section("5. Training                                         [post §6]")
     runs = training(rep, model, tokenizer, train, test, base, sizes, device)
 
-    rep.section("6. What changed                                     [post §6]")
+    rep.section("6. What changed                                     [post §7]")
     what_changed(rep, test, base, runs)
 
     if not quick:

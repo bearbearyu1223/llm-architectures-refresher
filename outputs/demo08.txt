@@ -51,16 +51,16 @@ device memory : 17.2 GB
   problems right in >=1 of 8 samples 117/200 (58.5%)
     of the problems greedy gets wrong 44/125 (35.2%)
 
-  Sampled answers that are not a lone integer, first three:
+  Sampled answers not a lone integer, first three, one per problem:
     "35 x 11 = 385"
-    "35 x 11 = 385"
-    "35 x 11 = 385"
+    "3, 854"
+    "26 x 83 = 2118"
 
   >> The model sometimes gets the arithmetic right. Reinforcement learning
      can only make more likely what it already samples.
 
 --------------------------------------------------------------------------
-3. Groups and advantages                            [post §3]
+3. Groups and advantages                            [post §4]
 --------------------------------------------------------------------------
   G = 8 answers each, T = 1.0. Questions picked by
   estimated pass rate: lowest, nearest 50%, highest.
@@ -129,9 +129,9 @@ device memory : 17.2 GB
      question.
 
 --------------------------------------------------------------------------
-4. One update by hand                               [post §4]
+4. One update by hand                               [post §5]
 --------------------------------------------------------------------------
-  The group for 46 x 32 from section 3, adapters fresh, lr 3e-05.
+  The group for 46 x 32 from post §4, adapters fresh, lr 3e-05.
   2 gradient steps on the same 8 answers (GRPO's inner steps).
 
   step  ratio min  ratio max  clipped  surrogate         KL      loss
@@ -164,7 +164,7 @@ device memory : 17.2 GB
      Answers above it are made more likely, answers below it less.
 
 --------------------------------------------------------------------------
-5. Training                                         [post §5]
+5. Training                                         [post §6]
 --------------------------------------------------------------------------
   policy                             the model + LoRA, r=8, 7 projections
   reference (for the KL)             the same model, adapters off
@@ -198,19 +198,53 @@ device memory : 17.2 GB
   50          0.586             60.0%     0.2506    4.84
   60          0.591             66.2%     0.2588    4.94
 
+  GRPO, seed 2
+
+  step  mean reward  no-signal groups  KL to ref  length
+  --------------------------------------------------------
+  10          0.366             60.0%     0.1505    5.42
+  20          0.523             66.2%     0.2729    5.11
+  30          0.450             70.0%     0.3115    4.83
+  40          0.570             65.0%     0.2407    4.88
+  50          0.581             62.5%     0.2233    4.95
+  60          0.614             70.0%     0.2289    5.08
+
   control: shuffled rewards, seed 0
 
   step  mean reward  no-signal groups  KL to ref  length
   --------------------------------------------------------
-  10          0.391              3.8%     0.0493    5.72
-  20          0.362              2.5%     0.0734    5.42
-  30          0.277             16.2%     0.2406    5.45
-  40          0.166             28.7%     0.3828    6.15
-  50          0.159             27.5%     0.4323    7.05
-  60          0.183             27.5%     0.4983    7.63
+  10          0.436             61.3%     0.1295    5.31
+  20          0.325             66.2%     0.0990    6.43
+  30          0.047             86.2%     0.5233   12.40
+  40          0.097             73.8%     0.5028    8.51
+  50          0.311             66.2%     0.1725    5.93
+  60          0.372             62.5%     0.1603    5.58
+
+  control: shuffled rewards, seed 1
+
+  step  mean reward  no-signal groups  KL to ref  length
+  --------------------------------------------------------
+  10          0.287             65.0%     0.0441    5.83
+  20          0.333             63.7%     0.0665    5.47
+  30          0.356             71.2%     0.1063    4.95
+  40          0.334             70.0%     0.2396    5.10
+  50          0.356             62.5%     0.1584    5.15
+  60          0.394             56.2%     0.1892    5.10
+
+  control: shuffled rewards, seed 2
+
+  step  mean reward  no-signal groups  KL to ref  length
+  --------------------------------------------------------
+  10          0.284             63.7%     0.0208    5.76
+  20          0.323             71.2%     0.0582    5.83
+  30          0.231             80.0%     0.0822    5.41
+  40          0.362             66.2%     0.0434    5.77
+  50          0.306             66.2%     0.0907    5.61
+  60          0.447             63.7%     0.0860    5.24
 
   Each row averages the 10 steps up to it. no-signal groups:
-  all G training rewards equal (for the control, the shuffled ones).
+  all G training rewards equal. A control shuffles rewards only within
+  each group, so this share is the one its unshuffled rewards would give.
   length: answer tokens, <|im_end|> included.
 
   Test set, greedy, 200 problems never trained on:
@@ -220,14 +254,26 @@ device memory : 17.2 GB
   untrained                          37.5%         91.0%
   GRPO, seed 0                       50.5%         98.0%   +13.0
   GRPO, seed 1                       59.0%         99.0%   +21.5
-  control: shuffled rewards, seed 0  33.5%         89.0%    -4.0
+  GRPO, seed 2                       57.0%         98.5%   +19.5
+  control: shuffled rewards, seed 0  47.0%         91.0%    +9.5
+  control: shuffled rewards, seed 1  42.0%         93.5%    +4.5
+  control: shuffled rewards, seed 2  42.0%         93.0%    +4.5
 
-  >> The reward is the only thing that tells the model which answers were
-     right. Shuffle it across the batch, keeping its mean, and the same
-     training loop has nothing to learn from.
+  Change in test accuracy over the untrained model, points:
+
+  model                      runs   mean    min    max
+  ------------------------------------------------------
+  GRPO                          3  +18.0  +13.0  +21.5
+  control: shuffled rewards     3   +6.2   +4.5   +9.5
+
+  3 runs each: min to max is a range, not an error bar.
+
+  >> The shuffled controls improved too, so part of the gain comes from
+     the loop itself. Only the real reward says which answers were right,
+     and the real runs gained more than any control.
 
 --------------------------------------------------------------------------
-6. What changed                                     [post §6]
+6. What changed                                     [post §7]
 --------------------------------------------------------------------------
   Test problems, untrained vs GRPO, seed 0 (greedy):
 
@@ -242,16 +288,31 @@ device memory : 17.2 GB
 
   Where the accuracy change came from, test set:
 
-  wrong -> right    seed 0  seed 1  shuffled, seed 0
-  ----------------------------------------------------
-  arithmetic fixed      27      42                 8
-  format fixed           5       5                 0
-  broken                 6       4                16
-  net                   26      43                -8
+  seed N: GRPO, seed N. ctrl N: control (shuffled rewards), seed N.
+
+  test answers      seed 0  seed 1  seed 2  ctrl 0  ctrl 1  ctrl 2
+  ------------------------------------------------------------------
+  arithmetic fixed      27      42      39      24      16      13
+  format fixed           5       5       5       0       3       0
+  broken                 6       4       5       5      10       4
+  net                   26      43      39      19       9       9
 
   arithmetic fixed: a wrong lone integer became the right one.
   format fixed: not a lone integer became the right one.
   broken: right became wrong. net: problems gained.
+
+  Fixed problems (arithmetic + format), split by post §2's set: the 44
+  problems the untrained model got wrong greedily but right in >=1 of 8
+  samples.
+
+  fixed problems    seed 0  seed 1  seed 2  ctrl 0  ctrl 1  ctrl 2
+  ------------------------------------------------------------------
+  all fixed             32      47      44      24      19      13
+    in the 44           22      27      28      17      13       9
+    outside the 44      10      20      16       7       6       4
+
+  A fix in the 44 sharpens an answer the model could already sample;
+  a fix outside them is one none of its 8 samples showed.
 
   >> Splitting the gain shows what the reward actually taught: to state
      the answer in the checkable form, to get the product right, or both.
