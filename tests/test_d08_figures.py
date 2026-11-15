@@ -1,6 +1,5 @@
-"""Smoke test for post 8's schematic: it renders both themes, and its numbers
-are section 1's."""
-
+"""Post 8's figures: each parser reads the capture strictly and raises on a broken
+one, and every figure renders in both themes from the real capture."""
 from llmrefresher import plotting
 from llmrefresher.demos.d08_figures import figure_sft_vs_grpo, reward, s1_example
 from llmrefresher.plotting import THEMES, styled
@@ -29,9 +28,6 @@ import pytest  # noqa: E402
 
 from llmrefresher.demos.d08_figures import (  # noqa: E402
     CaptureError,
-    figure_all_equal_groups,
-    figure_baseline_reach,
-    figure_heldout_accuracy,
     parse_all_equal_groups,
     parse_baseline_reach,
     parse_heldout_accuracy,
@@ -160,20 +156,239 @@ def test_parse_heldout_accuracy_rejects(broken):
         parse_heldout_accuracy(broken)
 
 
+# -- every figure renders in both themes from the real capture ---------------------
+
+from llmrefresher.demos import d08_figures  # noqa: E402
+from llmrefresher.demos.d08_figures import (  # noqa: E402
+    FIGURES,
+    clipped_surrogate,
+    parse_change_summary,
+    parse_example_groups,
+    parse_hand_update,
+    parse_mixed_groups,
+    parse_s1_example,
+    parse_setup,
+)
+
+REAL = d08_figures.CAPTURE.read_text()
+
+
 @pytest.mark.parametrize("figure, name", [
-    (figure_baseline_reach, "baseline-reach"),
-    (figure_all_equal_groups, "all-equal-groups"),
-    (figure_heldout_accuracy, "heldout-accuracy"),
+    (d08_figures.figure_sft_vs_grpo, "sft-vs-grpo"),
+    (d08_figures.figure_baseline_reach, "baseline-reach"),
+    (d08_figures.figure_all_equal_groups, "all-equal-groups"),
+    (d08_figures.figure_clip, "clip"),
+    (d08_figures.figure_grpo_step, "grpo-step"),
+    (d08_figures.figure_control_shuffle, "control-shuffle"),
+    (d08_figures.figure_training_logs, "training-logs"),
+    (d08_figures.figure_heldout_accuracy, "heldout-accuracy"),
+    (d08_figures.figure_sharpening_split, "sharpening-split"),
+    (d08_figures.figure_rlhf_vs_ours, "rlhf-vs-ours"),
 ])
-def test_measured_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
-    capture = tmp_path / "demo08.txt"
-    capture.write_text(CAPTURE)
+def test_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
     monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
     paths = []
     for theme in THEMES:
         with styled(theme):
-            paths.append(figure(theme, capture))
+            paths.append(figure(theme, d08_figures.CAPTURE))
     assert [p.name for p in paths] == [f"{name}-light.png", f"{name}-dark.png"]
     for p in paths:
         assert p.parent.parent.parent == tmp_path
         assert p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_every_figure_is_tested():
+    assert len(FIGURES) == 10
+
+
+# -- the real capture's numbers ---------------------------------------------------
+
+def test_baseline_parts_sum_to_200():
+    b = parse_baseline_reach(REAL)
+    assert b.parts == (2, 73, 44, 81)
+    assert sum(b.parts) == b.problems == 200
+    assert b.both_right + b.wrong_reached == b.reach            # 73 + 44 = 117
+    assert b.greedy_only + b.both_right == b.greedy_right       # 2 + 73 = 75
+
+
+def test_baseline_parts_reject_an_impossible_split():
+    # 44 of greedy's misses reached, but only 40 reached in all: negative overlap
+    broken = REAL.replace("117/200 (58.5%)", "40/200 (20.0%)")
+    with pytest.raises(CaptureError):
+        parse_baseline_reach(broken)
+
+
+def test_parse_s1_example():
+    assert parse_s1_example(REAL) == (23, 47)
+
+
+def test_parse_mixed_groups():
+    rows = parse_mixed_groups(REAL)
+    assert [(r.g, r.mixed_pct, r.per_1000) for r in rows] == [
+        (2, 14.6, 73), (4, 26.7, 67), (8, 38.9, 49), (16, 50.8, 32)]
+
+
+def test_parse_example_groups_and_hand_update():
+    groups = parse_example_groups(REAL)
+    assert [g.problem for g in groups] == [(31, 51), (46, 32), (12, 24)]
+    hand = parse_hand_update(REAL)
+    assert hand.group.problem == (46, 32)
+    assert hand.group.rewards == (0, 0, 1, 0, 1, 0, 1, 1)
+    assert (hand.group.advantage_of(1), hand.group.advantage_of(0)) == (0.935, -0.935)
+    assert (hand.ratio_min, hand.ratio_max) == (0.0001, 1.4386)
+
+
+def test_parse_setup():
+    s = parse_setup(REAL)
+    assert (s.model, s.train, s.rank, s.projections) == ("Qwen2.5-0.5B-Instruct", 256, 8, 7)
+    assert (s.questions, s.group, s.answers, s.inner_steps, s.steps) == (8, 8, 64, 1, 60)
+    assert (s.beta, s.clip, s.lr, s.temperature, s.max_tokens, s.eps) == (
+        "0.04", "0.2", "3e-05", "1.0", 24, "0.0001")
+
+
+def test_parse_heldout_changes_and_summary():
+    rows = parse_heldout_accuracy(REAL)
+    assert [r.change for r in rows] == [None, 13.0, 21.5, 19.5, 9.5, 4.5, 4.5]
+    summary = parse_change_summary(REAL)
+    assert (summary["GRPO"].low, summary["control"].high) == (13.0, 9.5)
+
+
+def test_clipped_surrogate():
+    assert clipped_surrogate(1.0, 0.935, 0.2) == 0.935
+    assert clipped_surrogate(1.5, 1.0, 0.2) == 1.2      # flat past 1 + eps for A > 0
+    assert clipped_surrogate(0.5, -1.0, 0.2) == -0.8    # flat below 1 - eps for A < 0
+    assert clipped_surrogate(1.5, -1.0, 0.2) == -1.5    # unclipped where it is smaller
+
+
+# -- each parser raises on a broken capture ---------------------------------------
+
+@pytest.mark.parametrize("parser, broken", [
+    (parse_s1_example, REAL.replace("What is 23 x 47?", "What is 23 times 47?")),
+    (parse_s1_example, REAL.replace('wrong answer "1091"', 'wrong answer "1092"')),
+    (parse_mixed_groups, REAL.replace("  G   mixed  mixed", "  G  mixed  mixed")),
+    (parse_mixed_groups, REAL.replace("  8   38.9%", "  8   39.9%")),           # not 1 - 0.611
+    (parse_mixed_groups, REAL.replace("                              49", "                              52")),
+    (parse_mixed_groups, REAL.replace("  16  50.8%                              32\n", "")),
+    (parse_example_groups, REAL.replace("  3      \"1472\"       1     +0.935",
+                                        "  3      \"1472\"       1     +0.535")),
+    (parse_example_groups, REAL.replace("mean 0.500   std 0.535", "mean 0.400   std 0.535")),
+    (parse_hand_update, REAL.replace("The group for 46 x 32", "The group for 46 x 33")),
+    (parse_hand_update, REAL.replace("  1        1.0000     1.0000", "  1        0.9000     1.0000")),
+    (parse_hand_update, REAL.replace("0.0001     1.4386", "0.0001     1.43")),
+    (parse_setup, REAL.replace("8 questions x G=8 = 64 answers", "8 questions x G=8 = 60 answers")),
+    (parse_setup, REAL.replace("KL beta                            0.04",
+                               "KL beta                            four")),
+    (parse_setup, REAL.replace("  sampling                           T = 1.0, at most 24 tokens\n", "")),
+    (parse_setup, REAL.replace("256 / 200, disjoint", "250 / 200, disjoint")),
+    (parse_setup, REAL.replace("AdamW, lr 3e-05", "Adam, lr 3e-05")),
+    (parse_change_summary, REAL.replace("  GRPO                          3  +18.0  +13.0",
+                                        "  GRPO                          3  +18.0  +12.0")),
+    (parse_change_summary, REAL.replace("  model                      runs", "  model                     runs")),
+])
+def test_new_parsers_reject(parser, broken):
+    assert broken != REAL, "the mutation must change the capture"
+    with pytest.raises(CaptureError):
+        parser(broken)
+
+
+# -- the second batch: the control's shuffle, the training logs, the split -----------
+
+from llmrefresher.demos.d08_figures import (  # noqa: E402
+    EXAMPLE_SHUFFLE,
+    flipped,
+    group_advantages,
+    parse_group_answers,
+    parse_sharpening_split,
+    parse_training_logs,
+    run_columns,
+    shuffled,
+    spread,
+)
+
+
+def test_example_shuffle_is_the_posts_example():
+    hand = parse_hand_update(REAL).group
+    answers = parse_group_answers(REAL, hand.problem)
+    assert answers == ("New York", "1352", "1472", "1452", "1472", "1452", "1472", "1472")
+    fake = shuffled(hand.rewards)
+    assert fake == (1, 0, 0, 1, 0, 1, 0, 1)                      # post §6, "The control"
+    assert sorted(fake) == sorted(hand.rewards)                  # a reordering, nothing more
+    adv = group_advantages(fake, float(hand.eps))
+    assert {round(a, 3) for a in adv} == {0.935, -0.935}
+    moved = flipped(hand.advantages, adv)
+    assert [k + 1 for k in moved] == [1, 3, 4, 5, 6, 7]
+    # New York and both 1452s up; three of the four 1472s down
+    assert {answers[k] for k in moved if adv[k] > 0} == {"New York", "1452"}
+    assert sum(answers[k] == "1472" for k in moved if adv[k] < 0) == 3
+
+
+def test_shuffled_rejects_a_non_permutation():
+    with pytest.raises(ValueError):
+        shuffled((0, 1, 1), (0, 0, 1))
+    assert len(EXAMPLE_SHUFFLE) == 8
+
+
+def test_group_advantages_match_s3b():
+    hand = parse_hand_update(REAL).group
+    got = group_advantages(hand.rewards, float(hand.eps))
+    assert all(abs(g - a) < 0.0006 for g, a in zip(got, hand.advantages, strict=True))
+
+
+def test_parse_training_logs():
+    logs = parse_training_logs(REAL)
+    assert [g.label for g in logs] == [
+        "GRPO, seed 0", "GRPO, seed 1", "GRPO, seed 2", "control: shuffled rewards, seed 0",
+        "control: shuffled rewards, seed 1", "control: shuffled rewards, seed 2"]
+    assert [r.step for r in logs[0].rows] == [10, 20, 30, 40, 50, 60]
+    c0 = logs[3]
+    assert c0.control and c0.seed == 0
+    assert (c0.at(30).reward, c0.at(30).kl, c0.at(30).length) == (0.047, 0.5233, 12.40)
+    assert [g.rows[-1].reward for g in logs] == [0.537, 0.591, 0.614, 0.372, 0.394, 0.447]
+    # the prose: by step 60 every control is closer to the reference than any real run
+    assert max(g.rows[-1].kl for g in logs if g.control) < min(
+        g.rows[-1].kl for g in logs if not g.control)
+
+
+def test_parse_sharpening_split():
+    s = parse_sharpening_split(REAL)
+    assert (s.reached, s.wrong, s.unreached, s.samples) == (44, 125, 81, 8)
+    assert [r.column for r in s.runs] == run_columns()
+    assert [r.inside for r in s.runs] == [22, 27, 28, 17, 13, 9]
+    assert [r.outside for r in s.runs] == [10, 20, 16, 7, 6, 4]
+
+
+@pytest.mark.parametrize("parser, broken", [
+    (parse_training_logs, REAL.replace("  30          0.047             86.2%",
+                                       "  30          0.47              86.2%")),
+    (parse_training_logs, REAL.replace("  60          0.447             63.7%     0.0860    5.24\n",
+                                       "")),                                    # a row short
+    (parse_training_logs, REAL.replace("  control: shuffled rewards, seed 1\n\n  step",
+                                       "  control: shuffled rewards, seed 9\n\n  step")),
+    (parse_training_logs, REAL.replace("  40          0.464", "  45          0.464")),
+    (parse_sharpening_split, REAL.replace("    in the 44           22", "    in the 44           23")),
+    (parse_sharpening_split, REAL.replace("    in the 44 ", "    in the 45 ")),
+    (parse_sharpening_split, REAL.replace("  net                   26", "  net                   27")),
+    (parse_sharpening_split, REAL.replace("  arithmetic fixed      27", "  arithmetic fixed      28")),
+    (parse_group_answers, REAL.replace('  1  "New York"       0', '  1  New York       0')),
+])
+def test_second_batch_parsers_reject(parser, broken):
+    assert broken != REAL, "the mutation must change the capture"
+    with pytest.raises(CaptureError):
+        if parser is parse_group_answers:
+            parser(broken, (46, 32))
+        else:
+            parser(broken)
+
+
+def test_spread_keeps_order_and_gap():
+    assert spread([0.1, 0.5, 0.9], 0.1) == [0.1, 0.5, 0.9]            # already apart
+    out = spread([0.5, 0.5], 0.2)
+    assert out == pytest.approx([0.4, 0.6])                            # centred on the pair
+    ys = [5.58, 5.10, 5.24, 4.90, 4.94, 5.08]
+    out = spread(ys, 0.6, 0.0, 13.0)
+    order = sorted(range(len(ys)), key=ys.__getitem__)
+    pos = [out[i] for i in order]
+    assert all(b - a >= 0.6 - 1e-9 for a, b in zip(pos, pos[1:], strict=False))
+    assert sum(out) / len(out) == pytest.approx(sum(ys) / len(ys))     # no drift
+    assert spread([0.0, 0.0], 0.2, lo=0.0) == pytest.approx([0.0, 0.2])
+    assert spread([1.0, 1.0], 0.2, hi=1.0) == pytest.approx([0.8, 1.0])
