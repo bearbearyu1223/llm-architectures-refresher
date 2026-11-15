@@ -103,6 +103,7 @@ def test_parse_baseline_reach():
     assert (b.problems, b.samples, b.greedy_pct, b.reach, b.reach_pct) == (200, 8, 37.5, 117, 58.5)
     assert (b.wrong, b.wrong_reached, b.wrong_reached_pct) == (125, 44, 35.2)
     assert (b.greedy_right, b.wrong_unreached, b.gain_points) == (75, 81, 21.0)
+    assert b.gain == 42
 
 
 @pytest.mark.parametrize("broken", [

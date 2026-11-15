@@ -18,8 +18,10 @@ Claims from the post, each with a receipt:
 5. Training with LoRA raises test accuracy on problems it never trained on.
    The controls train identically except that each group's rewards are
    shuffled among its own answers (same groups with signal, no information
-   about which answer earned it). Three real runs and three controls, each
-   on its own seed, so the summary is a range of three, not an error bar.
+   about which answer earned it). Three real runs and three controls;
+   control N shares real run N's seed (adapters, question order, sampling)
+   and differs only in the shuffle, so the six runs are three pairs, and
+   the summary is a range of three, not an error bar.
 6. The gain splits into answers whose format was fixed and answers whose
    arithmetic was fixed, and into problems the starting model already got
    right in some of its samples (sharpening) and problems it never did.
@@ -311,6 +313,51 @@ def change_summary(base: float, accuracies: list[float]) -> tuple[float, float, 
     """
     changes = [100 * (a - base) for a in accuracies]
     return sum(changes) / len(changes), min(changes), max(changes)
+
+
+def mixed_groups(all_equal: float, group: int) -> tuple[float, float]:
+    """``(share, per 1,000 answers)`` of mixed groups, from the all-equal share.
+
+    A mixed group has both a right and a wrong answer, so its share is
+    ``1 - all_equal``. 1,000 generated answers make ``1000 / group`` groups,
+    of which that share are mixed.
+    """
+    share = 1 - all_equal
+    return share, 1000 / group * share
+
+
+def draws_per_question(steps: int, per_step: int, questions: int) -> float:
+    """Average times each training question is drawn over one run."""
+    return steps * per_step / questions
+
+
+def training_takeaway(real: tuple[float, float], control: tuple[float, float]) -> str:
+    """Section 5's takeaway, chosen by the measured ranges of change.
+
+    ``real`` and ``control`` are ``(min, max)`` changes in accuracy over the
+    untrained model, in points, as :func:`change_summary` returns them. They
+    are compared at the one decimal the summary table prints.
+    """
+    real_low, real_high = (round(x, 1) for x in real)
+    ctrl_low, ctrl_high = (round(x, 1) for x in control)
+    if real_high <= 0:
+        return ("The real runs did not improve on the untrained model, so these "
+                "runs show no gain from the reward, whatever the controls did. "
+                "Only the real reward says which answers were right, and here "
+                "that was not enough.")
+    if real_low <= ctrl_high:
+        return ("A shuffled control gained as much as a real run, so these runs "
+                "cannot separate what the reward adds from what the loop itself "
+                "does. Only the real reward says which answers were right, but "
+                "here that did not show up as a larger gain.")
+    if ctrl_high <= 0:
+        return ("The shuffled controls did not improve, so the gain does not come "
+                "from the loop alone. Only the real reward says which answers were "
+                "right, and the real runs gained more than any control.")
+    some = "The" if ctrl_low > 0 else "Some of the"
+    return (f"{some} shuffled controls improved too, so part of the gain comes from "
+            "the loop itself. Only the real reward says which answers were right, "
+            "and the real runs gained more than any control.")
 
 
 def short_label(run_label: str) -> str:
@@ -754,18 +801,27 @@ def groups_and_advantages(rep: Report, model, tokenizer, train, cen: Census, dev
     rep.blank()
     rep.note("Share of groups with all rewards equal (zero advantage, no signal):")
     rep.blank()
-    rows = []
-    for g in (2, 4, 8, 16):
-        if k % g:
-            continue
-        measured = zero_variance_fraction(cen.rewards.reshape(-1, g))
-        rows.append((g, n * k // g, f"{measured:.3f}", f"{analytic_zero_variance(rates, g):.3f}"))
-    rep.table(["G", "groups", "measured", "analytic"], rows)
+    measured = {g: zero_variance_fraction(cen.rewards.reshape(-1, g))
+                for g in (2, 4, 8, 16) if k % g == 0}
+    rep.table(["G", "groups", "measured", "analytic"],
+              [(g, n * k // g, f"{m:.3f}", f"{analytic_zero_variance(rates, g):.3f}")
+               for g, m in measured.items()])
     rep.blank()
     rep.note(f"measured: {k} fresh samples per question, cut into groups of G.")
     rep.note("analytic: mean over questions of p^G + (1-p)^G, with each p")
     rep.note(f"estimated from {k} other samples. p^G + (1-p)^G is convex in p,")
     rep.note("so plugging in an estimated p overstates it (Jensen's inequality).")
+    rep.blank()
+    rep.note("The same measured groups, counted the other way:")
+    rep.blank()
+    rows = []
+    for g, m in measured.items():
+        share, per_1000 = mixed_groups(m, g)
+        rows.append((g, f"{100 * share:.1f}%", f"{per_1000:.0f}"))
+    rep.table(["G", "mixed", "mixed groups per 1,000 answers"], rows)
+    rep.blank()
+    rep.note("mixed: 1 - measured, groups with both a right and a wrong answer.")
+    rep.note("mixed groups per 1,000 answers: (1000 / G) x mixed.")
     rep.takeaway(
         "Only groups with a mix of right and wrong answers move the model. "
         "Bigger groups waste fewer questions, at the cost of more samples per question."
@@ -923,10 +979,15 @@ def training(rep: Report, model, tokenizer, train, test, base: Eval, sizes: Size
     rep.kv("optimizer", f"AdamW, lr {LR:g}, no weight decay")
     rep.kv("steps per run", f"{sizes.steps} ({sizes.steps * PROMPTS_PER_STEP} draws from "
                             f"{len(train)} questions)")
+    if train:  # always, except in tests that fake the training runs
+        draws = draws_per_question(sizes.steps, PROMPTS_PER_STEP, len(train))
+        rep.kv("draws per question", f"{draws:.3f} on average")
     rep.kv("sampling", f"T = {TEMPERATURE}, at most {MAX_NEW_TOKENS} tokens")
 
-    # Every run starts from its own seed (adapters, question order, rollouts,
-    # shuffles), so the order they run in does not change any of them.
+    # Every run reseeds everything it uses (adapters, question order, rollouts,
+    # shuffles), so the order they run in does not change any of them. Control
+    # N uses real run N's seed, so each pair sees the same questions and the
+    # same first-step answers; only which answer gets which reward differs.
     runs = [grpo_train(model, tokenizer, train, test, seed=s, shuffled=False, sizes=sizes,
                        device=device, label=f"GRPO, seed {s}") for s in sizes.seeds]
     runs += [grpo_train(model, tokenizer, train, test, seed=s, shuffled=True, sizes=sizes,
@@ -959,21 +1020,19 @@ def training(rep: Report, model, tokenizer, train, test, base: Eval, sizes: Size
     rep.blank()
     groups = [("GRPO", [r for r in runs if not r.shuffled]),
               ("control: shuffled rewards", [r for r in runs if r.shuffled])]
-    rows = []
+    rows, ranges = [], []
     for name, group in groups:
         mean, low, high = change_summary(base.accuracy, [r.after.accuracy for r in group])
         rows.append((name, len(group), f"{mean:+.1f}", f"{low:+.1f}", f"{high:+.1f}"))
+        ranges.append((low, high))
     rep.table(["model", "runs", "mean", "min", "max"], rows)
     rep.blank()
     counts = sorted({len(group) for _, group in groups})
     each = " and ".join(str(c) for c in counts)
     rep.note(f"{each} run{'s' if counts != [1] else ''} each: min to max is a range, "
              "not an error bar.")
-    rep.takeaway(
-        "The shuffled controls improved too, so part of the gain comes from "
-        "the loop itself. Only the real reward says which answers were right, "
-        "and the real runs gained more than any control."
-    )
+    real, control = ranges
+    rep.takeaway(training_takeaway(real, control))
     return runs
 
 

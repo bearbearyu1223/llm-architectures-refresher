@@ -124,6 +124,18 @@ device memory : 17.2 GB
   estimated from 16 other samples. p^G + (1-p)^G is convex in p,
   so plugging in an estimated p overstates it (Jensen's inequality).
 
+  The same measured groups, counted the other way:
+
+  G   mixed  mixed groups per 1,000 answers
+  -------------------------------------------
+  2   14.6%                              73
+  4   26.7%                              67
+  8   38.9%                              49
+  16  50.8%                              32
+
+  mixed: 1 - measured, groups with both a right and a wrong answer.
+  mixed groups per 1,000 answers: (1000 / G) x mixed.
+
   >> Only groups with a mix of right and wrong answers move the model.
      Bigger groups waste fewer questions, at the cost of more samples per
      question.
@@ -174,6 +186,7 @@ device memory : 17.2 GB
   clip epsilon                       0.2 (inactive at 1 inner step)
   optimizer                          AdamW, lr 3e-05, no weight decay
   steps per run                      60 (480 draws from 256 questions)
+  draws per question                 1.875 on average
   sampling                           T = 1.0, at most 24 tokens
 
   GRPO, seed 0

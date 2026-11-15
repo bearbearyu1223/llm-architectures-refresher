@@ -15,18 +15,21 @@ from llmrefresher.demos.d08_rewards import (
     QUICK,
     analytic_zero_variance,
     change_summary,
+    draws_per_question,
     first_per_problem,
     fixes_from_sampled,
     group_advantages,
     grpo_objective,
     make_problems,
     masked_mean,
+    mixed_groups,
     parse_answer,
     response_mask,
     score,
     short_label,
     show,
     shuffle_within_groups,
+    training_takeaway,
     transitions,
     zero_variance_fraction,
 )
@@ -258,3 +261,60 @@ def test_sizes_have_the_expected_seeds():
 def test_short_label():
     assert short_label("GRPO, seed 2") == "seed 2"
     assert short_label("control: shuffled rewards, seed 1") == "ctrl 1"
+
+
+def test_mixed_groups_from_the_all_equal_share():
+    # 0.611 all-equal at G = 8: 38.9% mixed, 125 groups per 1,000 answers.
+    share, per_1000 = mixed_groups(0.611, 8)
+    assert share == pytest.approx(0.389)
+    assert per_1000 == pytest.approx(125 * 0.389)
+    # The post's G = 2 and G = 16 rows, at the rounding the demo prints.
+    assert f"{mixed_groups(0.854, 2)[1]:.0f}" == "73"
+    assert f"{100 * mixed_groups(0.492, 16)[0]:.1f}" == "50.8"
+    assert f"{mixed_groups(0.492, 16)[1]:.0f}" == "32"
+    assert mixed_groups(1.0, 4) == (0.0, 0.0)
+
+
+def test_draws_per_question():
+    assert draws_per_question(FULL.steps, 8, FULL.train) == 1.875
+    assert draws_per_question(4, 8, 32) == 1.0
+
+
+COMMITTED = ("The shuffled controls improved too, so part of the gain comes from "
+             "the loop itself. Only the real reward says which answers were right, "
+             "and the real runs gained more than any control.")
+
+
+def test_takeaway_committed_results_print_the_posts_text():
+    assert training_takeaway((13.0, 21.5), (4.5, 9.5)) == COMMITTED
+
+
+def test_takeaway_some_controls_improved():
+    text = training_takeaway((13.0, 21.5), (-1.0, 4.5))
+    assert text.startswith("Some of the shuffled controls improved too")
+    assert text.endswith("the real runs gained more than any control.")
+
+
+def test_takeaway_controls_did_not_improve():
+    text = training_takeaway((3.0, 5.0), (-2.0, 0.0))
+    assert text.startswith("The shuffled controls did not improve")
+    assert "gained more than any control" in text
+
+
+def test_takeaway_overlap_includes_a_tie():
+    for control in ((10.0, 14.0), (1.0, 13.0)):
+        text = training_takeaway((13.0, 21.5), control)
+        assert text.startswith("A shuffled control gained as much as a real run")
+        assert "gained more than any control" not in text
+
+
+def test_takeaway_real_runs_did_not_improve():
+    for control in ((-3.0, -1.0), (2.0, 4.0)):
+        text = training_takeaway((-1.0, 0.0), control)
+        assert text.startswith("The real runs did not improve")
+        assert "gained more than any control" not in text
+
+
+def test_takeaway_compares_at_the_printed_decimal():
+    # 13.0 and 12.99999 print alike, so they count as a tie.
+    assert training_takeaway((12.999999, 20.0), (5.0, 13.0)).startswith("A shuffled")

@@ -248,6 +248,11 @@ class BaselineReach:
         return self.wrong - self.wrong_reached
 
     @property
+    def gain(self) -> int:
+        """Problems the eight tries reach beyond greedy's right ones (117 - 75)."""
+        return self.reach - self.greedy_right
+
+    @property
     def gain_points(self) -> float:
         return round(self.reach_pct - self.greedy_pct, 1)
 
@@ -388,7 +393,7 @@ def figure_baseline_reach(theme: Theme, capture: Path = CAPTURE) -> Path:
 
     Top: two separate bars on one problem axis, not stacked, because the
     problems sampling gets right are not greedy's plus some more; the gap
-    between their ends is labelled as a difference of rates. Bottom: the
+    between their ends is labelled in problems, then points. Bottom: the
     problems greedy gets wrong, on the same scale, split into those some
     sample gets right and those none does. Orange is GRPO's sampling, as in
     the section 1 figure.
@@ -425,20 +430,20 @@ def figure_baseline_reach(theme: Theme, capture: Path = CAPTURE) -> Path:
         track(y)
     ax.barh(y_greedy, greedy_x, h, color=grey, alpha=fade, zorder=3)
     ax.barh(y_tries, reach_x, h, color=orange, zorder=3)
-    end_label(greedy_x, y_greedy, f"{b.greedy_pct:.1f}%")
-    end_label(reach_x, y_tries, f"{b.reach_pct:.1f}%")
+    end_label(greedy_x, y_greedy, f"{b.greedy_right} ({b.greedy_pct:.1f}%)")
+    end_label(reach_x, y_tries, f"{b.reach} ({b.reach_pct:.1f}%)")
     row_label(y_greedy, "one greedy guess")
     row_label(y_tries, f"right in ≥1 of {b.samples} tries")
     ax.text((greedy_x + n) / 2, y_greedy, f"{b.wrong} wrong", ha="center", va="center",
             fontsize=10.5, color=theme.secondary, zorder=5)
 
-    # the +21: a bracket from greedy's end down to the eight tries' end, in the gap
+    # the +42 (21 points): a bracket from greedy's end down to the eight tries' end, in the gap
     mid = (y_greedy + y_tries) / 2
     top, bot = y_greedy - h / 2 - 0.04, y_tries + h / 2 + 0.04
     ax.plot([greedy_x, greedy_x, reach_x, reach_x], [top, mid, mid, bot], color=theme.ink,
             linewidth=1.2, zorder=4)
-    ax.text(reach_x + 2, mid, f"{b.gain_points:+.0f} points", ha="left", va="center",
-            fontsize=11, color=theme.ink, zorder=5)
+    ax.text(reach_x + 2, mid, f"{b.gain:+d} problems ({b.gain_points:.0f} points)",
+            ha="left", va="center", fontsize=11, color=theme.ink, zorder=5)
 
     # -- bottom: greedy's misses, on the same scale ------------------------------------
     y_head = y_split + h / 2 + 0.42
