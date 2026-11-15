@@ -1310,10 +1310,10 @@ def figure_clip(theme: Theme, capture: Path = CAPTURE) -> Path:
                     clip_on=False)
         ax.text(hand.ratio_max + 0.03, yb, f"{hand.ratio_min:.4f} to {hand.ratio_max:.4f}",
                 transform=band, ha="left", va="center", fontsize=10, color=theme.ink)
-    axes[0].set_ylabel("one token's surrogate term")
+    axes[0].set_ylabel("one token's term in the objective")
     axes[0].legend(loc="upper left", handlelength=2.6)
     fig.text(0.5, 0.035,
-             f"Under each panel: the range of the ratios after one step on §5's group (s4a), "
+             f"Under each panel: the range of the ratios after one step on the 46 × 32 group, "
              f"right and wrong answers together. The clip didn't keep them in "
              f"[{lo:.1f}, {hi:.1f}].", ha="center", va="center", fontsize=10.2,
              color=theme.secondary)
@@ -1867,7 +1867,7 @@ def figure_rlhf_vs_ours(theme: Theme, capture: Path = CAPTURE) -> Path:
 
     # the differences, between the lanes, under columns 2 and 3 only
     ymid = (lane_a[0] + lane_b[1]) / 2
-    for col, words in [(1, "learned judge can be gamed: reward hacking"),
+    for col, words in [(1, "a learned judge can be gamed"),
                        (2, "value model vs group mean (§4)")]:
         x0, x1 = cols[col]
         ax.text((x0 + x1) / 2, ymid, words, ha="center", va="center", fontsize=10.2,
