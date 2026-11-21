@@ -318,3 +318,150 @@ def test_takeaway_real_runs_did_not_improve():
 def test_takeaway_compares_at_the_printed_decimal():
     # 13.0 and 12.99999 print alike, so they count as a tie.
     assert training_takeaway((12.999999, 20.0), (5.0, 13.0)).startswith("A shuffled")
+
+
+# -- review round 4: the new printed lines (s2's split, s4's step detail) ----------
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+from llmrefresher.demos.d08_rewards import (  # noqa: E402
+    BETA,
+    Extremes,
+    Terms,
+    Token,
+    baseline_split,
+    merge_extremes,
+    reach_split,
+    step_detail,
+    token_extremes,
+)
+from llmrefresher.report import Report  # noqa: E402
+
+
+def _printed(fn, *args) -> list[str]:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(Report("08", "t"), *args)
+    return buf.getvalue().splitlines()
+
+
+def test_reach_split_counts_each_problem_once():
+    greedy = [True, True, False, False, True]
+    sample = [True, False, True, False, True]
+    assert reach_split(greedy, sample) == (2, 1, 1, 1)
+    with pytest.raises(ValueError):
+        reach_split([True], [True, False])
+
+
+def test_baseline_split_prints_the_two_by_two():
+    # the capture's s2a: 75 greedy right, 117 reached, 44 of greedy's 125 misses reached
+    greedy = [True] * 75 + [False] * 125
+    sample = [True] * 73 + [False] * 2 + [True] * 44 + [False] * 81
+    lines = _printed(baseline_split, greedy, sample, 8)
+    assert lines == [
+        "  Greedy against sampling, problem by problem:",
+        "",
+        "  test problems  >=1 of 8 right  none of 8 right  total",
+        "  -------------------------------------------------------",
+        "  greedy right               73                2     75",
+        "  greedy wrong               44               81    125",
+        "  total                     117               83    200",
+    ]
+    assert all(len(line) < 72 and line == line.rstrip() for line in lines)
+
+
+def test_token_extremes_by_hand():
+    ratio = torch.tensor([[1.0, 0.5, 9.0], [2.0, 0.1, 1.0]])
+    r = -ratio.log()
+    kl = r.exp() - r - 1
+    mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])   # 9.0 is padding
+    ext = token_extremes(ratio, r, kl, mask)
+    assert (ext.min_ratio.row, ext.min_ratio.position) == (1, 1)
+    assert ext.min_ratio.ratio == pytest.approx(0.1)
+    assert (ext.max_ratio.row, ext.max_ratio.position) == (1, 0)
+    assert (ext.max_kl.row, ext.max_kl.position) == (1, 1)
+    assert ext.max_kl.kl == pytest.approx(1 / 0.1 + math.log(0.1) - 1, rel=1e-5)
+    assert ext.max_kl.r == pytest.approx(-math.log(0.1), rel=1e-5)
+    assert token_extremes(ratio, r, kl, torch.zeros(2, 3)) is None
+
+
+def test_merge_extremes_takes_the_batch_extremes():
+    def tok(row, ratio, kl):
+        return Token(row, 0, ratio, 0.0, kl)
+    a = Extremes(tok(0, 0.5, 1.0), tok(1, 1.2, 0.1), tok(0, 0.5, 1.0))
+    b = Extremes(tok(9, 0.2, 3.0), tok(8, 1.1, 0.0), tok(9, 0.2, 3.0))
+    m = merge_extremes([a, None, b])
+    assert (m.min_ratio.row, m.max_ratio.row, m.max_kl.row) == (9, 1, 9)
+    assert merge_extremes([None]) is None
+
+
+def test_detail_changes_nothing_in_the_loss():
+    torch.manual_seed(0)
+    logp = -torch.rand(4, 5)
+    old = logp + 0.3 * torch.randn(4, 5)
+    ref = logp + 0.3 * torch.randn(4, 5)
+    adv = torch.tensor([1.0, -1.0, 0.5, -0.5])
+    mask = torch.ones(4, 5)
+    mask[2, 3:] = 0
+    plain = grpo_objective(logp, old, ref, adv, mask)
+    rich = grpo_objective(logp, old, ref, adv, mask, detail=True)
+    assert plain.tokens is None
+    assert torch.equal(plain.loss, rich.loss)
+    assert (plain.kl, plain.ratio_min, plain.ratio_max) == (rich.kl, rich.ratio_min,
+                                                            rich.ratio_max)
+    assert rich.tokens.min_ratio.ratio == rich.ratio_min           # the same tokens the table sees
+    assert rich.tokens.max_ratio.ratio == rich.ratio_max
+    ratio = (logp - old).exp()
+    assert rich.tokens.min_ratio.ratio == pytest.approx(ratio[mask.bool()].min().item())
+
+
+# s4b's eight answers and rewards, as the capture prints them
+S4_TEXTS = ["New York", "1352", "1472", "1452", "1472", "1452", "1472", "1472"]
+S4_REWARDS = [0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0]
+
+
+def _step2(min_row=1, max_row=2) -> Terms:
+    # s4a step 2: KL 4.52e+02, ratios 0.0001 to 1.4386; the reference is the sampler,
+    # so r = -log(ratio) and the estimate is 1/ratio + log(ratio) - 1
+    def tok(row, ratio):
+        r = -math.log(ratio)
+        return Token(row, 0, ratio, r, math.exp(r) - r - 1)
+    low, high = tok(min_row, 1.2e-4), tok(max_row, 1.4386)
+    return Terms(loss=torch.tensor(18.0031), surrogate=0.0580, kl=451.5275,
+                 ratio_min=low.ratio, ratio_max=high.ratio, clipped=0.289,
+                 tokens=Extremes(low, high, low))
+
+
+def test_step_detail_prints_the_kl_and_extreme_tokens():
+    lines = _printed(step_detail, _step2(), 2, S4_TEXTS, S4_REWARDS)
+    assert lines == [
+        "  Step 2, the KL to more digits and the extreme tokens:",
+        "",
+        "  KL, to two decimals                451.53",
+        "  0.04 x KL                          +18.0611",
+        "",
+        "  token           ratio        r   KL est.  answer  reward",
+        "  ----------------------------------------------------------",
+        '  min ratio    1.20e-04   9.0280  8.32e+03  "1352"       0',
+        '  max ratio    1.44e+00  -0.3637  5.88e-02  "1472"       1',
+        '  max KL est.  1.20e-04   9.0280  8.32e+03  "1352"       0',
+        "",
+        "  One token per row, from all 8 answers. r = ref - logp, and",
+        "  KL est. is that token's exp(r) - r - 1, before any averaging.",
+    ]
+    assert BETA == 0.04
+
+
+def test_step_detail_stays_under_72_columns_for_the_longest_answer():
+    texts = ["x" * 40] * 8
+    lines = _printed(step_detail, _step2(min_row=0), 2, texts, S4_REWARDS)
+    assert all(len(line) < 72 and line == line.rstrip() for line in lines)
+    assert max(len(line) for line in lines) <= 70
+
+
+def test_step_detail_needs_detail():
+    plain = Terms(loss=torch.tensor(0.0), surrogate=0.0, kl=0.0, ratio_min=1.0,
+                  ratio_max=1.0, clipped=0.0)
+    with pytest.raises(ValueError):
+        _printed(step_detail, plain, 2, S4_TEXTS, S4_REWARDS)

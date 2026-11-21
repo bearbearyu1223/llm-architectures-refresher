@@ -175,9 +175,9 @@ REAL = d08_figures.CAPTURE.read_text()
 
 @pytest.mark.parametrize("figure, name", [
     (d08_figures.figure_sft_vs_grpo, "sft-vs-grpo"),
-    (d08_figures.figure_baseline_reach, "baseline-reach"),
     (d08_figures.figure_all_equal_groups, "all-equal-groups"),
     (d08_figures.figure_clip, "clip"),
+    (d08_figures.figure_kl_k3, "kl-k3"),
     (d08_figures.figure_grpo_step, "grpo-step"),
     (d08_figures.figure_control_shuffle, "control-shuffle"),
     (d08_figures.figure_training_logs, "training-logs"),
@@ -198,7 +198,8 @@ def test_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
 
 
 def test_every_figure_is_tested():
-    assert len(FIGURES) == 10
+    # ten above, plus baseline-reach, drawn from a capture with s2's split table below
+    assert len(FIGURES) == 11
 
 
 # -- the real capture's numbers ---------------------------------------------------
@@ -401,3 +402,156 @@ def test_spread_keeps_order_and_gap():
     assert sum(out) / len(out) == pytest.approx(sum(ys) / len(ys))     # no drift
     assert spread([0.0, 0.0], 0.2, lo=0.0) == pytest.approx([0.0, 0.2])
     assert spread([1.0, 1.0], 0.2, hi=1.0) == pytest.approx([0.8, 1.0])
+
+
+# -- review round 4 ------------------------------------------------------------------
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+from llmrefresher.demos.d08_figures import (  # noqa: E402
+    about,
+    axis_limits,
+    clip_verdict,
+    k3,
+    parse_reach_split,
+    pool_share,
+)
+from llmrefresher.demos.d08_rewards import baseline_split  # noqa: E402
+from llmrefresher.report import Report  # noqa: E402
+
+SPLIT_ANCHOR = "    of the problems greedy gets wrong 44/125 (35.2%)\n"
+
+
+def with_split(text: str = REAL) -> str:
+    """The capture with s2's split table where the demo now prints it, printed by the
+    demo's own baseline_split from per-problem flags that match s2a's counts."""
+    g, both, s_only, neither = parse_baseline_reach(text).parts
+    greedy = [True] * (both + g) + [False] * (s_only + neither)
+    sample = [True] * both + [False] * g + [True] * s_only + [False] * neither
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rep = Report("08", "t")
+        rep.blank()
+        baseline_split(rep, greedy, sample, 8)
+    assert text.count(SPLIT_ANCHOR) == 1
+    return text.replace(SPLIT_ANCHOR, SPLIT_ANCHOR + buf.getvalue())
+
+
+def test_reward_is_the_demos_rule():
+    assert [reward("1,081"), reward("1081."), reward("1081.0"), reward("= 1081")] == [1, 1, 0, 0]
+
+
+def test_split_round_trip_from_the_demos_printer():
+    split = parse_reach_split(with_split())
+    assert split.parts == parse_baseline_reach(REAL).parts == (2, 73, 44, 81)
+    assert (split.both, split.greedy_only, split.samples_only, split.neither) == (73, 2, 44, 81)
+
+
+def test_baseline_reach_waits_for_the_split_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
+    with pytest.raises(CaptureError, match="test problems  >=1 of 8 right"):
+        d08_figures.figure_baseline_reach(THEMES[0], d08_figures.CAPTURE)
+    cap = tmp_path / "demo08.txt"
+    cap.write_text(with_split())
+    for theme in THEMES:
+        with styled(theme):
+            path = d08_figures.figure_baseline_reach(theme, cap)
+        assert path.name == f"baseline-reach-{theme.name}.png"
+
+
+def test_baseline_reach_uses_no_series_colour(tmp_path, monkeypatch):
+    monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
+    cap = tmp_path / "demo08.txt"
+    cap.write_text(with_split())
+    seen = []
+
+    def keep(fig, slug, name, theme):
+        from matplotlib.colors import to_hex
+        for ax in fig.axes:
+            seen.extend(to_hex(p.get_facecolor()) for p in ax.patches)
+            seen.extend(to_hex(line.get_color()) for line in ax.lines)
+        return tmp_path / "x.png"
+
+    monkeypatch.setattr(d08_figures, "save_both", keep)
+    for theme in THEMES:
+        seen.clear()
+        with styled(theme):
+            d08_figures.figure_baseline_reach(theme, cap)
+        assert seen and not set(seen) & set(theme.series)
+
+
+@pytest.mark.parametrize("old, new", [
+    ("  greedy right               73                2     75",
+     "  greedy right               72                3     75"),     # columns vs s2a
+    ("  total                     117               83    200",
+     "  total                     117               83    201"),     # row doesn't add up
+    ("  greedy wrong               44               81    125\n", ""),  # a row short
+    ("  test problems  >=1 of 8", "  test problem  >=1 of 8"),         # header
+])
+def test_parse_reach_split_rejects(old, new):
+    text = with_split()
+    assert text.count(old) == 1
+    with pytest.raises(CaptureError):
+        parse_reach_split(text.replace(old, new))
+
+
+def test_clip_verdict_follows_the_range():
+    assert clip_verdict(0.0001, 1.4386, 0.8, 1.2) == "The clip didn't keep them in [0.8, 1.2]."
+    assert clip_verdict(0.9, 1.1, 0.8, 1.2) == "They stayed inside [0.8, 1.2]."
+    assert clip_verdict(0.8, 1.2, 0.8, 1.2) == "They stayed inside [0.8, 1.2]."
+    assert clip_verdict(0.85, 1.25, 0.8, 1.2).startswith("The clip didn't")
+
+
+def test_axis_limits():
+    assert axis_limits([13.0, 21.5, 19.5, 9.5, 4.5, 4.5], 1, room=1.25) == (0.0, 27.0)
+    assert axis_limits([73, 67, 49, 32], 20, room=1.08) == (0.0, 80.0)
+    assert axis_limits([0.537, 0.614, 0.047], 0.1) == (0.0, 0.7)
+    assert axis_limits([0.5564, 0.0860], 0.1) == (0.0, 0.7)
+    assert axis_limits([12.40, 4.9], 1) == (0.0, 14.0)
+    lo, hi = axis_limits([13.0, -3.5], 1, room=1.25)                   # a control that lost
+    assert lo <= -3.5 * 1.25 and hi >= 13.0
+    assert axis_limits([0.0, 0.0], 1) == (0.0, 1.0)
+
+
+def test_k3_and_about():
+    assert k3(1.0) == 0.0
+    assert k3(0.0001) == pytest.approx(9989.79, abs=0.01)
+    assert k3(1.4386) == pytest.approx(0.0588, abs=1e-4)
+    assert [about(k3(0.0001)), about(k3(1.4386))] == ["10,000", "0.06"]
+    assert [about(0.096), about(0), about(452)] == ["0.1", "0", "500"]
+    with pytest.raises(ValueError):
+        k3(0.0)
+
+
+def test_kl_k3_needs_a_positive_ratio(tmp_path, monkeypatch):
+    monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
+    cap = tmp_path / "demo08.txt"
+    cap.write_text(REAL.replace("2        0.0001     1.4386", "2        0.0000     1.4386"))
+    with pytest.raises(CaptureError):
+        d08_figures.figure_kl_k3(THEMES[0], cap)
+
+
+def test_hand_update_keeps_the_printed_kl():
+    assert parse_hand_update(REAL).kl == "4.52e+02"
+
+
+def test_pool_share_matches_the_proposal():
+    s = parse_sharpening_split(REAL)
+    inside = [pool_share(r.inside, s.reached) for r in s.runs]
+    outside = [pool_share(r.outside, s.unreached) for r in s.runs]
+    assert inside == ["50%", "61%", "64%", "39%", "30%", "20%"]
+    assert outside == ["12%", "25%", "20%", "9%", "7%", "5%"]
+
+
+def test_training_logs_label_the_kl_peak(tmp_path, monkeypatch):
+    seen = {}
+
+    def keep(fig, slug, name, theme):
+        seen["texts"] = [t.get_text() for ax in fig.axes for t in ax.texts]
+        return tmp_path / "x.png"
+
+    monkeypatch.setattr(d08_figures, "save_both", keep)
+    with styled(THEMES[0]):
+        d08_figures.figure_training_logs(THEMES[0], d08_figures.CAPTURE)
+    assert "0.5564" in seen["texts"] and "0.5233" in seen["texts"]

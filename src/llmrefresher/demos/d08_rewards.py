@@ -187,6 +187,62 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 @dataclass(frozen=True)
+class Token:
+    """One answer token of a batch, for printing: where it is and what it scored."""
+
+    row: int          # the answer, as a row of the batch
+    position: int     # the token's index within that answer
+    ratio: float      # its probability now over its probability when sampled
+    r: float          # ref - logp, the KL estimate's argument
+    kl: float         # its KL estimate, exp(r) - r - 1
+
+
+@dataclass(frozen=True)
+class Extremes:
+    """The answer tokens with the smallest ratio, the largest ratio and the largest
+    KL estimate in a batch."""
+
+    min_ratio: Token
+    max_ratio: Token
+    max_kl: Token
+
+
+def token_extremes(ratio: torch.Tensor, log_ref_ratio: torch.Tensor, kl: torch.Tensor,
+                   mask: torch.Tensor) -> Extremes | None:
+    """The extreme answer tokens of an ``(N, T)`` batch, or None if it has none.
+
+    Only positions where ``mask`` is 1 count. Ties go to the first token in
+    row-major order.
+    """
+    real = mask.bool()
+    if not real.any():
+        return None
+    width = ratio.shape[1]
+
+    def pick(values: torch.Tensor, largest: bool) -> Token:
+        fill = float("-inf") if largest else float("inf")
+        masked = values.detach().masked_fill(~real, fill)
+        flat = int(masked.argmax() if largest else masked.argmin())
+        row, pos = divmod(flat, width)
+        return Token(row, pos, ratio[row, pos].item(),
+                     log_ref_ratio[row, pos].item(), kl[row, pos].item())
+
+    return Extremes(pick(ratio, False), pick(ratio, True), pick(kl, True))
+
+
+def merge_extremes(parts: list[Extremes | None]) -> Extremes | None:
+    """The extremes of a whole batch from its chunks' (first chunk wins a tie)."""
+    parts = [p for p in parts if p is not None]
+    if not parts:
+        return None
+    return Extremes(
+        min((p.min_ratio for p in parts), key=lambda t: t.ratio),
+        max((p.max_ratio for p in parts), key=lambda t: t.ratio),
+        max((p.max_kl for p in parts), key=lambda t: t.kl),
+    )
+
+
+@dataclass(frozen=True)
 class Terms:
     """One evaluation of the GRPO objective, for printing."""
 
@@ -196,6 +252,7 @@ class Terms:
     ratio_min: float
     ratio_max: float
     clipped: float         # share of answer tokens where the clip was active
+    tokens: Extremes | None = None  # only when asked for (``detail``)
 
 
 def grpo_objective(
@@ -206,6 +263,8 @@ def grpo_objective(
     mask: torch.Tensor,
     clip: float = CLIP,
     beta: float = BETA,
+    *,
+    detail: bool = False,
 ) -> Terms:
     """The GRPO loss on a batch of answers, token by token.
 
@@ -218,6 +277,9 @@ def grpo_objective(
     minus ``beta`` times the KL estimate ``exp(ref - logp) - (ref - logp) - 1``
     (always >= 0, and 0 when the two agree). Averaged over each answer's tokens,
     then over answers, as in DeepSeekMath. The loss is its negative.
+
+    ``detail`` also records the extreme tokens (:func:`token_extremes`), for
+    printing; it changes nothing that is computed for the loss.
     """
     adv = advantages.unsqueeze(1)
     ratio = torch.exp(logp - old_logp)
@@ -238,7 +300,20 @@ def grpo_objective(
             ratio_min=ratio[real].min().item() if real.any() else 1.0,
             ratio_max=ratio[real].max().item() if real.any() else 1.0,
             clipped=(active.sum() / real.sum().clamp(min=1)).item(),
+            tokens=token_extremes(ratio, log_ref_ratio, kl, mask) if detail else None,
         )
+
+
+def reach_split(greedy_right: list[bool], sample_right: list[bool]) -> tuple[int, int, int, int]:
+    """``(both, greedy only, samples only, neither)``: the test problems split four ways.
+
+    ``greedy_right`` flags, per problem, that the greedy answer was right;
+    ``sample_right`` that at least one sampled answer was. The four counts are
+    disjoint and add up to the number of problems.
+    """
+    pairs = list(zip(greedy_right, sample_right, strict=True))
+    return (sum(g and s for g, s in pairs), sum(g and not s for g, s in pairs),
+            sum(s and not g for g, s in pairs), sum(not g and not s for g, s in pairs))
 
 
 def transitions(
@@ -568,6 +643,8 @@ def grpo_update(
     advantages: torch.Tensor,
     ref_logp: torch.Tensor,
     inner_steps: int,
+    *,
+    detail: bool = False,
 ) -> list[Terms]:
     """``inner_steps`` gradient steps on one batch of rollouts.
 
@@ -576,6 +653,8 @@ def grpo_update(
     Later steps reuse those old log-probs, the ratio moves away from 1, and the
     clip starts to bind. Gradients are accumulated over row chunks, each chunk
     weighted by its share of the batch, so the step is on the whole batch.
+    ``detail`` records each step's extreme tokens (:class:`Extremes`), rows
+    numbered within ``batch``.
     """
     n = len(batch)
     old_logp: torch.Tensor | None = None
@@ -586,7 +665,8 @@ def grpo_update(
         for s in _chunks(n):
             logp = token_logprobs(model, batch, s)
             old = logp.detach() if k == 0 else old_logp[s]
-            terms = grpo_objective(logp, old, ref_logp[s], advantages[s], batch.mask[s])
+            terms = grpo_objective(logp, old, ref_logp[s], advantages[s], batch.mask[s],
+                                   detail=detail)
             (terms.loss * (s.stop - s.start) / n).backward()
             fresh.append(logp.detach())
             parts.append((terms, s.stop - s.start))
@@ -601,9 +681,19 @@ def grpo_update(
             ratio_min=min(t.ratio_min for t, _ in parts),
             ratio_max=max(t.ratio_max for t, _ in parts),
             clipped=sum(t.clipped * w for t, w in parts) / n,
+            tokens=merge_extremes([_renumber(t.tokens, s.start) for (t, _), s
+                                   in zip(parts, _chunks(n), strict=True)]) if detail else None,
         ))
     model.eval()
     return history
+
+
+def _renumber(ext: Extremes | None, offset: int) -> Extremes | None:
+    """A chunk's extremes with rows numbered within the whole batch."""
+    if ext is None:
+        return None
+    return Extremes(*(replace(t, row=t.row + offset)
+                      for t in (ext.min_ratio, ext.max_ratio, ext.max_kl)))
 
 
 def _optimizer(model: nn.Module) -> torch.optim.Optimizer:
@@ -724,6 +814,8 @@ def the_baseline(rep: Report, model, tokenizer, test, sizes: Sizes, device) -> E
            _pct(int(any_right.sum()), n))
     rep.kv("  of the problems greedy gets wrong",
            _pct(int((any_right & greedy_wrong).sum()), int(greedy_wrong.sum())))
+    rep.blank()
+    baseline_split(rep, [c for c, _ in base.outcomes], any_right.tolist(), k)
     invalid = first_per_problem([not v for v in sampled.valid.tolist()], k)
     if invalid:
         rep.blank()
@@ -735,6 +827,21 @@ def the_baseline(rep: Report, model, tokenizer, test, sizes: Sizes, device) -> E
         "can only make more likely what it already samples."
     )
     return replace(base, sampled_right=tuple(any_right.tolist()), samples=k)
+
+
+def baseline_split(rep: Report, greedy_right: list[bool], sample_right: list[bool],
+                   samples: int) -> None:
+    """The problems counted both ways at once: greedy right or wrong, against
+    right in at least one of ``samples`` samples or in none (:func:`reach_split`)."""
+    both, greedy_only, samples_only, neither = reach_split(greedy_right, sample_right)
+    rep.note("Greedy against sampling, problem by problem:")
+    rep.blank()
+    rep.table(
+        ["test problems", f">=1 of {samples} right", f"none of {samples} right", "total"],
+        [("greedy right", both, greedy_only, both + greedy_only),
+         ("greedy wrong", samples_only, neither, samples_only + neither),
+         ("total", both + samples_only, greedy_only + neither, len(greedy_right))],
+    )
 
 
 # --------------------------------------------------------------------------
@@ -857,7 +964,7 @@ def one_update(rep: Report, model, tokenizer, examples: Batch, device) -> None:
         opt = _optimizer(model)
         ref = all_logprobs(model, group, reference=True)
         before = (all_logprobs(model, group) * group.mask).sum(dim=1).cpu()
-        steps = grpo_update(model, opt, group, adv, ref, HAND_STEPS)
+        steps = grpo_update(model, opt, group, adv, ref, HAND_STEPS, detail=True)
         after = (all_logprobs(model, group) * group.mask).sum(dim=1).cpu()
     finally:
         reset_adapters(model, seed=0)  # the adapters are shared with section 5
@@ -880,6 +987,8 @@ def one_update(rep: Report, model, tokenizer, examples: Batch, device) -> None:
     rep.note("grows exponentially in r; where a ratio crossed the clip in the")
     rep.note("advantage's direction, that token's surrogate gradient is zero.")
     rep.blank()
+    step_detail(rep, steps[-1], HAND_STEPS, group.texts, group.correct.tolist())
+    rep.blank()
     rows = []
     for i in range(GROUP):
         rows.append((show(group.texts[i], 22), int(group.correct[i]), f"{adv[i].item():+.2f}",
@@ -895,6 +1004,33 @@ def one_update(rep: Report, model, tokenizer, examples: Batch, device) -> None:
         "No value network and no labels: the group's own mean is the baseline. "
         "Answers above it are made more likely, answers below it less."
     )
+
+
+def step_detail(rep: Report, terms: Terms, step: int, texts: list[str],
+                rewards: list[float]) -> None:
+    """One step's KL to two decimals and its extreme tokens (``terms.tokens``).
+
+    ``texts`` and ``rewards`` are the batch's answers and rewards, indexed by
+    the tokens' rows.
+    """
+    if terms.tokens is None:
+        raise ValueError("step_detail needs the Terms of a grpo_update(detail=True)")
+    rep.note(f"Step {step}, the KL to more digits and the extreme tokens:")
+    rep.blank()
+    rep.kv("KL, to two decimals", f"{terms.kl:.2f}")
+    rep.kv(f"{BETA} x KL", f"{BETA * terms.kl:+.4f}")
+    rep.blank()
+    t = terms.tokens
+    rep.table(
+        ["token", "ratio", "r", "KL est.", "answer", "reward"],
+        [(name, f"{tok.ratio:.2e}", f"{tok.r:.4f}", f"{tok.kl:.2e}", show(texts[tok.row], 14),
+          int(rewards[tok.row]))
+         for name, tok in [("min ratio", t.min_ratio), ("max ratio", t.max_ratio),
+                           ("max KL est.", t.max_kl)]],
+    )
+    rep.blank()
+    rep.note(f"One token per row, from all {len(texts)} answers. r = ref - logp, and")
+    rep.note("KL est. is that token's exp(r) - r - 1, before any averaging.")
 
 
 # --------------------------------------------------------------------------

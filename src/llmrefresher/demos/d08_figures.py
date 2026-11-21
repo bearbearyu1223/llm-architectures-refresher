@@ -1,14 +1,16 @@
 """Figures for post 8. Kept apart from the demo so the sections stay readable.
 
-Ten figures, in the post's order:
+Eleven figures, in the post's order:
 
 * :func:`figure_sft_vs_grpo` (section 1): one question trained two ways.
 * :func:`figure_baseline_reach` (section 2): the 200 test problems split four
-  ways by greedy and by eight samples.
+  ways by greedy and by eight samples, from the split table printed after s2a.
 * :func:`figure_all_equal_groups` (section 4): groups with no signal, and
   groups that teach something per 1,000 answers, by group size.
-* :func:`figure_clip` (section 5): one token's clipped surrogate against its
+* :func:`figure_clip` (section 5): one token's clipped term against its
   probability ratio.
+* :func:`figure_kl_k3` (section 5): the per-token KL estimate against the
+  probability ratio, with s4a's two extreme ratios marked.
 * :func:`figure_grpo_step` (section 6): one training step as a loop.
 * :func:`figure_control_shuffle` (section 6): section 4's group with its real
   rewards and with one example shuffle of them, as the control would train.
@@ -32,7 +34,9 @@ illustrative permutation the figure labels as an example (the demo doesn't
 print its shuffles); the rewards it reorders are parsed.
 
 Arithmetic on parsed numbers is allowed, and is shown on the figure where it
-produces a drawn number (figure 2's 73 and 2 are 117 - 44 and 75 - 73).
+produces a drawn number: the k3 figure's two estimates are computed from s4a's
+printed ratios and labelled "~". Figure 2 prints how its 73 and 2 follow from
+s2a (117 - 44, 75 - 73), but draws them from the split table that counts them.
 
 Render all ten with ``uv run python -m llmrefresher.demos.d08_figures``
 (``--capture PATH`` to read another capture).
@@ -41,7 +45,9 @@ Render all ten with ``uv run python -m llmrefresher.demos.d08_figures``
 from __future__ import annotations
 
 import argparse
+import math
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,7 +60,7 @@ from .. import plotting
 from ..plotting import THEMES, Theme, ink_for, save_both, styled
 from ..report import WIDTH
 from .d07_figures import _arrow, _box, _canvas, _crop, _lines
-from .d08_rewards import FULL, GROUP, HAND_STEPS, QUESTION, SLUG
+from .d08_rewards import FULL, GROUP, HAND_STEPS, QUESTION, SLUG, score
 
 PROBLEM = (23, 47)  # section 1's example question; checked against the capture
 
@@ -77,8 +83,23 @@ def s1_example(problem: tuple[int, int] = PROBLEM) -> tuple[str, str, str]:
 
 
 def reward(answer: str, problem: tuple[int, int] = PROBLEM) -> int:
-    """The reward rule, for the figure: 1 if the answer is the right integer."""
-    return int(answer == str(problem[0] * problem[1]))
+    """The demo's reward rule (``d08_rewards.score``): 1 if the answer is the
+    right lone integer ("1081", "1,081" and "1081." all count), else 0."""
+    return int(score(answer, problem)[0])
+
+
+def axis_limits(values: list[float], step: float, room: float = 1.1) -> tuple[float, float]:
+    """``(lo, hi)`` for an axis that shows every value with ``room`` to spare.
+
+    ``hi`` is the largest value times ``room``, rounded up to a multiple of
+    ``step``; ``lo`` is 0 unless a value is negative, then the smallest times
+    ``room``, rounded down. So a rerun's values can't fall outside a typed limit.
+    """
+    hi = math.ceil(max(max(values), 0.0) * room / step - 1e-9) * step
+    lo = math.floor(min(min(values), 0.0) * room / step + 1e-9) * step
+    if hi <= lo:
+        hi = lo + step
+    return round(lo, 10) + 0.0, round(hi, 10) + 0.0
 
 
 # --------------------------------------------------------------------------
@@ -314,6 +335,49 @@ def parse_baseline_reach(text: str, sizes=FULL) -> BaselineReach:
     return out
 
 
+def split_header(samples: int) -> str:
+    """The header of s2's split table, as ``d08_rewards.baseline_split`` prints it."""
+    return f"  test problems  >=1 of {samples} right  none of {samples} right  total"
+
+
+@dataclass(frozen=True)
+class ReachSplit:
+    """s2's split table: the test problems by greedy and by sampling, as printed."""
+
+    both: int           # greedy right, some sample right
+    greedy_only: int    # greedy right, no sample right
+    samples_only: int   # greedy wrong, some sample right
+    neither: int
+
+    @property
+    def parts(self) -> tuple[int, int, int, int]:
+        """In the figure's order: greedy only, both, samples only, neither."""
+        return (self.greedy_only, self.both, self.samples_only, self.neither)
+
+
+def parse_reach_split(text: str, sizes=FULL) -> ReachSplit:
+    """The split table printed after s2a, checked against s2a.
+
+    Rows ``greedy right``, ``greedy wrong`` and ``total``; columns right in
+    at least one sample, in none, and the total. Every row and column must
+    add up, and the totals must be s2a's: the problems, pass@k, greedy's
+    right and wrong, and the reach among greedy's misses.
+    """
+    b = parse_baseline_reach(text, sizes)
+    rows = _table(text, S2_SECTION, split_header(b.samples), 3)
+    right, wrong, total = (_int_row(row, label, 3, "s2 split") for row, label in zip(
+        rows, ["greedy right", "greedy wrong", "total"], strict=True))
+    for row, label in [(right, "greedy right"), (wrong, "greedy wrong"), (total, "total")]:
+        if row[0] + row[1] != row[2]:
+            raise CaptureError(f"s2 split {label}: {row[0]} + {row[1]} is not {row[2]}")
+    if [r + w for r, w in zip(right, wrong, strict=True)] != total:
+        raise CaptureError(f"s2 split: columns don't add up to the total row {total}")
+    if (total[2], total[0], right[2], wrong[2], wrong[0]) != (
+            b.problems, b.reach, b.greedy_right, b.wrong, b.wrong_reached):
+        raise CaptureError(f"s2 split {right}, {wrong}, {total} disagrees with s2a")
+    return ReachSplit(right[0], right[1], wrong[0], wrong[1])
+
+
 # -- s3: example groups, all-equal shares, mixed groups ---------------------------
 
 @dataclass(frozen=True)
@@ -447,6 +511,7 @@ class HandUpdate:
     group: ExampleGroup
     ratio_min: float
     ratio_max: float
+    kl: str = ""    # the step's KL, as printed ("4.52e+02")
 
 
 def parse_hand_update(text: str) -> HandUpdate:
@@ -476,7 +541,8 @@ def parse_hand_update(text: str) -> HandUpdate:
         raise CaptureError(f"s4a: ratio min {lo} above max {hi}")
     if not groups[0].mixed:
         raise CaptureError(f"section 4's group {problem} has no mixed rewards")
-    return HandUpdate(groups[0], lo, hi)
+    kl = _match(r"-?\d\.\d\de[+-]\d\d", rows[-1][5], "s4a KL")[0]
+    return HandUpdate(groups[0], lo, hi, kl)
 
 
 # -- s0 and s5a: the setup --------------------------------------------------------
@@ -1047,15 +1113,21 @@ def figure_baseline_reach(theme: Theme, capture: Path = CAPTURE) -> Path:
     """The 200 test problems as one bar, split four ways.
 
     Left to right: greedy right and no sample right (2), both right (73),
-    greedy wrong and some sample right (44), neither (81). Two of these come
-    from arithmetic on s2a's numbers, and the figure prints it: 73 = 117 - 44,
-    2 = 75 - 73. Brackets above mark greedy's 75 right and 125 wrong; the
-    bracket below marks pass@8's 117. Orange is sampling, as in figure 1.
+    greedy wrong and some sample right (44), neither (81), all four from the
+    split table printed after s2a (:func:`parse_reach_split`). The figure
+    also prints how two of them follow from s2a: 73 = 117 - 44, 2 = 75 - 73.
+    Brackets above mark greedy's 75 right and 125 wrong; the bracket below
+    marks pass@8's 117.
+
+    No series colour: drawn before any training, so orange (GRPO) would read
+    as a result. The parts some sample got right are the theme's strong
+    neutral, the rest its light grey.
     """
-    b = parse_baseline_reach(capture.read_text())
+    text = capture.read_text()
+    b = parse_baseline_reach(text)
     n = b.problems
-    greedy_only, both, reached, neither = b.parts
-    orange, grey = theme.series[1], theme.muted
+    greedy_only, both, reached, neither = parse_reach_split(text).parts
+    reach_fill, grey = theme.secondary, theme.muted
     # The two grey parts: solid in light; in dark lifted to a mid grey that
     # reads against the surface (the old 0.28 alpha nearly vanished).
     grey_fill = grey if theme.name == "light" else _over(grey, 0.75, theme.surface)
@@ -1069,8 +1141,8 @@ def figure_baseline_reach(theme: Theme, capture: Path = CAPTURE) -> Path:
 
     segments = [  # (left, width, fill, words inside)
         (0, greedy_only, grey_fill, None),
-        (greedy_only, both, orange, ["greedy right,", "a sample right"]),
-        (greedy_only + both, reached, orange, ["greedy wrong,", "a sample right"]),
+        (greedy_only, both, reach_fill, ["greedy right,", "a sample right"]),
+        (greedy_only + both, reached, reach_fill, ["greedy wrong,", "a sample right"]),
         (greedy_only + both + reached, neither, grey_fill, ["greedy wrong,", "no sample right"]),
     ]
     for left, width, fill, words in segments:
@@ -1109,7 +1181,7 @@ def figure_baseline_reach(theme: Theme, capture: Path = CAPTURE) -> Path:
 
     # below: pass@8
     y_below = y_bar - h / 2 - 0.28
-    _hbracket(ax, greedy_only, greedy_only + both + reached, y_below, 0.16, orange, lw=1.8)
+    _hbracket(ax, greedy_only, greedy_only + both + reached, y_below, 0.16, reach_fill, lw=1.8)
     ax.text((greedy_only + b.reach) / 2 + greedy_only / 2, y_below - 0.3,
             f"right in ≥1 of {b.samples} samples (pass@{b.samples}): "
             f"{b.reach} ({b.reach_pct:.1f}%)",
@@ -1214,8 +1286,9 @@ def figure_all_equal_groups(theme: Theme, capture: Path = CAPTURE) -> Path:
                        xytext=(0, 5), ha="center", va="bottom", fontsize=11.5,
                        fontweight="bold", color=theme.ink, zorder=5)
     _g_ticks(right, gs, accent)
-    right.set_ylim(0, 80)
-    right.set_yticks([0, 20, 40, 60, 80])
+    lo, hi = axis_limits([m.per_1000 for m in mixed], 20, room=1.08)
+    right.set_ylim(lo, hi)
+    right.set_yticks(range(int(lo), int(hi) + 1, 20))
     right.set_ylabel("mixed groups per 1,000 answers")
     right.set_title("Groups that teach something, per 1,000 answers", loc="left", pad=26,
                     fontsize=12.5)
@@ -1238,13 +1311,22 @@ def clipped_surrogate(rho: float, adv: float, eps: float) -> float:
     return min(rho * adv, min(max(rho, 1 - eps), 1 + eps) * adv)
 
 
+def clip_verdict(ratio_min: float, ratio_max: float, lo: float, hi: float) -> str:
+    """The clip figure's last sentence, chosen by where s4a's ratios fell."""
+    if ratio_min < lo or ratio_max > hi:
+        return f"The clip didn't keep them in [{lo:.1f}, {hi:.1f}]."
+    return f"They stayed inside [{lo:.1f}, {hi:.1f}]."
+
+
 def figure_clip(theme: Theme, capture: Path = CAPTURE) -> Path:
-    """One token's clipped surrogate against its ratio, one panel per sign of A.
+    """One token's clipped term against its ratio, one panel per sign of A.
 
     A is section 5's group's own advantage (s3b, 46 x 32: +0.935 for a right
     answer, -0.935 for a wrong one), epsilon is s5a's, and the ratio range
     under both panels is s4a's step 2. That range is drawn the same in both
-    panels: s4a doesn't say which answers' tokens reached which end.
+    panels: s4a doesn't say which answers' tokens reached which end. The
+    footer's verdict on the range is :func:`clip_verdict`'s. The labels say
+    "clipped term", not "surrogate": the post names it after this figure.
     """
     text = capture.read_text()
     hand = parse_hand_update(text)
@@ -1272,8 +1354,8 @@ def figure_clip(theme: Theme, capture: Path = CAPTURE) -> Path:
         ax.axvspan(*flat, color=theme.muted, alpha=0.16 if theme.name == "light" else 0.22,
                    lw=0, zorder=0)
         # under the flat line on the right, above it on the left: clear of both curves
-        ax.text((flat[0] + flat[1]) / 2, (0.45 if adv > 0 else 1.3) * adv, "flat: no\ngradient from\nthe surrogate"
-                if adv > 0 else "flat: no gradient\nfrom the surrogate", ha="center",
+        ax.text((flat[0] + flat[1]) / 2, (0.45 if adv > 0 else 1.3) * adv, "flat: no\ngradient from\nthis term"
+                if adv > 0 else "flat: no gradient\nfrom this term", ha="center",
                 va="center", fontsize=10.2, color=theme.secondary, linespacing=1.2)
         for edge, name in [(lo, "1 − ε"), (hi, "1 + ε")]:
             ax.axvline(edge, color=theme.secondary, lw=0.9, alpha=0.6, zorder=1)
@@ -1285,7 +1367,7 @@ def figure_clip(theme: Theme, capture: Path = CAPTURE) -> Path:
         free = [r for r in rhos if (r >= hi if adv > 0 else r <= lo)]
         ax.plot(free, [r * adv for r in free], color=grey, lw=1.6, linestyle=(0, (4, 3)),
                 zorder=2, label="unclipped: ratio x A")
-        ax.plot(rhos, ys, color=orange, lw=2.6, zorder=3, label="clipped surrogate")
+        ax.plot(rhos, ys, color=orange, lw=2.6, zorder=3, label="clipped term")
         # the first inner step
         ax.plot([1.0], [adv], marker="o", markersize=8, color=theme.ink, zorder=5)
         # the label sits on the side of the curve with open space
@@ -1315,11 +1397,110 @@ def figure_clip(theme: Theme, capture: Path = CAPTURE) -> Path:
     axes[0].legend(loc="upper left", handlelength=2.6)
     fig.text(0.5, 0.035,
              f"Under each panel: the range of the ratios after one step on the {hand.group.problem[0]} × {hand.group.problem[1]} group, "
-             f"right and wrong answers together. The clip didn't keep them in "
-             f"[{lo:.1f}, {hi:.1f}].", ha="center", va="center", fontsize=10.2,
+             f"right and wrong answers together. "
+             f"{clip_verdict(hand.ratio_min, hand.ratio_max, lo, hi)}", ha="center", va="center", fontsize=10.2,
              color=theme.secondary)
     fig.subplots_adjust(left=0.08, right=0.98, top=0.83, bottom=0.24)
     return save_both(fig, SLUG, "clip", theme)
+
+
+# --------------------------------------------------------------------------
+# Section 5: the KL estimate, one token at a time
+# --------------------------------------------------------------------------
+
+def k3(ratio: float) -> float:
+    """One token's KL estimate e^d - d - 1 with d = -log(ratio): 1/ratio + log(ratio) - 1.
+
+    ``ratio`` is policy over reference. In s4a's step 2 the reference is also
+    the sampler, so it is the ratio s4a prints.
+    """
+    if ratio <= 0:
+        raise ValueError(f"ratio {ratio} must be positive")
+    return 1 / ratio + math.log(ratio) - 1
+
+
+def about(x: float) -> str:
+    """``x`` to one significant figure, with thousands commas: 9989.8 is "10,000",
+    0.0588 is "0.06"."""
+    if x == 0:
+        return "0"
+    rounded = round(x, -math.floor(math.log10(abs(x))))
+    return f"{rounded:,.{max(0, -math.floor(math.log10(abs(rounded))))}f}"
+
+
+def _decade_label(v: float) -> str:
+    """A power of ten as plain digits: 0.001, 1, 10,000."""
+    return f"{v:,.{max(0, -round(math.log10(v)))}f}"
+
+
+def figure_kl_k3(theme: Theme, capture: Path = CAPTURE) -> Path:
+    """The per-token KL estimate against the token's probability ratio, log-log.
+
+    One neutral curve, k3 = 1/ratio + log(ratio) - 1, and three marked
+    points: ratio 1 (estimate 0, an arrow to the floor), and s4a's step-2
+    ratio max and min, their estimates computed here from the printed ratios
+    and labelled "~" to one significant figure (s4a prints the ratios to four
+    decimals, so 0.0001 is a range). The dashed line is s4a's step-2 KL, the
+    average over answers, as printed.
+    """
+    hand = parse_hand_update(capture.read_text())
+    if hand.ratio_min <= 0:
+        raise CaptureError(f"s4a's ratio min prints as {hand.ratio_min}; the log-scale curve "
+                           "needs a positive ratio")
+    average = float(hand.kl)
+    lo_est, hi_est = k3(hand.ratio_min), k3(hand.ratio_max)
+    ink, sec = theme.ink, theme.secondary
+
+    x_lo = 10.0 ** math.floor(math.log10(hand.ratio_min))
+    x_hi = max(10.0, 10.0 ** math.ceil(math.log10(hand.ratio_max)))
+    y_lo = 10.0 ** min(-3, math.floor(math.log10(hi_est)))
+    y_hi = 10.0 ** max(5, math.ceil(math.log10(max(lo_est, average))) + 1)
+
+    fig, ax = plt.subplots(figsize=(9.6, 5.6))
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    # a little past the outermost decade, so a point on it isn't cut by the frame
+    ax.set_xlim(x_lo / 10 ** 0.25, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    n = 600
+    xs = [x_lo / 10 ** 0.25 * (x_hi / (x_lo / 10 ** 0.25)) ** (i / n) for i in range(n + 1)]
+    xs = sorted(set(xs + [1.0]))
+    ys = [max(k3(x), y_lo / 10) for x in xs]  # 0 at ratio 1: drawn down to the floor
+    ax.plot(xs, ys, color=ink, lw=2.2, zorder=3)
+
+    ax.axhline(average, color=sec, lw=1.3, linestyle=(0, (5, 3)), zorder=2)
+    ax.text(x_hi / 1.15, average * 1.3, f"step {HAND_STEPS}'s average, {hand.kl}",
+            ha="right", va="bottom", fontsize=10.5, color=ink)
+
+    for x, y in [(hand.ratio_min, lo_est), (hand.ratio_max, hi_est)]:
+        ax.plot([x], [y], marker="o", markersize=8, color=ink, zorder=5, clip_on=False)
+    ax.annotate(f"smallest ratio, {hand.ratio_min:.4f}: ~{about(lo_est)}",
+                (hand.ratio_min, lo_est), xytext=(12, 4), textcoords="offset points",
+                ha="left", va="center", fontsize=10.5, color=ink)
+    ax.annotate(f"largest ratio,\n{hand.ratio_max:.4f}: ~{about(hi_est)}",
+                (hand.ratio_max, hi_est), xytext=(12, -6), textcoords="offset points",
+                ha="left", va="top", fontsize=10.5, color=ink, linespacing=1.2)
+    # the V's tip is the estimate 0 at ratio 1, which a log axis can't show: an
+    # arrow along the floor points at it
+    ax.annotate("ratio 1: 0", (0.93, y_lo * 1.25), xytext=(0.2, y_lo * 1.25),
+                textcoords="data", ha="right", va="center", fontsize=10.5, color=ink,
+                arrowprops=dict(arrowstyle="-|>", color=ink, lw=1.2, shrinkA=4, shrinkB=0,
+                                mutation_scale=12))
+
+    decades_x = [10.0 ** k for k in range(round(math.log10(x_lo)), round(math.log10(x_hi)) + 1)]
+    decades_y = [10.0 ** k for k in range(round(math.log10(y_lo)), round(math.log10(y_hi)) + 1)]
+    ax.set_xticks(decades_x)
+    ax.set_xticklabels([_decade_label(v) for v in decades_x])
+    ax.set_yticks(decades_y)
+    ax.set_yticklabels([_decade_label(v) for v in decades_y])
+    ax.minorticks_off()
+    ax.grid(axis="x", visible=False)
+    ax.set_xlabel("probability ratio, policy / reference (log scale)")
+    ax.set_ylabel("per-token KL estimate (log scale)")
+    ax.set_title("One token pushed down costs far more than one pushed up", loc="left",
+                 fontsize=12.5, pad=12)
+    fig.tight_layout()
+    return save_both(fig, SLUG, "kl-k3", theme)
 
 
 # --------------------------------------------------------------------------
@@ -1520,7 +1701,7 @@ def figure_control_shuffle(theme: Theme, capture: Path = CAPTURE) -> Path:
     group = parse_hand_update(text).group
     answers = parse_group_answers(text, group.problem)
     right = str(group.problem[0] * group.problem[1])
-    if [int(a == right) for a in answers] != list(group.rewards):
+    if [reward(a, group.problem) for a in answers] != list(group.rewards):
         raise CaptureError(f"s3b group {group.problem}: rewards don't mark the answers {right}")
     eps = float(group.eps)
     fake = shuffled(group.rewards)
@@ -1584,7 +1765,7 @@ def figure_control_shuffle(theme: Theme, capture: Path = CAPTURE) -> Path:
                  fill=theme.surface, z=3)
             ax.text(x, y, answer, ha="center", va="center", fontsize=10.5 if len(answer) < 6
                     else 9.6, color=ink, fontweight="bold", zorder=5)
-            if answer == right:
+            if reward(answer, group.problem):
                 _check(ax, x + chip_w / 2 - 0.18, y + chip_h / 2 - 0.2, 0.12, ink)
             ax.text(x, y - dy_reward, str(r), ha="center", va="center", fontsize=12.5,
                     fontweight="bold", color=ink)
@@ -1625,7 +1806,10 @@ def figure_training_logs(theme: Theme, capture: Path = CAPTURE) -> Path:
     Orange solid: GRPO seeds; green dashed: their controls; marker shape is
     the seed. Each line ends in a direct label with its step-60 value (the
     values section 6's bullets quote), spread apart where they would collide,
-    and control 0's step-30 point is called out in every panel.
+    and control 0's step-30 point is called out in every panel. The KL
+    panel's highest point, if it is neither ringed nor an end value, gets its
+    value too (GRPO seed 0 at step 50), without a ring. Each y-axis runs from
+    0 to its largest value plus 10%, rounded up (:func:`axis_limits`).
     """
     logs = parse_training_logs(capture.read_text())
     orange, green = theme.series[1], theme.series[2]
@@ -1634,10 +1818,14 @@ def figure_training_logs(theme: Theme, capture: Path = CAPTURE) -> Path:
     odd = next(g for g in logs if g.control and g.seed == 0)
     odd_step = min(odd.rows, key=lambda r: r.reward).step  # control 0's worst row
 
+    def limits(field: str, step: float) -> tuple[float, float]:
+        return axis_limits([getattr(r, field) for g in logs for r in g.rows], step)
+
     panels = [  # (field, title, subtitle, ylim, format)
-        ("reward", "mean reward", "true reward of the sampled answers", (0, 0.7), "{:.3f}"),
-        ("kl", "KL to the reference", "per-token estimate", (0, 0.6), "{:.4f}"),
-        ("length", "answer length", "tokens", (0, 13), "{:.2f}"),
+        ("reward", "mean reward", "true reward of the sampled answers", limits("reward", 0.1),
+         "{:.3f}"),
+        ("kl", "KL to the reference", "per-token estimate", limits("kl", 0.1), "{:.4f}"),
+        ("length", "answer length", "tokens", limits("length", 1), "{:.2f}"),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.7))
     fig.subplots_adjust(left=0.04, right=0.885, top=0.8, bottom=0.19, wspace=0.72)
@@ -1680,6 +1868,12 @@ def figure_training_logs(theme: Theme, capture: Path = CAPTURE) -> Path:
         ax.annotate(fmt.format(v), (odd_step, v), xytext=(-10, 0 if field == "reward" else 5),
                     textcoords="offset points", ha="right", va="center", fontsize=10.5,
                     fontweight="bold", color=theme.ink, zorder=6)
+        if field == "kl":  # the panel's peak, unless the ring or an end label has it
+            peak_log, peak = max(((g, r) for g in logs for r in g.rows), key=lambda p: p[1].kl)
+            if not ((peak_log is odd and peak.step == odd_step) or peak.step == last):
+                ax.annotate(fmt.format(peak.kl), (peak.step, peak.kl), xytext=(6, 6),
+                            textcoords="offset points", ha="left", va="bottom",
+                            fontsize=10.5, fontweight="bold", color=theme.ink, zorder=6)
     fig.text(0.04, 0.02, f"Each point averages the {steps[0]} steps up to it. Ringed: "
              f"control 0's lowest-reward row, step {odd_step}.", ha="left", va="bottom",
              fontsize=10.2, color=theme.secondary)
@@ -1723,12 +1917,14 @@ def figure_heldout_accuracy(theme: Theme, capture: Path = CAPTURE) -> Path:
     for x, g, c in zip(xs, grpo, ctrl, strict=True):
         for dx, r, color in [(-w / 2 - 0.02, g, orange), (w / 2 + 0.02, c, green)]:
             ax.bar(x + dx, r.change, w, color=color, zorder=3)
+            up = r.change >= 0  # labels beyond the bar's end, above or below
             ax.annotate(f"{r.change:+.1f}", (x + dx, r.change), textcoords="offset points",
-                        xytext=(0, 17), ha="center", va="bottom", fontsize=11.5,
+                        xytext=(0, 17 if up else -17), ha="center",
+                        va="bottom" if up else "top", fontsize=11.5,
                         fontweight="bold", color=theme.ink, zorder=5)
             ax.annotate(f"{r.right:.1f}%", (x + dx, r.change), textcoords="offset points",
-                        xytext=(0, 4), ha="center", va="bottom", fontsize=9.6,
-                        color=theme.secondary, zorder=5)
+                        xytext=(0, 4 if up else -4), ha="center", va="bottom" if up else "top",
+                        fontsize=9.6, color=theme.secondary, zorder=5)
     x_right = len(seeds) - 0.5
     for y, color, label in [(weakest, orange, f"weakest GRPO run {weakest:+.1f}"),
                             (best_ctrl, green, f"best control {best_ctrl:+.1f}")]:
@@ -1742,8 +1938,10 @@ def figure_heldout_accuracy(theme: Theme, capture: Path = CAPTURE) -> Path:
     ax.set_xticklabels([f"seed {k}" for k in seeds], fontsize=11.5)
     ax.tick_params(axis="x", length=0)
     ax.set_xlim(x_left, x_right)
-    ax.set_ylim(0, 27)
-    ax.set_yticks(range(0, 26, 5))
+    # room above (and below) for the two labels on each bar
+    lo, hi = axis_limits([r.change for r in rows[1:]], 1, room=1.25)
+    ax.set_ylim(lo, hi)
+    ax.set_yticks(range(5 * math.ceil(lo / 5), int(hi) + 1, 5))
     ax.grid(axis="x", visible=False)
     for side in ("right", "top"):
         ax.spines[side].set_visible(False)
@@ -1759,12 +1957,18 @@ def figure_heldout_accuracy(theme: Theme, capture: Path = CAPTURE) -> Path:
 # Section 7: the sharpening split
 # --------------------------------------------------------------------------
 
+def pool_share(count: int, pool: int) -> str:
+    """``count`` as a whole-number percent of ``pool``: 22 of 44 is "50%"."""
+    return f"{100 * count / pool:.0f}%"
+
+
 def figure_sharpening_split(theme: Theme, capture: Path = CAPTURE) -> Path:
     """Fixed problems inside and outside the 44, one panel each, seed-paired.
 
     Each panel's y-axis runs to its own pool (s2a's 44, and 125 - 44 = 81,
     printed with its arithmetic), and the panels are the same size, so bar
-    height is the share of the pool fixed. Bars are s6c's counts.
+    height is the share of the pool fixed. Bars are s6c's counts; under each
+    count, its share of the panel's pool (:func:`pool_share`).
     """
     split = parse_sharpening_split(capture.read_text())
     orange, green = theme.series[1], theme.series[2]
@@ -1788,9 +1992,12 @@ def figure_sharpening_split(theme: Theme, capture: Path = CAPTURE) -> Path:
             for dx, r, color in [(-w / 2 - 0.02, g, orange), (w / 2 + 0.02, c, green)]:
                 v = getattr(r, field)
                 ax.bar(x + dx, v, w, color=color, zorder=3)
-                ax.annotate(str(v), (x + dx, v), textcoords="offset points", xytext=(0, 4),
+                ax.annotate(str(v), (x + dx, v), textcoords="offset points", xytext=(0, 17),
                             ha="center", va="bottom", fontsize=11.5, fontweight="bold",
                             color=theme.ink, zorder=5)
+                ax.annotate(pool_share(v, pool), (x + dx, v), textcoords="offset points",
+                            xytext=(0, 4), ha="center", va="bottom", fontsize=9.6,
+                            color=theme.secondary, zorder=5)
         ax.axhline(pool, color=theme.secondary, lw=1.3, linestyle=(0, (5, 3)), zorder=2)
         ax.text(len(seeds) - 0.45, pool, f"all {pool}", ha="right", va="bottom",
                 fontsize=10.5, color=theme.ink)
@@ -1804,12 +2011,13 @@ def figure_sharpening_split(theme: Theme, capture: Path = CAPTURE) -> Path:
         ax.set_title(title, loc="left", fontsize=12.5, pad=24)
         ax.text(0, 1.035, sub, transform=ax.transAxes, ha="left", va="bottom", fontsize=10.2,
                 color=theme.secondary)
-    axes[0].legend(handles=[Patch(facecolor=orange, label="GRPO, real rewards"),
+    # in the right panel's empty upper part, clear of its "all" line
+    axes[1].legend(handles=[Patch(facecolor=orange, label="GRPO, real rewards"),
                             Patch(facecolor=green, label="control, shuffled rewards (same seed)")],
-                   loc="upper left", bbox_to_anchor=(0, 0.92), fontsize=10.2,
-                   frameon=True, facecolor=theme.surface, edgecolor=theme.surface,
-                   framealpha=1.0)
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.84, bottom=0.1)
+                   loc="upper right", bbox_to_anchor=(1.0, 0.9), fontsize=10.2)
+    fig.suptitle("Problems fixed after training, as a share of each pool", x=0.07, y=0.985,
+                 ha="left", fontsize=13.5, fontweight="bold", color=theme.ink)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.8, bottom=0.1)
     return save_both(fig, SLUG, "sharpening-split", theme)
 
 
@@ -1892,7 +2100,7 @@ def figure_rlhf_vs_ours(theme: Theme, capture: Path = CAPTURE) -> Path:
 
 
 FIGURES = (figure_sft_vs_grpo, figure_baseline_reach, figure_all_equal_groups, figure_clip,
-           figure_grpo_step, figure_control_shuffle, figure_training_logs,
+           figure_kl_k3, figure_grpo_step, figure_control_shuffle, figure_training_logs,
            figure_heldout_accuracy, figure_sharpening_split, figure_rlhf_vs_ours)
 
 
@@ -1901,10 +2109,19 @@ def main() -> None:
     parser.add_argument("--capture", type=Path, default=None,
                         help="demo 08 stdout to read (default outputs/demo08.txt)")
     capture = parser.parse_args().capture or CAPTURE
+    missing = []
     for theme in THEMES:
         with styled(theme):
             for figure in FIGURES:
-                print(figure(theme, capture))
+                try:
+                    print(figure(theme, capture))
+                except CaptureError as e:  # draw the rest; say which one couldn't be
+                    plt.close("all")
+                    missing.append(figure.__name__)
+                    print(f"not drawn: {figure.__name__} ({theme.name}): {e}", file=sys.stderr)
+    if missing:
+        raise SystemExit(f"{len(set(missing))} figure(s) not drawn from {capture}: "
+                         + ", ".join(dict.fromkeys(missing)))
 
 
 if __name__ == "__main__":
