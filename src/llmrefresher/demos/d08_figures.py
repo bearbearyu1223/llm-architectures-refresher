@@ -34,9 +34,8 @@ illustrative permutation the figure labels as an example (the demo doesn't
 print its shuffles); the rewards it reorders are parsed.
 
 Arithmetic on parsed numbers is allowed, and is shown on the figure where it
-produces a drawn number: the k3 figure's two estimates are computed from s4a's
-printed ratios and labelled "~". Figure 2 prints how its 73 and 2 follow from
-s2a (117 - 44, 75 - 73), but draws them from the split table that counts them.
+produces a drawn number. Figure 2's counts and the k3 figure's two points are
+read from the tables that print them, not derived.
 
 Render all ten with ``uv run python -m llmrefresher.demos.d08_figures``
 (``--capture PATH`` to read another capture).
@@ -348,6 +347,10 @@ class ReachSplit:
     greedy_only: int    # greedy right, no sample right
     samples_only: int   # greedy wrong, some sample right
     neither: int
+    greedy_right: int   # the printed totals: row "greedy right"
+    greedy_wrong: int   # row "greedy wrong"
+    reach: int          # row "total", column ">=1 of k right" (pass@k)
+    problems: int       # row "total", column "total"
 
     @property
     def parts(self) -> tuple[int, int, int, int]:
@@ -359,23 +362,32 @@ def parse_reach_split(text: str, sizes=FULL) -> ReachSplit:
     """The split table printed after s2a, checked against s2a.
 
     Rows ``greedy right``, ``greedy wrong`` and ``total``; columns right in
-    at least one sample, in none, and the total. Every row and column must
-    add up, and the totals must be s2a's: the problems, pass@k, greedy's
-    right and wrong, and the reach among greedy's misses.
+    at least one sample, in none, and the total. The printed totals must
+    reconcile with the four parts (73 + 2 = 75, 73 + 44 = 117, 44 + 81 =
+    125, all four = 200) and with s2a: the problems, pass@k, greedy's right
+    and wrong, and the reach among greedy's misses.
     """
     b = parse_baseline_reach(text, sizes)
     rows = _table(text, S2_SECTION, split_header(b.samples), 3)
     right, wrong, total = (_int_row(row, label, 3, "s2 split") for row, label in zip(
         rows, ["greedy right", "greedy wrong", "total"], strict=True))
-    for row, label in [(right, "greedy right"), (wrong, "greedy wrong"), (total, "total")]:
-        if row[0] + row[1] != row[2]:
-            raise CaptureError(f"s2 split {label}: {row[0]} + {row[1]} is not {row[2]}")
-    if [r + w for r, w in zip(right, wrong, strict=True)] != total:
-        raise CaptureError(f"s2 split: columns don't add up to the total row {total}")
-    if (total[2], total[0], right[2], wrong[2], wrong[0]) != (
+    both, greedy_only, samples_only, neither = right[0], right[1], wrong[0], wrong[1]
+    checks = [  # (what, left side, printed total)
+        ("greedy right: both + greedy only", both + greedy_only, right[2]),
+        ("greedy wrong: samples only + neither", samples_only + neither, wrong[2]),
+        ("pass@k: both + samples only", both + samples_only, total[0]),
+        ("no sample right: greedy only + neither", greedy_only + neither, total[1]),
+        ("all problems: the four parts", both + greedy_only + samples_only + neither, total[2]),
+        ("all problems: greedy right + wrong", right[2] + wrong[2], total[2]),
+    ]
+    for what, got, printed in checks:
+        if got != printed:
+            raise CaptureError(f"s2 split, {what}: {got}, but the table prints {printed}")
+    if (total[2], total[0], right[2], wrong[2], samples_only) != (
             b.problems, b.reach, b.greedy_right, b.wrong, b.wrong_reached):
         raise CaptureError(f"s2 split {right}, {wrong}, {total} disagrees with s2a")
-    return ReachSplit(right[0], right[1], wrong[0], wrong[1])
+    return ReachSplit(both, greedy_only, samples_only, neither, right[2], wrong[2], total[0],
+                      total[2])
 
 
 # -- s3: example groups, all-equal shares, mixed groups ---------------------------
@@ -543,6 +555,89 @@ def parse_hand_update(text: str) -> HandUpdate:
         raise CaptureError(f"section 4's group {problem} has no mixed rewards")
     kl = _match(r"-?\d\.\d\de[+-]\d\d", rows[-1][5], "s4a KL")[0]
     return HandUpdate(groups[0], lo, hi, kl)
+
+
+# -- s4: step 2's detail (KL to two decimals, the extreme tokens) ------------------
+
+_DETAIL_HEAD = re.compile(r"  token +ratio +r +KL est\. +answer +reward")
+_DETAIL_ROW = re.compile(r'  (min ratio|max ratio|max KL est\.) +(\d\.\d\de[+-]\d\d) +(-?\d+\.\d{4}) '
+                         r'+(\d\.\d\de[+-]\d\d) +"(.*)" +([01])')
+
+
+@dataclass(frozen=True)
+class ExtremeToken:
+    """One row of section 4's extreme-token table, numbers with their printed text."""
+
+    ratio: float
+    ratio_text: str     # "9.27e-05"
+    r: float
+    kl: float
+    kl_text: str        # "1.08e+04"
+    answer: str
+    reward: int
+
+
+@dataclass(frozen=True)
+class StepDetail:
+    """Section 4's step-2 detail: the KL to two decimals and the extreme tokens."""
+
+    kl: float                 # 451.53
+    min_ratio: ExtremeToken
+    max_ratio: ExtremeToken
+    max_kl: ExtremeToken
+
+
+def detail_title(step: int = HAND_STEPS) -> str:
+    """The detail block's first line, as ``d08_rewards.step_detail`` prints it."""
+    return f"  Step {step}, the KL to more digits and the extreme tokens:"
+
+
+def parse_step_detail(text: str) -> StepDetail:
+    """The detail block printed after s4a, checked against s4a and itself.
+
+    Its title, the ``KL, to two decimals`` line, then a table of three rows
+    (min ratio, max ratio, max KL est.). Checks: the KL rounds to s4a's
+    printed KL; the min and max ratios round to s4a's four-decimal ones;
+    min <= max; each estimate is exp(r) - r - 1 to its printed digits; the
+    max-KL row has the largest estimate; and each answer's reward is the
+    reward rule's for section 4's question.
+    """
+    hand = parse_hand_update(text)
+    lines = _section(text, S4_SECTION)
+    starts = [i for i, line in enumerate(lines) if line == detail_title()]
+    if len(starts) != 1:
+        raise CaptureError(f"expected one {detail_title().strip()!r} line in section 4, "
+                           f"found {len(starts)}")
+    block = lines[starts[0]:]
+    kl = float(_match(r"\d+\.\d\d", _kv(block, "KL, to two decimals", "section 4's detail"),
+                      "s4 detail KL")[0])
+    heads = [i for i, line in enumerate(block) if _DETAIL_HEAD.fullmatch(line)]
+    if not heads or not re.fullmatch(r"  -+", block[heads[0] + 1]):
+        raise CaptureError("section 4's detail has no extreme-token table")
+    rows = {}
+    for line in block[heads[0] + 2:heads[0] + 5]:
+        m = _DETAIL_ROW.fullmatch(line)
+        if m is None:
+            raise CaptureError(f"s4 detail row {line!r} is not in the printed format")
+        name, ratio, r, est, answer, rew = m.groups()
+        token = ExtremeToken(float(ratio), ratio, float(r), float(est), est, answer, int(rew))
+        if abs(math.exp(token.r) - token.r - 1 - token.kl) > 0.006 * token.kl + 1e-6:
+            raise CaptureError(f"s4 detail {name}: {est} is not exp(r) - r - 1 for r = {r}")
+        if token.reward != reward(answer, hand.group.problem):
+            raise CaptureError(f"s4 detail {name}: {answer!r} doesn't get reward {rew}")
+        rows[name] = token
+    if list(rows) != ["min ratio", "max ratio", "max KL est."]:
+        raise CaptureError(f"s4 detail rows {list(rows)}: expected min ratio, max ratio, "
+                           "max KL est.")
+    low, high, top = rows["min ratio"], rows["max ratio"], rows["max KL est."]
+    if f"{kl:.2e}" != hand.kl and abs(kl - float(hand.kl)) > 0.0051 * abs(kl):
+        raise CaptureError(f"s4 detail KL {kl} is not s4a's {hand.kl}")
+    for token, printed in [(low, hand.ratio_min), (high, hand.ratio_max)]:
+        if abs(token.ratio - printed) > 0.00005 + 0.005 * token.ratio:
+            raise CaptureError(f"s4 detail ratio {token.ratio_text} is not s4a's {printed:.4f}")
+    if not low.ratio <= high.ratio or top.kl < max(low.kl, high.kl):
+        raise CaptureError("s4 detail: the extremes are out of order")
+    return StepDetail(kl, low, high, top)
 
 
 # -- s0 and s5a: the setup --------------------------------------------------------
@@ -1114,19 +1209,19 @@ def figure_baseline_reach(theme: Theme, capture: Path = CAPTURE) -> Path:
 
     Left to right: greedy right and no sample right (2), both right (73),
     greedy wrong and some sample right (44), neither (81), all four from the
-    split table printed after s2a (:func:`parse_reach_split`). The figure
-    also prints how two of them follow from s2a: 73 = 117 - 44, 2 = 75 - 73.
-    Brackets above mark greedy's 75 right and 125 wrong; the bracket below
-    marks pass@8's 117.
+    split table printed after s2a (:func:`parse_reach_split`), as are the
+    totals the brackets mark: greedy's 75 right and 125 wrong above, pass@8's
+    117 below. Only the two percents and the sample count come from s2a.
 
     No series colour: drawn before any training, so orange (GRPO) would read
     as a result. The parts some sample got right are the theme's strong
     neutral, the rest its light grey.
     """
     text = capture.read_text()
-    b = parse_baseline_reach(text)
-    n = b.problems
-    greedy_only, both, reached, neither = parse_reach_split(text).parts
+    b = parse_baseline_reach(text)  # the percents and the sample count
+    split = parse_reach_split(text)
+    n = split.problems
+    greedy_only, both, reached, neither = split.parts
     reach_fill, grey = theme.secondary, theme.muted
     # The two grey parts: solid in light; in dark lifted to a mid grey that
     # reads against the surface (the old 0.28 alpha nearly vanished).
@@ -1171,26 +1266,22 @@ def figure_baseline_reach(theme: Theme, capture: Path = CAPTURE) -> Path:
 
     # above: greedy's split, 75 right and 125 wrong
     y_above = y_bar + h / 2 + 0.28
-    _hbracket(ax, 0, b.greedy_right, y_above, -0.16, theme.secondary)
-    ax.text(b.greedy_right / 2, y_above + 0.26,
-            f"one greedy guess right: {b.greedy_right} ({b.greedy_pct:.1f}%)",
+    _hbracket(ax, 0, split.greedy_right, y_above, -0.16, theme.secondary)
+    ax.text(split.greedy_right / 2, y_above + 0.26,
+            f"one greedy guess right: {split.greedy_right} ({b.greedy_pct:.1f}%)",
             ha="center", va="center", fontsize=11, color=theme.ink)
-    _hbracket(ax, b.greedy_right, n, y_above, -0.16, theme.secondary, lw=1.0)
-    ax.text((b.greedy_right + n) / 2, y_above + 0.26, f"the {b.wrong} greedy gets wrong",
+    _hbracket(ax, split.greedy_right, n, y_above, -0.16, theme.secondary, lw=1.0)
+    ax.text((split.greedy_right + n) / 2, y_above + 0.26,
+            f"the {split.greedy_wrong} greedy gets wrong",
             ha="center", va="center", fontsize=11, color=theme.secondary)
 
     # below: pass@8
     y_below = y_bar - h / 2 - 0.28
     _hbracket(ax, greedy_only, greedy_only + both + reached, y_below, 0.16, reach_fill, lw=1.8)
-    ax.text((greedy_only + b.reach) / 2 + greedy_only / 2, y_below - 0.3,
+    ax.text((greedy_only + split.reach) / 2 + greedy_only / 2, y_below - 0.3,
             f"right in ≥1 of {b.samples} samples (pass@{b.samples}): "
-            f"{b.reach} ({b.reach_pct:.1f}%)",
+            f"{split.reach} ({b.reach_pct:.1f}%)",
             ha="center", va="center", fontsize=11, color=theme.ink, fontweight="bold")
-
-    # the derived parts, with their arithmetic
-    ax.text(n, y_below - 0.3,
-            f"{both} = {b.reach} − {reached}\n{greedy_only} = {b.greedy_right} − {both}",
-            ha="right", va="center", fontsize=9.6, color=theme.secondary, linespacing=1.3)
 
     ax.text(0, 4.4, f"The untrained model on {n} test problems", ha="left", va="center",
             fontsize=12.5, fontweight="bold", color=theme.ink)
@@ -1419,15 +1510,6 @@ def k3(ratio: float) -> float:
     return 1 / ratio + math.log(ratio) - 1
 
 
-def about(x: float) -> str:
-    """``x`` to one significant figure, with thousands commas: 9989.8 is "10,000",
-    0.0588 is "0.06"."""
-    if x == 0:
-        return "0"
-    rounded = round(x, -math.floor(math.log10(abs(x))))
-    return f"{rounded:,.{max(0, -math.floor(math.log10(abs(rounded))))}f}"
-
-
 def _decade_label(v: float) -> str:
     """A power of ten as plain digits: 0.001, 1, 10,000."""
     return f"{v:,.{max(0, -round(math.log10(v)))}f}"
@@ -1437,33 +1519,32 @@ def figure_kl_k3(theme: Theme, capture: Path = CAPTURE) -> Path:
     """The per-token KL estimate against the token's probability ratio, log-log.
 
     One neutral curve, k3 = 1/ratio + log(ratio) - 1, and three marked
-    points: ratio 1 (estimate 0, an arrow to the floor), and s4a's step-2
-    ratio max and min, their estimates computed here from the printed ratios
-    and labelled "~" to one significant figure (s4a prints the ratios to four
-    decimals, so 0.0001 is a range). The dashed line is s4a's step-2 KL, the
-    average over answers, as printed.
+    points: ratio 1 (estimate 0, an arrow to the floor), and the tokens with
+    s4a's step-2 smallest and largest ratio, each drawn at its own printed
+    (ratio, KL est.) from section 4's detail table (:func:`parse_step_detail`)
+    and labelled with those printed values. The dashed line is s4a's step-2
+    KL, the average over answers, as printed.
     """
-    hand = parse_hand_update(capture.read_text())
-    if hand.ratio_min <= 0:
-        raise CaptureError(f"s4a's ratio min prints as {hand.ratio_min}; the log-scale curve "
-                           "needs a positive ratio")
+    text = capture.read_text()
+    hand = parse_hand_update(text)
+    detail = parse_step_detail(text)
+    low, high = detail.min_ratio, detail.max_ratio
     average = float(hand.kl)
-    lo_est, hi_est = k3(hand.ratio_min), k3(hand.ratio_max)
     ink, sec = theme.ink, theme.secondary
 
-    x_lo = 10.0 ** math.floor(math.log10(hand.ratio_min))
-    x_hi = max(10.0, 10.0 ** math.ceil(math.log10(hand.ratio_max)))
-    y_lo = 10.0 ** min(-3, math.floor(math.log10(hi_est)))
-    y_hi = 10.0 ** max(5, math.ceil(math.log10(max(lo_est, average))) + 1)
+    # a quarter-decade past the smallest ratio, so its point isn't cut by the frame
+    x_left = low.ratio / 10 ** 0.25
+    x_hi = max(10.0, 10.0 ** math.ceil(math.log10(high.ratio)))
+    y_lo = 10.0 ** min(-3, math.floor(math.log10(high.kl)))
+    y_hi = 10.0 ** max(5, math.ceil(math.log10(3 * max(low.kl, average))))
 
     fig, ax = plt.subplots(figsize=(9.6, 5.6))
     ax.set_xscale("log")
     ax.set_yscale("log")
-    # a little past the outermost decade, so a point on it isn't cut by the frame
-    ax.set_xlim(x_lo / 10 ** 0.25, x_hi)
+    ax.set_xlim(x_left, x_hi)
     ax.set_ylim(y_lo, y_hi)
     n = 600
-    xs = [x_lo / 10 ** 0.25 * (x_hi / (x_lo / 10 ** 0.25)) ** (i / n) for i in range(n + 1)]
+    xs = [x_left * (x_hi / x_left) ** (i / n) for i in range(n + 1)]
     xs = sorted(set(xs + [1.0]))
     ys = [max(k3(x), y_lo / 10) for x in xs]  # 0 at ratio 1: drawn down to the floor
     ax.plot(xs, ys, color=ink, lw=2.2, zorder=3)
@@ -1472,13 +1553,14 @@ def figure_kl_k3(theme: Theme, capture: Path = CAPTURE) -> Path:
     ax.text(x_hi / 1.15, average * 1.3, f"step {HAND_STEPS}'s average, {hand.kl}",
             ha="right", va="bottom", fontsize=10.5, color=ink)
 
-    for x, y in [(hand.ratio_min, lo_est), (hand.ratio_max, hi_est)]:
-        ax.plot([x], [y], marker="o", markersize=8, color=ink, zorder=5, clip_on=False)
-    ax.annotate(f"smallest ratio, {hand.ratio_min:.4f}: ~{about(lo_est)}",
-                (hand.ratio_min, lo_est), xytext=(12, 4), textcoords="offset points",
+    for t in (low, high):
+        ax.plot([t.ratio], [t.kl], marker="o", markersize=8, color=ink, zorder=5,
+                clip_on=False)
+    ax.annotate(f"smallest ratio {low.ratio_text}, estimate {low.kl_text}",
+                (low.ratio, low.kl), xytext=(12, 4), textcoords="offset points",
                 ha="left", va="center", fontsize=10.5, color=ink)
-    ax.annotate(f"largest ratio,\n{hand.ratio_max:.4f}: ~{about(hi_est)}",
-                (hand.ratio_max, hi_est), xytext=(12, -6), textcoords="offset points",
+    ax.annotate(f"largest ratio {high.ratio_text},\nestimate {high.kl_text}",
+                (high.ratio, high.kl), xytext=(12, -6), textcoords="offset points",
                 ha="left", va="top", fontsize=10.5, color=ink, linespacing=1.2)
     # the V's tip is the estimate 0 at ratio 1, which a log axis can't show: an
     # arrow along the floor points at it
@@ -1487,7 +1569,8 @@ def figure_kl_k3(theme: Theme, capture: Path = CAPTURE) -> Path:
                 arrowprops=dict(arrowstyle="-|>", color=ink, lw=1.2, shrinkA=4, shrinkB=0,
                                 mutation_scale=12))
 
-    decades_x = [10.0 ** k for k in range(round(math.log10(x_lo)), round(math.log10(x_hi)) + 1)]
+    decades_x = [10.0 ** k for k in range(math.ceil(math.log10(x_left)),
+                                          round(math.log10(x_hi)) + 1)]
     decades_y = [10.0 ** k for k in range(round(math.log10(y_lo)), round(math.log10(y_hi)) + 1)]
     ax.set_xticks(decades_x)
     ax.set_xticklabels([_decade_label(v) for v in decades_x])

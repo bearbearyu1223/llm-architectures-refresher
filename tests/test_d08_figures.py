@@ -177,7 +177,6 @@ REAL = d08_figures.CAPTURE.read_text()
     (d08_figures.figure_sft_vs_grpo, "sft-vs-grpo"),
     (d08_figures.figure_all_equal_groups, "all-equal-groups"),
     (d08_figures.figure_clip, "clip"),
-    (d08_figures.figure_kl_k3, "kl-k3"),
     (d08_figures.figure_grpo_step, "grpo-step"),
     (d08_figures.figure_control_shuffle, "control-shuffle"),
     (d08_figures.figure_training_logs, "training-logs"),
@@ -198,7 +197,8 @@ def test_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
 
 
 def test_every_figure_is_tested():
-    # ten above, plus baseline-reach, drawn from a capture with s2's split table below
+    # nine above, plus baseline-reach and kl-k3, drawn below from a capture with the
+    # demo's new lines (s2's split table, s4's step detail)
     assert len(FIGURES) == 11
 
 
@@ -410,14 +410,20 @@ import contextlib  # noqa: E402
 import io  # noqa: E402
 
 from llmrefresher.demos.d08_figures import (  # noqa: E402
-    about,
     axis_limits,
     clip_verdict,
     k3,
     parse_reach_split,
+    parse_step_detail,
     pool_share,
 )
-from llmrefresher.demos.d08_rewards import baseline_split  # noqa: E402
+from llmrefresher.demos.d08_rewards import (  # noqa: E402
+    Extremes,
+    Terms,
+    Token,
+    baseline_split,
+    step_detail,
+)
 from llmrefresher.report import Report  # noqa: E402
 
 SPLIT_ANCHOR = "    of the problems greedy gets wrong 44/125 (35.2%)\n"
@@ -446,6 +452,8 @@ def test_split_round_trip_from_the_demos_printer():
     split = parse_reach_split(with_split())
     assert split.parts == parse_baseline_reach(REAL).parts == (2, 73, 44, 81)
     assert (split.both, split.greedy_only, split.samples_only, split.neither) == (73, 2, 44, 81)
+    assert (split.greedy_right, split.greedy_wrong, split.reach, split.problems) == (
+        75, 125, 117, 200)
 
 
 def test_baseline_reach_waits_for_the_split_table(tmp_path, monkeypatch):
@@ -488,6 +496,10 @@ def test_baseline_reach_uses_no_series_colour(tmp_path, monkeypatch):
      "  total                     117               83    201"),     # row doesn't add up
     ("  greedy wrong               44               81    125\n", ""),  # a row short
     ("  test problems  >=1 of 8", "  test problem  >=1 of 8"),         # header
+    ("  greedy wrong               44               81    125",
+     "  greedy wrong               44               81    126"),     # 44 + 81 != 125
+    ("  total                     117               83    200",
+     "  total                     118               83    200"),     # 73 + 44 != 117
 ])
 def test_parse_reach_split_rejects(old, new):
     text = with_split()
@@ -514,22 +526,116 @@ def test_axis_limits():
     assert axis_limits([0.0, 0.0], 1) == (0.0, 1.0)
 
 
-def test_k3_and_about():
+def test_k3():
     assert k3(1.0) == 0.0
     assert k3(0.0001) == pytest.approx(9989.79, abs=0.01)
     assert k3(1.4386) == pytest.approx(0.0588, abs=1e-4)
-    assert [about(k3(0.0001)), about(k3(1.4386))] == ["10,000", "0.06"]
-    assert [about(0.096), about(0), about(452)] == ["0.1", "0", "500"]
     with pytest.raises(ValueError):
         k3(0.0)
 
 
-def test_kl_k3_needs_a_positive_ratio(tmp_path, monkeypatch):
-    monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
-    cap = tmp_path / "demo08.txt"
-    cap.write_text(REAL.replace("2        0.0001     1.4386", "2        0.0000     1.4386"))
+# Section 4's detail block exactly as `uv run demo08 --quick` printed it; section 4
+# there matched the full capture's s4a and s4b byte for byte.
+QUICK_DETAIL = """\
+  Step 2, the KL to more digits and the extreme tokens:
+
+  KL, to two decimals                451.53
+  0.04 x KL                          +18.0611
+
+  token           ratio        r   KL est.      answer  reward
+  --------------------------------------------------------------
+  min ratio    9.27e-05   9.2866  1.08e+04  "New York"       0
+  max ratio    1.44e+00  -0.3637  5.88e-02      "1472"       1
+  max KL est.  9.27e-05   9.2866  1.08e+04  "New York"       0
+
+  One token per row, from all 8 answers. r = ref - logp, and
+  KL est. is that token's exp(r) - r - 1, before any averaging.
+"""
+DETAIL_ANCHOR = "  advantage's direction, that token's surrogate gradient is zero.\n\n"
+
+
+def printed_detail() -> str:
+    """The block, printed by the demo's own step_detail from values that match the
+    quick run (r = -log ratio, since the reference is the sampler here)."""
+    import math
+
+    def tok(row, ratio, r):
+        return Token(row, 0, ratio, r, math.exp(r) - r - 1)
+    low, high = tok(0, 9.27e-05, 9.2866), tok(2, 1.4386, -0.3637)
+    terms = Terms(loss=None, surrogate=0.0580, kl=451.5275, ratio_min=low.ratio,
+                  ratio_max=high.ratio, clipped=0.289, tokens=Extremes(low, high, low))
+    texts = list(parse_group_answers(REAL, (46, 32)))
+    rewards = [float(r) for r in parse_hand_update(REAL).group.rewards]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        step_detail(Report("08", "t"), terms, 2, texts, rewards)
+    return buf.getvalue()
+
+
+def with_new_lines(detail: str | None = None) -> str:
+    """The capture with both of the demo's new blocks where it prints them."""
+    text = with_split()
+    assert text.count(DETAIL_ANCHOR) == 1
+    return text.replace(DETAIL_ANCHOR, DETAIL_ANCHOR + (detail or printed_detail()) + "\n")
+
+
+def test_detail_fixture_is_the_quick_runs_block():
+    assert printed_detail() == QUICK_DETAIL
+
+
+def test_parse_step_detail():
+    d = parse_step_detail(with_new_lines())
+    assert d.kl == 451.53
+    assert (d.min_ratio.ratio_text, d.min_ratio.kl_text, d.min_ratio.answer) == (
+        "9.27e-05", "1.08e+04", "New York")
+    assert (d.max_ratio.ratio_text, d.max_ratio.kl_text, d.max_ratio.reward) == (
+        "1.44e+00", "5.88e-02", 1)
+    assert d.max_kl == d.min_ratio
+    with pytest.raises(CaptureError, match="Step 2, the KL"):
+        parse_step_detail(REAL)                                  # not printed yet
+
+
+@pytest.mark.parametrize("old, new", [
+    ("451.53", "461.53"),                                        # not s4a's 4.52e+02
+    ("min ratio    9.27e-05", "min ratio    3.27e-04"),          # not s4a's 0.0001
+    ("1.08e+04  \"New York\"       0\n  max ratio",
+     "1.28e+04  \"New York\"       0\n  max ratio"),            # not exp(r) - r - 1
+    ('"1472"       1', '"1472"       0'),                        # reward vs the rule
+    ("  max KL est.  9.27e-05   9.2866  1.08e+04  \"New York\"       0\n", ""),
+    ("  token           ratio", "  tokens          ratio"),      # header
+])
+def test_parse_step_detail_rejects(old, new):
+    detail = printed_detail()
+    assert detail.count(old) == 1, old
     with pytest.raises(CaptureError):
-        d08_figures.figure_kl_k3(THEMES[0], cap)
+        parse_step_detail(with_new_lines(detail.replace(old, new)))
+
+
+def test_kl_k3_draws_the_printed_points(tmp_path, monkeypatch):
+    monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
+    with pytest.raises(CaptureError):
+        d08_figures.figure_kl_k3(THEMES[0], d08_figures.CAPTURE)    # until the recapture
+    cap = tmp_path / "demo08.txt"
+    cap.write_text(with_new_lines())
+    seen = {}
+
+    def keep(fig, slug, name, theme):
+        ax = fig.axes[0]
+        seen["points"] = [tuple(map(float, (line.get_xdata()[0], line.get_ydata()[0])))
+                          for line in ax.lines if line.get_marker() == "o"]
+        seen["texts"] = [t.get_text() for t in ax.texts]
+        seen["xlim"] = ax.get_xlim()
+        return tmp_path / f"{name}-{theme.name}.png"
+
+    monkeypatch.setattr(d08_figures, "save_both", keep)
+    for theme in THEMES:
+        with styled(theme):
+            d08_figures.figure_kl_k3(theme, cap)
+        assert seen["points"] == [(9.27e-05, 1.08e+04), (1.44, 5.88e-02)]
+        assert "smallest ratio 9.27e-05, estimate 1.08e+04" in seen["texts"]
+        assert "largest ratio 1.44e+00,\nestimate 5.88e-02" in seen["texts"]
+        assert "step 2's average, 4.52e+02" in seen["texts"]
+        assert seen["xlim"][0] < 9.27e-05                          # the min point is inside
 
 
 def test_hand_update_keeps_the_printed_kl():
@@ -555,3 +661,19 @@ def test_training_logs_label_the_kl_peak(tmp_path, monkeypatch):
     with styled(THEMES[0]):
         d08_figures.figure_training_logs(THEMES[0], d08_figures.CAPTURE)
     assert "0.5564" in seen["texts"] and "0.5233" in seen["texts"]
+
+
+def test_baseline_reach_prints_no_derivation(tmp_path, monkeypatch):
+    cap = tmp_path / "demo08.txt"
+    cap.write_text(with_split())
+    seen = {}
+
+    def keep(fig, slug, name, theme):
+        seen["texts"] = " ".join(t.get_text() for ax in fig.axes for t in ax.texts)
+        return tmp_path / "x.png"
+
+    monkeypatch.setattr(d08_figures, "save_both", keep)
+    with styled(THEMES[0]):
+        d08_figures.figure_baseline_reach(THEMES[0], cap)
+    assert "117 − 44" not in seen["texts"] and "75 − 73" not in seen["texts"]
+    assert all(str(n) in seen["texts"] for n in (73, 2, 44, 81, 75, 125, 117))
