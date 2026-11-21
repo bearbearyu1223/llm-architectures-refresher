@@ -175,6 +175,7 @@ REAL = d08_figures.CAPTURE.read_text()
 
 @pytest.mark.parametrize("figure, name", [
     (d08_figures.figure_sft_vs_grpo, "sft-vs-grpo"),
+    (d08_figures.figure_token_logprobs, "token-logprobs"),
     (d08_figures.figure_all_equal_groups, "all-equal-groups"),
     (d08_figures.figure_clip, "clip"),
     (d08_figures.figure_grpo_step, "grpo-step"),
@@ -197,9 +198,9 @@ def test_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
 
 
 def test_every_figure_is_tested():
-    # nine above, plus baseline-reach and kl-k3, drawn below from a capture with the
+    # ten above, plus baseline-reach and kl-k3, drawn below from a capture with the
     # demo's new lines (s2's split table, s4's step detail)
-    assert len(FIGURES) == 11
+    assert len(FIGURES) == 12
 
 
 # -- the real capture's numbers ---------------------------------------------------
@@ -677,3 +678,65 @@ def test_baseline_reach_prints_no_derivation(tmp_path, monkeypatch):
         d08_figures.figure_baseline_reach(THEMES[0], cap)
     assert "117 − 44" not in seen["texts"] and "75 − 73" not in seen["texts"]
     assert all(str(n) in seen["texts"] for n in (73, 2, 44, 81, 75, 125, 117))
+
+
+# -- section 1's token-by-token scoring --------------------------------------------
+
+from llmrefresher.demos.d08_figures import least_sure, parse_token_scores  # noqa: E402
+
+
+def test_parse_token_scores():
+    s = parse_token_scores(REAL)
+    assert s.problem == (23, 47) and s.prompt_tokens == 45
+    assert s.tokens == ("1", "0", "8", "1", "<|im_end|>") and s.right == "1081"
+    assert s.logprobs == (-0.3165, -0.0163, -2.8617, -0.0305, -0.0036)
+    assert s.probs == (0.7287, 0.9838, 0.0572, 0.9700, 0.9964)
+    assert (s.total, s.whole_prob, s.cross_entropy) == (-3.2286, 0.0396, 0.6457)
+    assert (s.wrong, s.wrong_total) == ("1091", -7.1006)
+
+
+@pytest.mark.parametrize("old, new", [
+    ("  2                      '8'   -2.8617  0.0572", "  2                      '8'   -2.8617  0.0672"),
+    ("  2                      '8'   -2.8617  0.0572", "  2                      '7'   -2.8617  0.0572"),
+    ("  sequence log-prob (sum)            -3.2286", "  sequence log-prob (sum)            -3.3286"),
+    ("  probability of the whole answer    0.0396", "  probability of the whole answer    0.0496"),
+    ("  cross-entropy (mean of -log-prob)  0.6457", "  cross-entropy (mean of -log-prob)  0.6557"),
+    ("5: the digits, then <|im_end|>", "6: the digits, then <|im_end|>"),
+    ("  4             '<|im_end|>'   -0.0036  0.9964\n", ""),
+])
+def test_parse_token_scores_rejects(old, new):
+    broken = REAL.replace(old, new)
+    assert broken != REAL, "the mutation must change the capture"
+    with pytest.raises(CaptureError):
+        parse_token_scores(broken)
+
+
+def test_least_sure():
+    assert least_sure((0.9, 0.2, 0.5)) == 1
+    assert least_sure((0.3, 0.3, 0.9)) == 0
+
+
+def test_token_logprobs_emphasises_the_least_sure_token(tmp_path, monkeypatch):
+    seen = {}
+
+    def keep(fig, slug, name, theme):
+        seen["fig"] = fig
+        return tmp_path / "x.png"
+
+    monkeypatch.setattr(d08_figures, "save_both", keep)
+    theme = THEMES[0]
+    with styled(theme):
+        d08_figures.figure_token_logprobs(theme, d08_figures.CAPTURE)
+    left, right = seen["fig"].axes
+    bars = left.patches
+    heights = [b.get_height() for b in bars]
+    from matplotlib.colors import to_hex
+    hot = [i for i, b in enumerate(bars) if to_hex(b.get_facecolor()) == theme.ink]
+    # one bar emphasised, and it is the shortest one the capture printed
+    assert hot == [heights.index(min(heights))]
+    assert heights == list(parse_token_scores(REAL).probs)
+    # the stacked bar's emphasised segment is the same token's log-prob
+    segs = [p for p in right.patches if to_hex(p.get_facecolor()) == theme.ink]
+    assert [round(p.get_width(), 4) for p in segs] == [parse_token_scores(REAL).logprobs[hot[0]]]
+    texts = " ".join(t.get_text() for ax in (left, right) for t in ax.texts)
+    assert all(v in texts for v in ("0.0572", "−2.8617", "−3.2286", "0.0396", "−7.1006", "89%"))

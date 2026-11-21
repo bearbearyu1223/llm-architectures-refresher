@@ -1,8 +1,10 @@
 """Figures for post 8. Kept apart from the demo so the sections stay readable.
 
-Eleven figures, in the post's order:
+Twelve figures, in the post's order:
 
 * :func:`figure_sft_vs_grpo` (section 1): one question trained two ways.
+* :func:`figure_token_logprobs` (section 1): the model scoring that question's
+  answer token by token, from s1a and s1b.
 * :func:`figure_baseline_reach` (section 2): the 200 test problems split four
   ways by greedy and by eight samples, from the split table printed after s2a.
 * :func:`figure_all_equal_groups` (section 4): groups with no signal, and
@@ -37,7 +39,7 @@ Arithmetic on parsed numbers is allowed, and is shown on the figure where it
 produces a drawn number. Figure 2's counts and the k3 figure's two points are
 read from the tables that print them, not derived.
 
-Render all ten with ``uv run python -m llmrefresher.demos.d08_figures``
+Render them all with ``uv run python -m llmrefresher.demos.d08_figures``
 (``--capture PATH`` to read another capture).
 """
 
@@ -228,6 +230,83 @@ def parse_s1_example(text: str) -> tuple[int, int]:
         raise CaptureError(f"s1b scores {wrong[0][1]} as the wrong answer, but the figure's "
                            f"rule gives {s1_example((a, b))[2]}")
     return a, b
+
+
+S1_HEADER = "  answer token         token  log-prob    prob"
+END_OF_TURN = "<|im_end|>"
+_LP = r"-\d+\.\d{4}"
+_P = r"[01]\.\d{4}"
+
+
+@dataclass(frozen=True)
+class TokenScores:
+    """s1a and s1b: the model's own score of section 1's right answer, per token."""
+
+    problem: tuple[int, int]
+    prompt_tokens: int
+    tokens: tuple[str, ...]       # as printed, unquoted: '1', '0', '8', '1', '<|im_end|>'
+    logprobs: tuple[float, ...]
+    probs: tuple[float, ...]
+    total: float                  # sequence log-prob (sum)
+    whole_prob: float             # probability of the whole answer
+    cross_entropy: float
+    wrong: str
+    wrong_total: float
+
+    @property
+    def right(self) -> str:
+        return "".join(t for t in self.tokens if t != END_OF_TURN)
+
+
+def least_sure(probs: tuple[float, ...]) -> int:
+    """Index of the token the model gives the lowest probability (the first, on a tie)."""
+    return min(range(len(probs)), key=lambda i: (probs[i], i))
+
+
+def parse_token_scores(text: str) -> TokenScores:
+    """s1a's per-token table and s1b's totals, every value checked against the others.
+
+    The row count must match "answer tokens scored"; the digits must spell the
+    right answer of :func:`s1_example`, then ``<|im_end|>``; each prob must be
+    exp(log-prob), the total their sum, the whole-answer probability exp(total)
+    and the cross-entropy -total / n, all to the printed rounding.
+    """
+    problem = parse_s1_example(text)
+    lines = _section(text, S1_SECTION)
+    where = "section 1"
+    prompt = int(_match(r"(\d+), all masked out", _kv(lines, "prompt tokens (chat template)",
+                                                      where), "prompt tokens")[1])
+    n = int(_match(r"(\d+): the digits, then <\|im_end\|>",
+                   _kv(lines, "answer tokens scored", where), "answer tokens scored")[1])
+    rows = _table(text, S1_SECTION, S1_HEADER, n)
+    tokens, lps, ps = [], [], []
+    for k, cells in enumerate(rows):
+        if len(cells) != 4 or cells[0] != str(k):
+            raise CaptureError(f"s1a row {k}: {cells!r} is not 'index, token, log-prob, prob'")
+        tokens.append(_match(r"'([^'\\]+)'", cells[1], f"s1a token {k}")[1])
+        lps.append(_number(cells[2], _LP, f"s1a log-prob {k}"))
+        ps.append(_number(cells[3], _P, f"s1a prob {k}"))
+        if abs(math.exp(lps[-1]) - ps[-1]) > 1e-4:
+            raise CaptureError(f"s1a row {k}: prob {ps[-1]} is not exp({lps[-1]})")
+    _, right, wrong = s1_example(problem)
+    if tokens[-1] != END_OF_TURN or "".join(tokens[:-1]) != right:
+        raise CaptureError(f"s1a's tokens {tokens!r} are not {right!r} then {END_OF_TURN}")
+
+    def kv(label: str, pattern: str) -> float:
+        return float(_match(pattern, _kv(lines, label, where), label)[0])
+
+    total = kv("sequence log-prob (sum)", _LP)
+    whole = kv("probability of the whole answer", _P)
+    ce = kv("cross-entropy (mean of -log-prob)", r"\d+\.\d{4}")
+    wrong_total = kv(f'same, for the wrong answer "{wrong}"', _LP)
+    if abs(sum(lps) - total) > 5e-5 * (n + 1):
+        raise CaptureError(f"s1b's sum {total} is not the sum of s1a's log-probs")
+    if abs(math.exp(total) - whole) > 1e-4:
+        raise CaptureError(f"s1b's whole-answer probability {whole} is not exp({total})")
+    if abs(-total / n - ce) > 1e-4:
+        raise CaptureError(f"s1b's cross-entropy {ce} is not -({total}) / {n}")
+    return TokenScores(problem, prompt, tuple(tokens), tuple(lps), tuple(ps), total, whole, ce,
+                       wrong, wrong_total)
 
 
 # -- s2a: the baseline ------------------------------------------------------------
@@ -1191,6 +1270,130 @@ def figure_sft_vs_grpo(theme: Theme, capture: Path = CAPTURE) -> Path:
 
     _crop(fig, ax, 0.2, 6.45)
     return save_both(fig, SLUG, "sft-vs-grpo", theme)
+
+
+def _signed(v: float) -> str:
+    """A printed 4-decimal value with a typographic minus, as the axis ticks have."""
+    return f"{v:.4f}".replace("-", "−")
+
+
+def figure_token_logprobs(theme: Theme, capture: Path = CAPTURE) -> Path:
+    """The model scoring section 1's right answer, token by token (s1a, s1b).
+
+    Left: each answer token's probability. Right: the answer's log-prob as one
+    stacked bar of its tokens' log-probs, beside the wrong answer's total. The
+    emphasised token is :func:`least_sure`'s pick from the parsed probs, not a
+    typed index. Its share of the total and the other tokens' sum are arithmetic
+    on the parsed values, drawn as such.
+
+    No series colour: this is the starting model's own scoring, before any
+    training, so blue (SFT), orange (GRPO) or green (control) would each read as
+    a result. The emphasis is the theme's ink, the rest its muted grey.
+    """
+    s = parse_token_scores(capture.read_text())
+    question, right, wrong = s1_example(s.problem)
+    assert right == s.right and wrong == s.wrong, "the parser checked both"
+    k = least_sure(s.probs)
+    n = len(s.tokens)
+    emph = theme.ink
+    quiet = _over(theme.muted, _recessive(theme), theme.surface)
+    names = ["end of turn" if t == END_OF_TURN else f"'{t}'" for t in s.tokens]
+
+    fig, (left, right_ax) = plt.subplots(1, 2, figsize=(11.2, 5.3),
+                                         gridspec_kw={"width_ratios": [1, 1.35], "wspace": 0.28})
+
+    # -- left: how sure the model is of each token ------------------------------------
+    xs = list(range(n))
+    for x, p in zip(xs, s.probs, strict=True):
+        hot = x == k
+        left.bar(x, p, 0.62, color=emph if hot else quiet, zorder=3)
+        left.annotate(f"{p:.4f}", (x, p), textcoords="offset points", xytext=(0, 4),
+                      ha="center", va="bottom", fontsize=11 if hot else 10.2,
+                      fontweight="bold" if hot else "normal",
+                      color=theme.ink if hot else theme.secondary, zorder=5)
+    # the note sits in the empty column above the emphasised bar
+    note_y = s.probs[k] + 0.42
+    left.text(k, note_y, "the one digit\nthe model\nis unsure of", ha="center", va="bottom",
+              fontsize=10.5, color=theme.ink, linespacing=1.2, zorder=5)
+    left.annotate("", xy=(k, s.probs[k] + 0.12), xytext=(k, note_y - 0.03),
+                  arrowprops=dict(arrowstyle="-|>", color=theme.ink, lw=1.2,
+                                  mutation_scale=11, shrinkA=0, shrinkB=0), zorder=5)
+    left.set_ylim(0, 1.12)
+    left.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
+    left.set_xlim(-0.6, n - 0.4)
+    left.set_xticks(xs)
+    left.set_xticklabels(names, fontsize=11.5)
+    left.tick_params(axis="x", length=0)
+    left.grid(axis="x", visible=False)
+    left.set_ylabel("probability the model gives the token")
+    left.set_xlabel(f'answer tokens of "{right}", in order')
+    left.set_title("How sure the model is of each token", loc="left", fontsize=12.5, pad=10)
+
+    # -- right: where the answer's log-prob comes from ----------------------------------
+    ax = right_ax
+    h = 0.5
+    y_right, y_wrong = 1.0, 0.0
+    lo, _ = axis_limits([s.total, s.wrong_total], 1.0)
+    edges = [0.0]
+    for lp in s.logprobs:
+        edges.append(edges[-1] + lp)
+    for i, lp in enumerate(s.logprobs):
+        ax.barh(y_right, lp, h, left=edges[i], color=emph if i == k else quiet, zorder=3)
+        if i:  # a surface-coloured seam between segments
+            ax.plot([edges[i]] * 2, [y_right - h / 2, y_right + h / 2], color=theme.surface,
+                    lw=1.6, zorder=4)
+    # inside the emphasised segment: its log-prob and its share of the total
+    mid = (edges[k] + edges[k + 1]) / 2
+    ax.text(mid, y_right + 0.07, f"{names[k]}  {_signed(s.logprobs[k])}", ha="center",
+            va="center", fontsize=11.5, fontweight="bold", color=ink_for(emph), zorder=5)
+    ax.text(mid, y_right - 0.12, f"{100 * s.logprobs[k] / s.total:.0f}% of the total",
+            ha="center", va="center", fontsize=10, color=ink_for(emph), zorder=5)
+    # the other tokens, above the bar, one label per contiguous run of them
+    runs = [list(range(0, k)), list(range(k + 1, n))]
+    for run in runs:
+        if not run:
+            continue
+        a, b = edges[run[0]], edges[run[-1] + 1]
+        x = (a + b) / 2
+        y_text = y_right + h / 2 + 0.2
+        ax.plot([x, x], [y_right + h / 2 + 0.02, y_text - 0.03], color=theme.secondary, lw=0.9,
+                zorder=5)
+        # a run that ends at 0 is right-aligned there, so it stays inside the axes
+        at_zero = run[0] == 0
+        ax.text(0.0 if at_zero else x, y_text,
+                "\n".join(f"{names[i]}  {_signed(s.logprobs[i])}" for i in run),
+                ha="right" if at_zero else "center", va="bottom", fontsize=9.8, color=theme.secondary,
+                linespacing=1.25, zorder=5)
+    others = sum(lp for i, lp in enumerate(s.logprobs) if i != k)
+    # the total, past the bar's end
+    ax.text(s.total - 0.15, y_right + 0.07, f"{_signed(s.total)} in all", ha="right",
+            va="center", fontsize=11.5, fontweight="bold", color=theme.ink, zorder=5)
+    ax.text(s.total - 0.15, y_right - 0.15,
+            f"probability {s.whole_prob:.4f}\nthe other {n - 1} tokens: {_signed(others)}",
+            ha="right", va="center", fontsize=10, color=theme.secondary, linespacing=1.25,
+            zorder=5)
+    # the wrong answer, one plain bar
+    ax.barh(y_wrong, s.wrong_total, h, color=quiet, zorder=3)
+    ax.text(s.wrong_total + 0.12, y_wrong, f"{_signed(s.wrong_total)} in all", ha="left",
+            va="center", fontsize=11.5, fontweight="bold", color=ink_for(quiet), zorder=5)
+
+    ax.set_xlim(lo, 0)
+    ax.set_ylim(-0.55, 2.05)
+    ax.set_yticks([y_wrong, y_right])
+    ax.set_yticklabels([f'"{wrong}"\nwrong answer', f'"{right}"\nright answer'], fontsize=11)
+    ax.tick_params(axis="y", length=0)
+    ax.grid(axis="y", visible=False)
+    ax.axvline(0, color=theme.axis, lw=1.0, zorder=2)
+    ax.set_xlabel("log-prob of the answer (natural log; more negative = less likely)")
+    ax.set_title("Where the answer's log-prob comes from", loc="left", fontsize=12.5, pad=10)
+
+    fig.suptitle("One uncertain digit costs most of the answer's log-prob", x=0.06, y=0.995,
+                 ha="left", fontsize=13.5, fontweight="bold", color=theme.ink)
+    fig.text(0.06, 0.935, f'The starting model scores "{right}" for "{question}" Its '
+             f"{s.prompt_tokens} prompt tokens are masked out; only the answer's {n} tokens "
+             "are scored.", ha="left", va="center", fontsize=10.2, color=theme.secondary)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.83, bottom=0.13)
+    return save_both(fig, SLUG, "token-logprobs", theme)
 
 
 # --------------------------------------------------------------------------
@@ -2182,8 +2385,8 @@ def figure_rlhf_vs_ours(theme: Theme, capture: Path = CAPTURE) -> Path:
     return save_both(fig, SLUG, "rlhf-vs-ours", theme)
 
 
-FIGURES = (figure_sft_vs_grpo, figure_baseline_reach, figure_all_equal_groups, figure_clip,
-           figure_kl_k3, figure_grpo_step, figure_control_shuffle, figure_training_logs,
+FIGURES = (figure_sft_vs_grpo, figure_token_logprobs, figure_baseline_reach,
+           figure_all_equal_groups, figure_clip, figure_kl_k3, figure_grpo_step, figure_control_shuffle, figure_training_logs,
            figure_heldout_accuracy, figure_sharpening_split, figure_rlhf_vs_ours)
 
 
