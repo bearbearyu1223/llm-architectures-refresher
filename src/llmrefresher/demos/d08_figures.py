@@ -500,6 +500,7 @@ class Setup:
     temperature: str      # as printed, "1.0"
     max_tokens: int
     eps: str              # the advantage's epsilon, from s3b's footer
+    clip_note: str | None = None  # "inactive at 1 inner step", when s5a prints it
 
 
 def parse_setup(text: str) -> Setup:
@@ -520,8 +521,8 @@ def parse_setup(text: str) -> Setup:
                  "s5a per step")
     inner = _match(r"(\d+)", _kv(s5, "inner steps per batch", where), "s5a inner steps")
     beta = _match(r"(\d+\.\d+)", _kv(s5, "KL beta", where), "s5a KL beta")
-    clip = _match(r"(\d+\.\d+)( \(inactive at 1 inner step\))?", _kv(s5, "clip epsilon", where),
-                  "s5a clip epsilon")
+    clip = _match(r"(\d+\.\d+)(?: \((inactive at 1 inner step)\))?",
+                  _kv(s5, "clip epsilon", where), "s5a clip epsilon")
     lr = _match(r"AdamW, lr (\S+), no weight decay", _kv(s5, "optimizer", where), "s5a optimizer")
     steps = _match(r"(\d+) \((\d+) draws from (\d+) questions\)", _kv(s5, "steps per run", where),
                    "s5a steps per run")
@@ -541,7 +542,7 @@ def parse_setup(text: str) -> Setup:
         raise CaptureError(f"s3b groups print different epsilons: {sorted(eps)}")
     return Setup(model, train, int(policy[1]), int(policy[2]), questions, group, answers,
                  int(inner[1]), beta[1], clip[1], lr[1], int(steps[1]), sampling[1],
-                 int(sampling[2]), eps.pop())
+                 int(sampling[2]), eps.pop(), clip[2])
 
 
 # -- s5c and s5d: held-out accuracy -----------------------------------------------
@@ -1313,7 +1314,7 @@ def figure_clip(theme: Theme, capture: Path = CAPTURE) -> Path:
     axes[0].set_ylabel("one token's term in the objective")
     axes[0].legend(loc="upper left", handlelength=2.6)
     fig.text(0.5, 0.035,
-             f"Under each panel: the range of the ratios after one step on the 46 × 32 group, "
+             f"Under each panel: the range of the ratios after one step on the {hand.group.problem[0]} × {hand.group.problem[1]} group, "
              f"right and wrong answers together. The clip didn't keep them in "
              f"[{lo:.1f}, {hi:.1f}].", ha="center", va="center", fontsize=10.2,
              color=theme.secondary)
@@ -1449,7 +1450,10 @@ def figure_grpo_step(theme: Theme, capture: Path = CAPTURE) -> Path:
     _arrow(ax, vx, ay0, vx, ly1, sec)
     _box(ax, lx0, ly0, lx1 - lx0, ly1 - ly0, orange, lw=1.6)
     text_at((lx0 + lx1) / 2, 1.85, ["loss = −(surrogate − β × KL)"], bold_first=True, size=11)
-    text_at((lx0 + lx1) / 2, 1.52, [f"β = {s.beta}, clip ε = {s.clip}"], size=10, color=sec)
+    if s.clip_note is None:
+        raise CaptureError("s5a prints no clip note, e.g. '(inactive at 1 inner step)'")
+    text_at((lx0 + lx1) / 2, 1.52, [f"β = {s.beta}, clip ε = {s.clip} ({s.clip_note})"],
+            size=10, color=sec)
 
     # -- (6) the reference: the same network, adapter off --------------------------------
     fx0, fx1, fy0, fy1 = fr_x0 - 0.05, px1 + 0.25, 3.15, 4.35
@@ -1464,8 +1468,14 @@ def figure_grpo_step(theme: Theme, capture: Path = CAPTURE) -> Path:
     yref = 3.75
     ref_x = 7.4
     _poly_arrow(ax, [fx1, ref_x, ref_x], [yref, yref, ly1], sec)
-    text_at(ref_x + 0.12, 3.15, ["reference log-probs,", "for the KL"], size=9.8, color=sec,
-            ha="left", gap=0.24)
+    text_at(ref_x - 0.12, 2.95, ["reference log-probs,", "for the KL"], size=9.8, color=sec,
+            ha="right", gap=0.24)
+    # the policy's own log-probs into the loss: out of the policy's bottom-right corner,
+    # above the reference box, then down outside the reference lane
+    pol_x, pol_y, pol_down = px1 - 0.1, (py0 + fy1) / 2, ref_x + 0.35
+    _poly_arrow(ax, [pol_x, pol_x, pol_down, pol_down], [py0, pol_y, pol_y, ly1], orange)
+    text_at(pol_down + 0.12, 2.95, ["policy log-probs of", f"the {s.answers} answers"],
+            size=9.8, color=sec, ha="left", gap=0.24)
 
     # -- (7) AdamW, back to the adapter ---------------------------------------------------
     ox0, ox1 = 1.0, 4.6
@@ -1476,9 +1486,10 @@ def figure_grpo_step(theme: Theme, capture: Path = CAPTURE) -> Path:
     adx = (ad_x0 + ad_x1) / 2
     _arrow(ax, adx, ly1, adx, ad_y0, orange, lw=1.8)
 
-    # the loop count, in the middle
-    text_at(8.15, 4.75, [f"x {s.steps} steps,", f"{s.inner_steps} inner step per batch"],
-            size=10.5, color=ink, gap=0.28, bold_first=True)
+    # the loop count, as the label of the return arrow
+    text_at(adx - 0.15, (ly1 + py0) / 2 + 0.14,
+            [f"× {s.steps} steps,", f"{s.inner_steps} inner step per batch"],
+            size=10.5, color=ink, ha="right", gap=0.28, bold_first=True)
 
     _crop(fig, ax, 0.9, 8.0)
     return save_both(fig, SLUG, "grpo-step", theme)

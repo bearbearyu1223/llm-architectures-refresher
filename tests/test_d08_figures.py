@@ -244,6 +244,15 @@ def test_parse_setup():
     assert (s.questions, s.group, s.answers, s.inner_steps, s.steps) == (8, 8, 64, 1, 60)
     assert (s.beta, s.clip, s.lr, s.temperature, s.max_tokens, s.eps) == (
         "0.04", "0.2", "3e-05", "1.0", 24, "0.0001")
+    assert s.clip_note == "inactive at 1 inner step"
+
+
+def test_grpo_step_needs_the_clip_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
+    broken = tmp_path / "demo08.txt"
+    broken.write_text(REAL.replace("0.2 (inactive at 1 inner step)", "0.2"))
+    with pytest.raises(CaptureError):
+        d08_figures.figure_grpo_step(THEMES[0], broken)
 
 
 def test_parse_heldout_changes_and_summary():
