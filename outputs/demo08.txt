@@ -51,6 +51,14 @@ device memory : 17.2 GB
   problems right in >=1 of 8 samples 117/200 (58.5%)
     of the problems greedy gets wrong 44/125 (35.2%)
 
+  Greedy against sampling, problem by problem:
+
+  test problems  >=1 of 8 right  none of 8 right  total
+  -------------------------------------------------------
+  greedy right               73                2     75
+  greedy wrong               44               81    125
+  total                     117               83    200
+
   Sampled answers not a lone integer, first three, one per problem:
     "35 x 11 = 385"
     "3, 854"
@@ -157,6 +165,20 @@ device memory : 17.2 GB
   below the reference's, the KL term exp(r) - r - 1, r = ref - logp,
   grows exponentially in r; where a ratio crossed the clip in the
   advantage's direction, that token's surrogate gradient is zero.
+
+  Step 2, the KL to more digits and the extreme tokens:
+
+  KL, to two decimals                451.53
+  0.04 x KL                          +18.0611
+
+  token           ratio        r   KL est.      answer  reward
+  --------------------------------------------------------------
+  min ratio    9.27e-05   9.2866  1.08e+04  "New York"       0
+  max ratio    1.44e+00  -0.3637  5.88e-02      "1472"       1
+  max KL est.  9.27e-05   9.2866  1.08e+04  "New York"       0
+
+  One token per row, from all 8 answers. r = ref - logp, and
+  KL est. is that token's exp(r) - r - 1, before any averaging.
 
   response    reward    adv  log-prob    after  change
   ------------------------------------------------------

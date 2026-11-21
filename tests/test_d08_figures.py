@@ -198,8 +198,8 @@ def test_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
 
 
 def test_every_figure_is_tested():
-    # ten above, plus baseline-reach and kl-k3, drawn below from a capture with the
-    # demo's new lines (s2's split table, s4's step detail)
+    # ten above, plus baseline-reach and kl-k3, tested below with and without the
+    # blocks they read (s2's split table, s4's step detail)
     assert len(FIGURES) == 12
 
 
@@ -427,22 +427,44 @@ from llmrefresher.demos.d08_rewards import (  # noqa: E402
 )
 from llmrefresher.report import Report  # noqa: E402
 
-SPLIT_ANCHOR = "    of the problems greedy gets wrong 44/125 (35.2%)\n"
+def capture_block(first: str, last: str, text: str = REAL) -> str:
+    """The lines of ``text`` from the one line starting ``first`` through the next line
+    starting ``last``, each with its newline."""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.startswith(first)]
+    assert len(starts) == 1, first
+    end = next(i for i in range(starts[0], len(lines)) if lines[i].startswith(last))
+    return "".join(lines[starts[0]:end + 1])
 
 
-def with_split(text: str = REAL) -> str:
-    """The capture with s2's split table where the demo now prints it, printed by the
-    demo's own baseline_split from per-problem flags that match s2a's counts."""
-    g, both, s_only, neither = parse_baseline_reach(text).parts
+# The demo's two blocks from round 4, as the capture holds them.
+SPLIT = capture_block("  Greedy against sampling, problem by problem:", "  total  ")
+DETAIL = capture_block("  Step 2, the KL to more digits and the extreme tokens:",
+                       "  KL est. is that token's")
+
+
+def without(block: str, text: str = REAL) -> str:
+    """A copy of the capture with ``block`` (and the blank line after it) removed."""
+    assert text.count(block + "\n") == 1
+    return text.replace(block + "\n", "")
+
+
+def mutated(block: str, old: str, new: str) -> str:
+    """A copy of the capture with ``old`` replaced by ``new`` inside ``block`` only."""
+    assert block.count(old) == 1, old
+    return REAL.replace(block, block.replace(old, new))
+
+
+def printed_split() -> str:
+    """The split table as the demo's own baseline_split prints it, from per-problem
+    flags that match s2a's counts."""
+    g, both, s_only, neither = parse_baseline_reach(REAL).parts
     greedy = [True] * (both + g) + [False] * (s_only + neither)
     sample = [True] * both + [False] * g + [True] * s_only + [False] * neither
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        rep = Report("08", "t")
-        rep.blank()
-        baseline_split(rep, greedy, sample, 8)
-    assert text.count(SPLIT_ANCHOR) == 1
-    return text.replace(SPLIT_ANCHOR, SPLIT_ANCHOR + buf.getvalue())
+        baseline_split(Report("08", "t"), greedy, sample, 8)
+    return buf.getvalue()
 
 
 def test_reward_is_the_demos_rule():
@@ -450,7 +472,8 @@ def test_reward_is_the_demos_rule():
 
 
 def test_split_round_trip_from_the_demos_printer():
-    split = parse_reach_split(with_split())
+    assert printed_split() == SPLIT          # the capture holds what the printer prints
+    split = parse_reach_split(REAL)
     assert split.parts == parse_baseline_reach(REAL).parts == (2, 73, 44, 81)
     assert (split.both, split.greedy_only, split.samples_only, split.neither) == (73, 2, 44, 81)
     assert (split.greedy_right, split.greedy_wrong, split.reach, split.problems) == (
@@ -459,20 +482,19 @@ def test_split_round_trip_from_the_demos_printer():
 
 def test_baseline_reach_waits_for_the_split_table(tmp_path, monkeypatch):
     monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
-    with pytest.raises(CaptureError, match="test problems  >=1 of 8 right"):
-        d08_figures.figure_baseline_reach(THEMES[0], d08_figures.CAPTURE)
     cap = tmp_path / "demo08.txt"
-    cap.write_text(with_split())
+    cap.write_text(without(SPLIT))
+    with pytest.raises(CaptureError, match="test problems  >=1 of 8 right"):
+        d08_figures.figure_baseline_reach(THEMES[0], cap)
     for theme in THEMES:
         with styled(theme):
-            path = d08_figures.figure_baseline_reach(theme, cap)
+            path = d08_figures.figure_baseline_reach(theme, d08_figures.CAPTURE)
         assert path.name == f"baseline-reach-{theme.name}.png"
 
 
 def test_baseline_reach_uses_no_series_colour(tmp_path, monkeypatch):
     monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
-    cap = tmp_path / "demo08.txt"
-    cap.write_text(with_split())
+    cap = d08_figures.CAPTURE
     seen = []
 
     def keep(fig, slug, name, theme):
@@ -503,10 +525,8 @@ def test_baseline_reach_uses_no_series_colour(tmp_path, monkeypatch):
      "  total                     118               83    200"),     # 73 + 44 != 117
 ])
 def test_parse_reach_split_rejects(old, new):
-    text = with_split()
-    assert text.count(old) == 1
     with pytest.raises(CaptureError):
-        parse_reach_split(text.replace(old, new))
+        parse_reach_split(mutated(SPLIT, old, new))
 
 
 def test_clip_verdict_follows_the_range():
@@ -535,26 +555,6 @@ def test_k3():
         k3(0.0)
 
 
-# Section 4's detail block exactly as `uv run demo08 --quick` printed it; section 4
-# there matched the full capture's s4a and s4b byte for byte.
-QUICK_DETAIL = """\
-  Step 2, the KL to more digits and the extreme tokens:
-
-  KL, to two decimals                451.53
-  0.04 x KL                          +18.0611
-
-  token           ratio        r   KL est.      answer  reward
-  --------------------------------------------------------------
-  min ratio    9.27e-05   9.2866  1.08e+04  "New York"       0
-  max ratio    1.44e+00  -0.3637  5.88e-02      "1472"       1
-  max KL est.  9.27e-05   9.2866  1.08e+04  "New York"       0
-
-  One token per row, from all 8 answers. r = ref - logp, and
-  KL est. is that token's exp(r) - r - 1, before any averaging.
-"""
-DETAIL_ANCHOR = "  advantage's direction, that token's surrogate gradient is zero.\n\n"
-
-
 def printed_detail() -> str:
     """The block, printed by the demo's own step_detail from values that match the
     quick run (r = -log ratio, since the reference is the sampler here)."""
@@ -573,19 +573,12 @@ def printed_detail() -> str:
     return buf.getvalue()
 
 
-def with_new_lines(detail: str | None = None) -> str:
-    """The capture with both of the demo's new blocks where it prints them."""
-    text = with_split()
-    assert text.count(DETAIL_ANCHOR) == 1
-    return text.replace(DETAIL_ANCHOR, DETAIL_ANCHOR + (detail or printed_detail()) + "\n")
-
-
-def test_detail_fixture_is_the_quick_runs_block():
-    assert printed_detail() == QUICK_DETAIL
+def test_the_capture_holds_what_step_detail_prints():
+    assert printed_detail() == DETAIL
 
 
 def test_parse_step_detail():
-    d = parse_step_detail(with_new_lines())
+    d = parse_step_detail(REAL)
     assert d.kl == 451.53
     assert (d.min_ratio.ratio_text, d.min_ratio.kl_text, d.min_ratio.answer) == (
         "9.27e-05", "1.08e+04", "New York")
@@ -593,7 +586,7 @@ def test_parse_step_detail():
         "1.44e+00", "5.88e-02", 1)
     assert d.max_kl == d.min_ratio
     with pytest.raises(CaptureError, match="Step 2, the KL"):
-        parse_step_detail(REAL)                                  # not printed yet
+        parse_step_detail(without(DETAIL))                       # block removed
 
 
 @pytest.mark.parametrize("old, new", [
@@ -606,18 +599,17 @@ def test_parse_step_detail():
     ("  token           ratio", "  tokens          ratio"),      # header
 ])
 def test_parse_step_detail_rejects(old, new):
-    detail = printed_detail()
-    assert detail.count(old) == 1, old
     with pytest.raises(CaptureError):
-        parse_step_detail(with_new_lines(detail.replace(old, new)))
+        parse_step_detail(mutated(DETAIL, old, new))
 
 
 def test_kl_k3_draws_the_printed_points(tmp_path, monkeypatch):
     monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
-    with pytest.raises(CaptureError):
-        d08_figures.figure_kl_k3(THEMES[0], d08_figures.CAPTURE)    # until the recapture
     cap = tmp_path / "demo08.txt"
-    cap.write_text(with_new_lines())
+    cap.write_text(without(DETAIL))
+    with pytest.raises(CaptureError):
+        d08_figures.figure_kl_k3(THEMES[0], cap)                  # no detail block
+    cap = d08_figures.CAPTURE
     seen = {}
 
     def keep(fig, slug, name, theme):
@@ -665,8 +657,7 @@ def test_training_logs_label_the_kl_peak(tmp_path, monkeypatch):
 
 
 def test_baseline_reach_prints_no_derivation(tmp_path, monkeypatch):
-    cap = tmp_path / "demo08.txt"
-    cap.write_text(with_split())
+    cap = d08_figures.CAPTURE
     seen = {}
 
     def keep(fig, slug, name, theme):
