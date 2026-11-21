@@ -38,6 +38,7 @@ memory.
 Run: ``uv run demo08`` (``--quick`` runs every section at toy size)
 ``uv run demo08 --temperature`` prints §2's temperature table (``d08_temperature.py``).
 ``uv run demo08 --reward-model`` prints §8's toy reward model (``d08_reward_model.py``).
+``uv run demo08 --kl-table`` prints §5's per-token KL estimates (``d08_kl_table.py``).
 """
 
 from __future__ import annotations
@@ -255,6 +256,18 @@ class Terms:
     ratio_max: float
     clipped: float         # share of answer tokens where the clip was active
     tokens: Extremes | None = None  # only when asked for (``detail``)
+
+
+def kl_estimate(log_ref_ratio: torch.Tensor) -> torch.Tensor:
+    """Per-token KL estimate (k3): ``exp(d) - d - 1``, with ``d = ref - logp``.
+
+    Always >= 0 and 0 when the two log-probs agree. It is one token's estimate;
+    the KL divergence is its average over tokens sampled from the policy.
+    ``demo08 --kl-table`` prints it for a few ratios (``d08_kl_table.py``).
+    ``grpo_objective`` writes the same expression inline (the post quotes that
+    line); ``tests/test_d08_kl_table.py`` checks the two agree.
+    """
+    return torch.exp(log_ref_ratio) - log_ref_ratio - 1
 
 
 def grpo_objective(
@@ -1258,6 +1271,11 @@ def main() -> None:
     if "--reward-model" in sys.argv:
         # Section 8's toy reward model: no network, no download, runs in moments.
         from .d08_reward_model import run
+        run()
+        return
+    if "--kl-table" in sys.argv:
+        # Section 5's per-token KL estimate at a few ratios: no model, runs in moments.
+        from .d08_kl_table import run
         run()
         return
     quick = "--quick" in sys.argv

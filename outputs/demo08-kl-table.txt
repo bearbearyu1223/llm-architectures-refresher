@@ -1,0 +1,37 @@
+==========================================================================
+DEMO 08: The per-token KL estimate
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+
+--------------------------------------------------------------------------
+The KL estimate at a few probability ratios         [post §5]
+--------------------------------------------------------------------------
+  ratio = policy probability / reference probability of a token;
+  d = reference log-prob - policy log-prob = -ln(ratio);
+  estimate = exp(d) - d - 1, as in demo 08's training loss.
+
+  ratio   as a number        d   estimate
+  -----------------------------------------
+  x10         10.0000  -2.3026     1.4026
+  x2           2.0000  -0.6931     0.1931
+  x1.5         1.5000  -0.4055     0.0721
+  x1           1.0000  +0.0000     0.0000
+  /1.5         0.6667  +0.4055     0.0945
+  /2           0.5000  +0.6931     0.3069
+  /10          0.1000  +2.3026     6.6974
+  /100         0.0100  +4.6052    94.3948
+  /10000     1.00e-04  +9.2103  9989.7897
+
+  Mirror pairs, same factor either way:
+
+  pair        more likely  less likely
+  --------------------------------------
+  x2 vs /2         0.1931       0.3069
+  x10 vs /10       1.4026       6.6974
+
+  Each row is one token's estimate, not the KL divergence itself.
+
+  estimate at ratio 1.4386, as in demo 08 §4   5.88e-02
