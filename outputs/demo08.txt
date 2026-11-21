@@ -33,6 +33,8 @@ device memory : 17.2 GB
   cross-entropy (mean of -log-prob)  0.6457
 
   same, for the wrong answer "1091"  -7.1006
+  probability of that answer         0.000825
+  ratio, right answer to wrong       48.0
 
   >> The sequence log-prob is a sum over answer tokens only. SFT raises it
      for an answer it is given; GRPO raises it for answers the model

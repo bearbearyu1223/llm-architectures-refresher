@@ -776,6 +776,8 @@ def sequence_logprob(rep: Report, model, tokenizer, device) -> None:
     other_lp = all_logprobs(model, other)[0].sum().item()
     rep.blank()
     rep.kv(f'same, for the wrong answer "{wrong}"', f"{other_lp:.4f}")
+    rep.kv("probability of that answer", f"{math.exp(other_lp):.6f}")
+    rep.kv("ratio, right answer to wrong", f"{math.exp(total - other_lp):.1f}")
     rep.takeaway(
         "The sequence log-prob is a sum over answer tokens only. SFT raises it "
         "for an answer it is given; GRPO raises it for answers the model sampled "
