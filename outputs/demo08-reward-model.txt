@@ -1,0 +1,36 @@
+==========================================================================
+DEMO 08: Learning from rewards: a reward model by hand
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+
+--------------------------------------------------------------------------
+1. Training a reward model on one ranking            [post §8]
+--------------------------------------------------------------------------
+  Prompt (an example): Explain to a ten-year-old why the sky is blue.
+  People's ranking, best first: simple > technical > vague > wrong
+  pairs from a ranking of 4: 6
+  toy reward model: one score per reply, trained 50 gradient steps
+
+  reply      score before  after 50 steps
+  -----------------------------------------
+  simple           0.0000          2.9651
+  technical       -0.5000          0.9119
+  vague           -0.5000         -0.9264
+  wrong            1.0000         -2.9505
+
+  P = sigmoid(gap): how sure the model is the first reply is better
+
+                      -------- before -------  --- after 50 steps ----
+  pair                    gap       P    loss     gap       P    loss
+  ---------------------------------------------------------------------
+  simple > technical   0.5000  0.6225  0.4741  2.0532  0.8863  0.1207
+  simple > vague       0.5000  0.6225  0.4741  3.8915  0.9800  0.0202
+  simple > wrong      -1.0000  0.2689  1.3133  5.9156  0.9973  0.0027
+  technical > vague    0.0000  0.5000  0.6931  1.8383  0.8627  0.1476
+  technical > wrong   -1.5000  0.1824  1.7014  3.8624  0.9794  0.0208
+  vague > wrong       -1.5000  0.1824  1.7014  2.0241  0.8833  0.1241
+  mean loss over pairs, before       1.0596
+  mean loss over pairs, after        0.0727

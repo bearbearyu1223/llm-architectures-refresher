@@ -37,6 +37,7 @@ memory.
 
 Run: ``uv run demo08`` (``--quick`` runs every section at toy size)
 ``uv run demo08 --temperature`` prints §2's temperature table (``d08_temperature.py``).
+``uv run demo08 --reward-model`` prints §8's toy reward model (``d08_reward_model.py``).
 """
 
 from __future__ import annotations
@@ -1252,6 +1253,11 @@ def main() -> None:
     if "--temperature" in sys.argv:
         # Post §2's temperature table: one forward pass, no training.
         from .d08_temperature import run
+        run()
+        return
+    if "--reward-model" in sys.argv:
+        # Section 8's toy reward model: no network, no download, runs in moments.
+        from .d08_reward_model import run
         run()
         return
     quick = "--quick" in sys.argv

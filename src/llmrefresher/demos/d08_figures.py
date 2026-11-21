@@ -1,6 +1,6 @@
 """Figures for post 8. Kept apart from the demo so the sections stay readable.
 
-Twelve figures, in the post's order:
+Thirteen figures, in the post's order:
 
 * :func:`figure_sft_vs_grpo` (section 1): one question trained two ways.
 * :func:`figure_token_logprobs` (section 1): the model scoring that question's
@@ -21,6 +21,8 @@ Twelve figures, in the post's order:
 * :func:`figure_heldout_accuracy` (section 6): each seed's gain, real reward
   beside its shuffled control.
 * :func:`figure_sharpening_split` (section 7): fixes inside and outside the 44.
+* :func:`figure_reward_model` (section 8): how InstructGPT's reward model is
+  trained on ranked pairs, and how its score becomes PPO's reward.
 * :func:`figure_rlhf_vs_ours` (section 8): InstructGPT's recipe beside this
   post's setup.
 
@@ -47,6 +49,7 @@ Render them all with ``uv run python -m llmrefresher.demos.d08_figures``
 from __future__ import annotations
 
 import argparse
+import itertools
 import math
 import re
 import sys
@@ -62,6 +65,7 @@ from .. import plotting
 from ..plotting import THEMES, Theme, ink_for, save_both, styled
 from ..report import WIDTH
 from .d07_figures import _arrow, _box, _canvas, _crop, _lines
+from .d08_reward_model import EXAMPLE_PROMPT, EXAMPLE_REPLIES
 from .d08_rewards import FULL, GROUP, HAND_STEPS, QUESTION, SLUG, score
 
 PROBLEM = (23, 47)  # section 1's example question; checked against the capture
@@ -71,6 +75,13 @@ PROBLEM = (23, 47)  # section 1's example question; checked against the capture
 INSTRUCTGPT_RM_SIZE = "6B"          # §3.5: the reward model's size
 INSTRUCTGPT_RANKED = (4, 9)         # §3.5: replies ranked per prompt
 INSTRUCTGPT_BETA = 0.02             # Appendix C.4: per-token KL coefficient
+
+# Section 8's made-up example (the post labels it as one); not data from any paper.
+# The prompt and replies come from d08_reward_model so the figure and its receipt
+# name the same replies; these are the figure's one-line gists of them, in order.
+EXAMPLE_GIST = ("air bounces blue light most", "Rayleigh scattering",
+                "“Great question! …”", "“it reflects the ocean”")
+EXAMPLE_NEW_PROMPT = "Explain to a ten-year-old why grass is green."
 
 
 def s1_example(problem: tuple[int, int] = PROBLEM) -> tuple[str, str, str]:
@@ -2407,9 +2418,171 @@ def figure_rlhf_vs_ours(theme: Theme, capture: Path = CAPTURE) -> Path:
     return save_both(fig, SLUG, "rlhf-vs-ours", theme)
 
 
+def figure_reward_model(theme: Theme, capture: Path = CAPTURE) -> Path:
+    """Two bands: how InstructGPT's reward model is made from ranked replies
+    (Step 2), and how its score becomes PPO's reward (Step 3). Reads nothing
+    from the capture: the example prompt and replies are the toy reward model's
+    (``d08_reward_model``), so the figure and that receipt name the same replies,
+    and InstructGPT's facts are this module's named constants. ``capture`` is
+    accepted only so every figure has the same signature."""
+    del capture
+    blue, grey = theme.series[0], theme.muted
+    ink, sec = theme.ink, theme.secondary
+    fig, ax = _canvas(12.4, 7.95)
+
+    def box(x0, x1, y0, y1, lines, *, edge=sec, lw=1.6, dashed=False, tag=None, fill=None,
+            sizes=(11.2, 10.3), gap=0.28, cx=None, math_last=False):
+        _box(ax, x0, y0, x1 - x0, y1 - y0, edge, lw=lw, dashed=dashed, fill=fill or "none")
+        text_ink = ink_for(fill) if fill else ink
+        n = len(lines)
+        top = (y0 + y1) / 2 + gap * (n - 1) / 2 - (0.1 if tag else 0)
+        for i, line in enumerate(lines):
+            size = sizes[0] if i == 0 else sizes[1]
+            if math_last and i == n - 1:
+                size = 10.0
+            ax.text((x0 + x1) / 2 if cx is None else cx, top - gap * i, line, ha="center",
+                    va="center", fontsize=size, fontweight="bold" if i == 0 else "normal",
+                    color=text_ink if (i == 0 or fill) else sec, zorder=5)
+        if tag:
+            ax.text(x1 - 0.1, y1 - 0.17, tag, ha="right", va="center", fontsize=9.2,
+                    color=sec, style="italic", zorder=5)
+
+    def label(x, y, text, *, size=9.6, italic=True, backed=False, va="center"):
+        ax.text(x, y, text, ha="center", va=va, fontsize=size, color=sec,
+                style="italic" if italic else "normal", zorder=6,
+                bbox=dict(boxstyle="square,pad=0.15", facecolor=theme.surface,
+                          edgecolor="none") if backed else None)
+
+    # ---- panel 1: making the reward model ------------------------------------
+    p1 = (4.25, 6.75)
+    m1 = (p1[0] + p1[1]) / 2
+    ax.text(0.2, 7.2, "1. Making the reward model (Step 2)", ha="left", va="center",
+            fontsize=12.5, fontweight="bold", color=ink)
+    box(0.2, 1.95, *p1, ["a prompt"] + _prompt_lines(EXAMPLE_PROMPT), dashed=True,
+        tag="example", gap=0.27)
+
+    # the replies: four cards, fanned out from the prompt and back in to the ranking
+    rx0, rx1, bus_in, bus_out = 2.4, 5.1, 2.15, 5.3
+    lo, hi = INSTRUCTGPT_RANKED
+    ax.text((rx0 + rx1) / 2, p1[1] - 0.12, "the model writes several replies", ha="center",
+            va="center", fontsize=10.3, fontweight="bold", color=ink)
+    ax.text((rx0 + rx1) / 2, p1[1] - 0.4, f"(InstructGPT ranked {lo} to {hi})", ha="center",
+            va="center", fontsize=9.2, color=sec)
+    card_h, card_gap = 0.4, 0.1
+    ys = [p1[1] - 0.82 - i * (card_h + card_gap) for i in range(len(EXAMPLE_REPLIES))]
+    for y, name, gist in zip(ys, EXAMPLE_REPLIES, EXAMPLE_GIST, strict=True):
+        _box(ax, rx0, y - card_h / 2, rx1 - rx0, card_h, sec, lw=1.1)
+        head = ax.text(rx0 + 0.1, y, f"{name}:", ha="left", va="center", fontsize=9.3,
+                       fontweight="bold", color=ink, zorder=5)
+        ax.annotate(gist, xy=(1, 0.5), xycoords=head, xytext=(3, 0),
+                    textcoords="offset points", ha="left", va="center", fontsize=8.9,
+                    color=sec, zorder=5)
+        _arrow(ax, bus_in, y, rx0, y, sec, lw=1.2)
+        ax.plot([rx1, bus_out], [y, y], color=sec, lw=1.2, zorder=3)
+    ax.plot([1.95, bus_in], [m1, m1], color=sec, lw=1.5, zorder=3)
+    ax.plot([bus_in] * 2, [ys[0], ys[-1]], color=sec, lw=1.5, zorder=3,
+            solid_capstyle="butt")
+    ax.plot([bus_out] * 2, [ys[0], ys[-1]], color=sec, lw=1.5, zorder=3,
+            solid_capstyle="butt")
+
+    # the ranking, with a best-to-worst arrow down its left inner edge
+    kx0, kx1 = 5.55, 7.3
+    _box(ax, kx0, p1[0], kx1 - kx0, p1[1] - p1[0], sec, lw=1.6)
+    ax.text((kx0 + kx1) / 2, p1[1] - 0.25, "people rank them", ha="center", va="center",
+            fontsize=10.6, fontweight="bold", color=ink, zorder=5)
+    rank_ys = [p1[1] - 0.85 - i * 0.39 for i in range(len(EXAMPLE_REPLIES))]
+    for y, name in zip(rank_ys, EXAMPLE_REPLIES, strict=True):
+        ax.text(kx0 + 1.0, y, name, ha="center", va="center", fontsize=10.3, color=sec,
+                zorder=5)
+    ax.text(kx0 + 0.27, rank_ys[0] + 0.2, "best", ha="center", va="bottom", fontsize=9,
+            color=sec, zorder=5)
+    ax.text(kx0 + 0.27, rank_ys[-1] - 0.2, "worst", ha="center", va="top", fontsize=9,
+            color=sec, zorder=5)
+    _arrow(ax, kx0 + 0.27, rank_ys[0] + 0.15, kx0 + 0.27, rank_ys[-1] - 0.15, sec, lw=1.1)
+    _arrow(ax, bus_out, m1, kx0, m1, sec)
+
+    # the pairs
+    ps = list(itertools.combinations(EXAMPLE_REPLIES, 2))
+    n_pairs = math.comb(len(EXAMPLE_REPLIES), 2)
+    assert len(ps) == n_pairs
+    px0, px1 = 7.6, 9.3
+    box(px0, px1, *p1, [f"{n_pairs} pairs,", "preferred first"]
+        + [f"{w} > {l_}" for w, l_ in ps], sizes=(10.6, 9.6), gap=0.27)
+    _arrow(ax, kx1, m1, px0, m1, sec)
+
+    # the reward model
+    mx0, mx1 = 9.6, 12.25
+    box(mx0, mx1, *p1, [r"reward model $r_\phi(x, y)$", "one score per reply,",
+                        "trained so the first reply", "in each pair scores higher",
+                        "loss for one pair:",
+                        r"$-\log\,\sigma(r_\phi(x, y_w) - r_\phi(x, y_l))$"],
+        lw=2.0, tag="learned", math_last=True, gap=0.31)
+    _arrow(ax, px1, m1, mx0, m1, sec)
+
+    # ---- panel 2: using it to train the policy -------------------------------
+    p2 = (1.75, 3.3)
+    m2 = (p2[0] + p2[1]) / 2
+    ax.text(0.2, 3.8, "2. Using it to train the policy (Step 3)", ha="left", va="center",
+            fontsize=12.5, fontweight="bold", color=ink)
+    stations = [(0.2, 1.95), (2.3, 4.1), (4.45, 6.55), (7.15, 9.15), (9.75, 12.25)]
+    box(*stations[0], *p2, ["a prompt"] + _prompt_lines(EXAMPLE_NEW_PROMPT), dashed=True,
+        tag="example", gap=0.27)
+    box(*stations[1], *p2, [r"policy $\pi_\theta$", "writes a reply y"], edge=blue, lw=2.0)
+    box(*stations[2], *p2, ["reward model", "scores the reply:", r"one number, $r_\phi(x, y)$"],
+        lw=2.0, tag="learned")
+    box(*stations[3], *p2, ["minus a KL penalty", "to the SFT model,",
+                            f"per token, β = {INSTRUCTGPT_BETA}"])
+    box(*stations[4], *p2, ["PPO update", "baseline: value model,", "initialized from",
+                            "the reward model"], lw=2.0)
+    for (_, a1), (b0, _) in zip(stations[:-1], stations[1:], strict=True):
+        _arrow(ax, a1, m2, b0, m2, sec)
+    for (a, b), word in [((stations[2][1], stations[3][0]), "score"),
+                         ((stations[3][1], stations[4][0]), "reward")]:
+        label((a + b) / 2, m2 + 0.08, word, size=9.4, italic=False, va="bottom")
+
+    # the frozen SFT model under the penalty
+    sx0, sx1 = stations[3]
+    sft = (0.75, 1.35)
+    fr_fill = _over(grey, 0.3 if theme.name == "light" else 0.5, theme.surface)
+    box(sx0, sx1, *sft, ["SFT model", "(frozen)"], edge=grey, fill=fr_fill, gap=0.24,
+        sizes=(10.6, 9.6))
+    _arrow(ax, (sx0 + sx1) / 2, sft[1], (sx0 + sx1) / 2, p2[0], sec)
+
+    # the updated policy goes back to the start, under the SFT box
+    px_c = sum(stations[1]) / 2
+    ppo_c = sum(stations[4]) / 2
+    _poly_arrow(ax, [ppo_c, ppo_c, px_c, px_c], [p2[0], 0.45, 0.45, p2[0]], sec)
+    label((px_c + sx0) / 2, 0.45, "updated policy", backed=True)
+
+    # ---- between the panels: the trained reward model is carried down ---------
+    top_c, bot_c = (mx0 + mx1) / 2, sum(stations[2]) / 2
+    yj = 3.8
+    ax.plot([top_c, top_c, bot_c], [p1[0], yj, yj], color=sec, lw=0.9,
+            linestyle=(0, (2, 2)), zorder=3)
+    ax.annotate("", xy=(bot_c, p2[1]), xytext=(bot_c, yj), annotation_clip=False,
+                arrowprops=dict(arrowstyle="-|>", color=sec, linewidth=0.9,
+                                linestyle=(0, (2, 2)), shrinkA=0, shrinkB=0,
+                                mutation_scale=12), zorder=3)
+    label(8.0, yj, "the trained reward model", backed=True)
+
+    ax.text(0.2, 7.75, "The reward model: trained on people's rankings, then used as the reward",
+            ha="left", va="center", fontsize=14, fontweight="bold", color=ink)
+    _crop(fig, ax, 0.25, 7.95)
+    return save_both(fig, SLUG, "reward-model", theme)
+
+
+def _prompt_lines(prompt: str) -> list[str]:
+    """An example prompt in three quoted lines, split before "ten-year-old" and
+    after "why": '"Explain to a' / 'ten-year-old why' / 'the sky is blue."'."""
+    head, tail = prompt.split(" why ", 1)
+    first, second = head.rsplit(" ", 1)
+    return [f'"{first}', f"{second} why", f'{tail}"']
+
+
 FIGURES = (figure_sft_vs_grpo, figure_token_logprobs, figure_baseline_reach,
            figure_all_equal_groups, figure_clip, figure_kl_k3, figure_grpo_step, figure_control_shuffle, figure_training_logs,
-           figure_heldout_accuracy, figure_sharpening_split, figure_rlhf_vs_ours)
+           figure_heldout_accuracy, figure_sharpening_split, figure_reward_model,
+           figure_rlhf_vs_ours)
 
 
 def main() -> None:

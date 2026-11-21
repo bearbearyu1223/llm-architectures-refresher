@@ -183,6 +183,7 @@ REAL = d08_figures.CAPTURE.read_text()
     (d08_figures.figure_training_logs, "training-logs"),
     (d08_figures.figure_heldout_accuracy, "heldout-accuracy"),
     (d08_figures.figure_sharpening_split, "sharpening-split"),
+    (d08_figures.figure_reward_model, "reward-model"),
     (d08_figures.figure_rlhf_vs_ours, "rlhf-vs-ours"),
 ])
 def test_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
@@ -198,9 +199,9 @@ def test_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
 
 
 def test_every_figure_is_tested():
-    # ten above, plus baseline-reach and kl-k3, tested below with and without the
+    # eleven above, plus baseline-reach and kl-k3, tested below with and without the
     # blocks they read (s2's split table, s4's step detail)
-    assert len(FIGURES) == 12
+    assert len(FIGURES) == 13
 
 
 # -- the real capture's numbers ---------------------------------------------------
@@ -759,3 +760,12 @@ def test_token_logprobs_emphasises_the_least_sure_token(tmp_path, monkeypatch):
     assert "0.0396" in texts and "−3.2286" in texts
     assert "exp(−3.2286)\n= 0.0396" in texts and "89% of the sum" in joined
     assert "1091" not in joined and "7.1006" not in joined
+
+
+def test_reward_model_figure_names_the_receipts_replies():
+    # the figure's gists line up one to one with the toy reward model's replies
+    from llmrefresher.demos import d08_reward_model
+    assert d08_figures.EXAMPLE_REPLIES is d08_reward_model.EXAMPLE_REPLIES
+    assert len(d08_figures.EXAMPLE_GIST) == len(d08_reward_model.EXAMPLE_REPLIES)
+    assert FIGURES.index(d08_figures.figure_reward_model) + 1 == \
+        FIGURES.index(d08_figures.figure_rlhf_vs_ours)
