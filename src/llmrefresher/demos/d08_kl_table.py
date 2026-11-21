@@ -6,13 +6,14 @@ policy's (the "k3" estimate), and that the charge is lopsided: a token the
 policy made rarer than the reference did costs much more than one it made
 more likely by the same factor. This program prints that charge for ratios
 in mirror pairs (x2 and /2, x10 and /10), using :func:`kl_estimate`, the
-function ``grpo_objective`` trains with.
+same expression ``grpo_objective`` writes inline (tests/test_d08_kl_table.py
+checks they agree).
 
 The last line re-computes demo 08 §4's "max ratio" token (ratio 1.4386,
 KL est. 5.88e-02) and stops with an error if it doesn't match.
 
-Arithmetic in float64 so the large rows print exactly; training runs the
-same function in float32. Nothing is sampled and no model is loaded.
+Arithmetic in float64 so the large rows print exactly; training computes the
+same expression in float32. Nothing is sampled and no model is loaded.
 
 Run: ``uv run demo08 --kl-table`` (no model is loaded).
 """

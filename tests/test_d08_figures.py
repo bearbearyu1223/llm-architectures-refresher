@@ -200,7 +200,7 @@ def test_figures_write_both_themes(figure, name, tmp_path, monkeypatch):
 
 def test_every_figure_is_tested():
     # eleven above, plus baseline-reach and kl-k3, tested below with and without the
-    # blocks they read (s2's split table, s4's step detail)
+    # blocks they read (s2's split table, the kl-table capture's pair table)
     assert len(FIGURES) == 13
 
 
@@ -606,30 +606,99 @@ def test_parse_step_detail_rejects(old, new):
 
 def test_kl_k3_draws_the_printed_points(tmp_path, monkeypatch):
     monkeypatch.setattr(plotting, "REPO_ROOT", tmp_path)
-    cap = tmp_path / "demo08.txt"
-    cap.write_text(without(DETAIL))
+    cap = tmp_path / "demo08-kl-table.txt"
+    cap.write_text(KL_REAL.replace(KL_PAIR_HEADER, "  pairs       more likely  less likely"))
     with pytest.raises(CaptureError):
-        d08_figures.figure_kl_k3(THEMES[0], cap)                  # no detail block
-    cap = d08_figures.CAPTURE
+        d08_figures.figure_kl_k3(THEMES[0], kl_table=cap)       # no pair table
     seen = {}
 
     def keep(fig, slug, name, theme):
         ax = fig.axes[0]
-        seen["points"] = [tuple(map(float, (line.get_xdata()[0], line.get_ydata()[0])))
-                          for line in ax.lines if line.get_marker() == "o"]
+        seen["points"] = sorted(tuple(map(float, (line.get_xdata()[0], line.get_ydata()[0])))
+                                for line in ax.lines if line.get_marker() == "o")
         seen["texts"] = [t.get_text() for t in ax.texts]
         seen["xlim"] = ax.get_xlim()
+        seen["ylabel"] = ax.get_ylabel()
         return tmp_path / f"{name}-{theme.name}.png"
 
     monkeypatch.setattr(d08_figures, "save_both", keep)
     for theme in THEMES:
         with styled(theme):
-            d08_figures.figure_kl_k3(theme, cap)
-        assert seen["points"] == [(9.27e-05, 1.08e+04), (1.44, 5.88e-02)]
-        assert "smallest ratio 9.27e-05, estimate 1.08e+04" in seen["texts"]
-        assert "largest ratio 1.44e+00,\nestimate 5.88e-02" in seen["texts"]
-        assert "step 2's average, 4.52e+02" in seen["texts"]
-        assert seen["xlim"][0] < 9.27e-05                          # the min point is inside
+            d08_figures.figure_kl_k3(theme)
+        assert seen["points"] == [(1e-4, 9989.7897), (0.1, 6.6974), (0.5, 0.3069),
+                                  (2.0, 0.1931), (10.0, 1.4026)]
+        assert "x2 vs /2:\n0.1931 vs 0.3069" in seen["texts"]
+        assert "x10 vs /10: 1.4026 vs 6.6974" in seen["texts"]
+        assert "/10000: 9989.7897" in seen["texts"]
+        assert {"pushed down (less likely)", "pushed up (more likely)"} <= set(seen["texts"])
+        assert not any("4.52e+02" in t or "9.27e-05" in t for t in seen["texts"])  # s4c's
+        assert seen["xlim"][0] < 1e-4 and seen["xlim"][1] > 10           # dots inside
+        assert seen["ylabel"] == "one token's KL estimate (log scale)"
+
+
+# -- review round 5: the KL figure reads the kl-table capture (s5k) ------------------
+
+from llmrefresher.demos.d08_figures import (  # noqa: E402
+    KL_HEADER,
+    KL_PAIR_HEADER,
+    parse_kl_table,
+)
+
+KL_REAL = d08_figures.KL_TABLE.read_text()
+
+
+def test_parse_kl_table():
+    t = parse_kl_table(KL_REAL)
+    assert [r.label for r in t.rows] == ["x10", "x2", "x1.5", "x1", "/1.5", "/2", "/10",
+                                         "/100", "/10000"]
+    assert [(u.label, u.estimate_text, d.label, d.estimate_text) for u, d in t.pairs] == [
+        ("x2", "0.1931", "/2", "0.3069"), ("x10", "1.4026", "/10", "6.6974")]
+    assert (t.extreme.label, t.extreme.ratio, t.extreme.estimate_text) == (
+        "/10000", 1e-4, "9989.7897")
+
+
+def test_kl_table_round_trips_the_demos_printer():
+    from llmrefresher.demos import d08_kl_table
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        d08_kl_table.run()
+    t = parse_kl_table(buf.getvalue())
+    assert t == parse_kl_table(KL_REAL)
+
+
+@pytest.mark.parametrize("old, new", [
+    ("  x2           2.0000  -0.6931     0.1931", "  x2           2.0000  -0.6931     0.1932"),
+    ("  /2           0.5000  +0.6931     0.3069", "  /2           0.5000  -0.6931     0.3069"),
+    ("  x10         10.0000", "  x10          9.0000"),                 # not the label
+    ("  x10 vs /10       1.4026       6.6974", "  x10 vs /10       1.4026       6.6975"),
+    ("  x10 vs /10", "  x10 vs /2 "),                                   # not one factor
+    ("  /100         0.0100  +4.6052    94.3948\n", ""),                # a row missing
+    (KL_HEADER, KL_HEADER.replace("estimate", "estimates")),
+    ("=" * 74 + "\nDEMO 08:", "DEMO 08:"),                              # no banner
+])
+def test_parse_kl_table_rejects(old, new):
+    assert KL_REAL.count(old) == 1, old
+    broken = KL_REAL.replace(old, new)
+    with pytest.raises(CaptureError):
+        parse_kl_table(broken)
+
+
+def test_reward_model_policy_box_is_neutral(tmp_path, monkeypatch):
+    # blue is the post's SFT colour and orange its GRPO colour: no box edge uses either
+    from matplotlib.colors import to_hex
+    seen = []
+
+    def keep(fig, slug, name, theme):
+        seen.extend(to_hex(p.get_edgecolor()) for ax in fig.axes for p in ax.patches)
+        return tmp_path / "x.png"
+
+    monkeypatch.setattr(d08_figures, "save_both", keep)
+    for theme in THEMES:
+        seen.clear()
+        with styled(theme):
+            d08_figures.figure_reward_model(theme)
+        assert seen
+        assert not {s.lower() for s in theme.series[:2]} & set(seen)
 
 
 def test_hand_update_keeps_the_printed_kl():

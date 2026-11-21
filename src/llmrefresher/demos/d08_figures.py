@@ -13,7 +13,8 @@ Thirteen figures, in the post's order:
 * :func:`figure_clip` (section 5): one token's clipped term against its
   probability ratio.
 * :func:`figure_kl_k3` (section 5): the per-token KL estimate against the
-  probability ratio, with s4a's two extreme ratios marked.
+  probability ratio, with s5k's mirror pairs (x2 vs /2, x10 vs /10) and its
+  /10000 row marked, read from the ``demo08 --kl-table`` capture.
 * :func:`figure_grpo_step` (section 6): one training step as a loop.
 * :func:`figure_control_shuffle` (section 6): section 4's group with its real
   rewards and with one example shuffle of them, as the control would train.
@@ -39,7 +40,7 @@ illustrative permutation the figure labels as an example (the demo doesn't
 print its shuffles); the rewards it reorders are parsed.
 
 Arithmetic on parsed numbers is allowed, and is shown on the figure where it
-produces a drawn number. Figure 2's counts and the k3 figure's two points are
+produces a drawn number. Figure 2's counts and the k3 figure's marked points are
 read from the tables that print them, not derived.
 
 Render them all with ``uv run python -m llmrefresher.demos.d08_figures``
@@ -1738,8 +1739,8 @@ def figure_clip(theme: Theme, capture: Path = CAPTURE) -> Path:
 def k3(ratio: float) -> float:
     """One token's KL estimate e^d - d - 1 with d = -log(ratio): 1/ratio + log(ratio) - 1.
 
-    ``ratio`` is policy over reference. In s4a's step 2 the reference is also
-    the sampler, so it is the ratio s4a prints.
+    ``ratio`` is policy over reference, the ratio the kl-table capture (s5k)
+    labels each row with.
     """
     if ratio <= 0:
         raise ValueError(f"ratio {ratio} must be positive")
@@ -1751,53 +1752,161 @@ def _decade_label(v: float) -> str:
     return f"{v:,.{max(0, -round(math.log10(v)))}f}"
 
 
-def figure_kl_k3(theme: Theme, capture: Path = CAPTURE) -> Path:
+KL_TABLE = plotting.REPO_ROOT / "outputs" / "demo08-kl-table.txt"
+KL_SECTION = "The KL estimate at a few probability ratios"
+KL_HEADER = "  ratio   as a number        d   estimate"
+KL_PAIR_HEADER = "  pair        more likely  less likely"
+KL_ROWS = 9      # rows the demo's ratio table prints (x10 down to /10000)
+KL_PAIRS = 2     # rows its mirror-pair table prints (x2 vs /2, x10 vs /10)
+KL_TOL = 5.1e-5  # half a unit in the 4th decimal, the table's precision
+
+
+@dataclass(frozen=True)
+class KLRow:
+    """One row of the kl-table's ratio table, as printed and as numbers."""
+
+    label: str           # "x2", "/10000"
+    ratio: float         # the factor the label names: 2.0, 0.0001
+    estimate: float
+    estimate_text: str   # "0.1931", as printed
+
+
+@dataclass(frozen=True)
+class KLTable:
+    """The kl-table capture's ratio table and its mirror pairs (s5k)."""
+
+    rows: tuple[KLRow, ...]
+    pairs: tuple[tuple[KLRow, KLRow], ...]   # (more likely, less likely)
+
+    @property
+    def extreme(self) -> KLRow:
+        """The row with the smallest ratio, the most-pushed-down token."""
+        return min(self.rows, key=lambda r: r.ratio)
+
+
+def _factor(label: str, what: str) -> float:
+    """The ratio a printed label names: "x2" is 2, "/10" is 0.1."""
+    m = _match(r"([x/])(\d+(?:\.\d+)?)", label, what)
+    f = float(m.group(2))
+    if f <= 0:
+        raise CaptureError(f"{what}: {label!r} names a zero factor")
+    return f if m.group(1) == "x" else 1 / f
+
+
+def parse_kl_table(text: str) -> KLTable:
+    """The demo08 --kl-table capture's two tables, each checked.
+
+    Every row's printed ratio, d and estimate must match the factor its label
+    names, d = -ln(ratio) and exp(d) - d - 1 to the printed precision; the
+    pair table's labels must read "xF vs /F" and its cells must be the ratio
+    table's estimates for those two rows, character for character.
+    """
+    _preamble(text)
+    rows = []
+    for cells in _table(text, KL_SECTION, KL_HEADER, KL_ROWS):
+        if len(cells) != 4:
+            raise CaptureError(f"s5k row {cells}: expected 4 cells")
+        label, as_number, d_text, est_text = cells
+        where = f"s5k row {label!r}"
+        ratio = _factor(label, where)
+        printed = _number(as_number, r"\d+\.\d{4}|\d\.\d{2}e[+-]\d{2}", where)
+        if not math.isclose(printed, ratio, rel_tol=5e-3, abs_tol=KL_TOL):
+            raise CaptureError(f"{where}: printed ratio {as_number} is not {ratio:g}")
+        d = _number(d_text, r"[+-]\d+\.\d{4}", where)
+        if abs(d + math.log(ratio)) > KL_TOL:
+            raise CaptureError(f"{where}: d {d_text} is not -ln({ratio:g})")
+        est = _number(est_text, r"\d+\.\d{4}", where)
+        if abs(est - k3(ratio)) > KL_TOL:
+            raise CaptureError(f"{where}: estimate {est_text} is not exp(d) - d - 1")
+        rows.append(KLRow(label, ratio, est, est_text))
+    if len({r.label for r in rows}) != len(rows):
+        raise CaptureError("s5k: a ratio label is printed twice")
+    by_label = {r.label: r for r in rows}
+    pairs = []
+    for cells in _table(text, KL_SECTION, KL_PAIR_HEADER, KL_PAIRS):
+        if len(cells) != 3:
+            raise CaptureError(f"s5k pair row {cells}: expected 3 cells")
+        m = _match(r"x(\S+) vs /(\S+)", cells[0], "s5k pair label")
+        if m.group(1) != m.group(2):
+            raise CaptureError(f"s5k pair {cells[0]!r} is not one factor either way")
+        up, down = (by_label.get(f"x{m.group(1)}"), by_label.get(f"/{m.group(1)}"))
+        if up is None or down is None:
+            raise CaptureError(f"s5k pair {cells[0]!r} names a row the ratio table lacks")
+        if (cells[1], cells[2]) != (up.estimate_text, down.estimate_text):
+            raise CaptureError(f"s5k pair {cells[0]!r}: {cells[1:]} are not the ratio "
+                               f"table's {up.estimate_text} and {down.estimate_text}")
+        pairs.append((up, down))
+    return KLTable(tuple(rows), tuple(pairs))
+
+
+def figure_kl_k3(theme: Theme, capture: Path = CAPTURE, kl_table: Path = KL_TABLE) -> Path:
     """The per-token KL estimate against the token's probability ratio, log-log.
 
-    One neutral curve, k3 = 1/ratio + log(ratio) - 1, and three marked
-    points: ratio 1 (estimate 0, an arrow to the floor), and the tokens with
-    s4a's step-2 smallest and largest ratio, each drawn at its own printed
-    (ratio, KL est.) from section 4's detail table (:func:`parse_step_detail`)
-    and labelled with those printed values. The dashed line is s4a's step-2
-    KL, the average over answers, as printed.
+    One neutral curve, k3 = 1/ratio + log(ratio) - 1, with s5k's mirror pairs
+    marked (x2 vs /2, x10 vs /10), each pair's two dots joined by a bracket
+    over the curve and labelled with the printed estimates, plus the table's
+    most-pushed-down row (/10000). Every marked number is parsed from the
+    ``demo08 --kl-table`` capture (:func:`parse_kl_table`). The left half is
+    shaded "pushed down", the right half "pushed up". ``capture`` (the main
+    demo's stdout) is accepted only so every figure has the same signature.
     """
-    text = capture.read_text()
-    hand = parse_hand_update(text)
-    detail = parse_step_detail(text)
-    low, high = detail.min_ratio, detail.max_ratio
-    average = float(hand.kl)
+    del capture
+    table = parse_kl_table(kl_table.read_text())
+    far = table.extreme
     ink, sec = theme.ink, theme.secondary
 
-    # a quarter-decade past the smallest ratio, so its point isn't cut by the frame
-    x_left = low.ratio / 10 ** 0.25
-    x_hi = max(10.0, 10.0 ** math.ceil(math.log10(high.ratio)))
-    y_lo = 10.0 ** min(-3, math.floor(math.log10(high.kl)))
-    y_hi = 10.0 ** max(5, math.ceil(math.log10(3 * max(low.kl, average))))
+    # a quarter-decade past the smallest and the largest ratio, so no dot or bracket
+    # leg sits on the frame; ticks run over whole decades inside that
+    x_left = far.ratio / 10 ** 0.25
+    x_hi = max(r.ratio for r in table.rows) * 10 ** 0.25
+    y_lo = 1e-3
+    y_hi = 10.0 ** max(5, math.ceil(math.log10(3 * far.estimate)))
 
-    fig, ax = plt.subplots(figsize=(9.6, 5.6))
+    fig, ax = plt.subplots(figsize=(9.6, 5.8))
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(x_left, x_hi)
     ax.set_ylim(y_lo, y_hi)
+
+    # the two sides, lightly shaded, each named at the top where the curve isn't
+    for (x0, x1), alpha, name, x, ha in [
+            ((x_left, 1.0), 0.16, "pushed down (less likely)", x_left * 1.35, "left"),
+            ((1.0, x_hi), 0.07, "pushed up (more likely)", x_hi / 1.35, "right")]:
+        a = alpha if theme.name == "light" else alpha * 1.4
+        ax.axvspan(x0, x1, color=theme.muted, alpha=a, lw=0, zorder=0)
+        ax.text(x, y_hi / 2.2, name, ha=ha, va="center", fontsize=10.5, style="italic",
+                color=ink_for(_over(theme.muted, a, theme.surface)), zorder=6)
+
     n = 600
     xs = [x_left * (x_hi / x_left) ** (i / n) for i in range(n + 1)]
     xs = sorted(set(xs + [1.0]))
     ys = [max(k3(x), y_lo / 10) for x in xs]  # 0 at ratio 1: drawn down to the floor
     ax.plot(xs, ys, color=ink, lw=2.2, zorder=3)
 
-    ax.axhline(average, color=sec, lw=1.3, linestyle=(0, (5, 3)), zorder=2)
-    ax.text(x_hi / 1.15, average * 1.3, f"step {HAND_STEPS}'s average, {hand.kl}",
-            ha="right", va="bottom", fontsize=10.5, color=ink)
-
-    for t in (low, high):
-        ax.plot([t.ratio], [t.kl], marker="o", markersize=8, color=ink, zorder=5,
+    def dot(r: KLRow) -> None:
+        ax.plot([r.ratio], [r.estimate], marker="o", markersize=7.5, color=ink, zorder=5,
                 clip_on=False)
-    ax.annotate(f"smallest ratio {low.ratio_text}, estimate {low.kl_text}",
-                (low.ratio, low.kl), xytext=(12, 4), textcoords="offset points",
-                ha="left", va="center", fontsize=10.5, color=ink)
-    ax.annotate(f"largest ratio {high.ratio_text},\nestimate {high.kl_text}",
-                (high.ratio, high.kl), xytext=(12, -6), textcoords="offset points",
-                ha="left", va="top", fontsize=10.5, color=ink, linespacing=1.2)
+
+    # each mirror pair: a bracket over the V, its legs dropping toward the two dots,
+    # and the label above it, centred on ratio 1
+    for (up, down), lift, two_lines in zip(table.pairs, (2.6, 3.2), (True, False),
+                                           strict=True):
+        dot(up)
+        dot(down)
+        yb = max(up.estimate, down.estimate) * lift
+        ax.plot([down.ratio, down.ratio, up.ratio, up.ratio],
+                [down.estimate * 1.45, yb, yb, up.estimate * 1.45], color=sec, lw=1.1,
+                solid_joinstyle="miter", zorder=4)
+        name = f"{up.label} vs {down.label}:"
+        values = f"{up.estimate_text} vs {down.estimate_text}"
+        ax.text(1.0, yb * 1.35, f"{name}\n{values}" if two_lines else f"{name} {values}",
+                ha="center", va="bottom", fontsize=10.5, color=ink, linespacing=1.2,
+                zorder=6)
+
+    dot(far)
+    ax.annotate(f"{far.label}: {far.estimate_text}", (far.ratio, far.estimate),
+                xytext=(10, 0), textcoords="offset points", ha="left", va="center",
+                fontsize=10.5, color=ink)
     # the V's tip is the estimate 0 at ratio 1, which a log axis can't show: an
     # arrow along the floor points at it
     ax.annotate("ratio 1: 0", (0.93, y_lo * 1.25), xytext=(0.2, y_lo * 1.25),
@@ -1806,7 +1915,7 @@ def figure_kl_k3(theme: Theme, capture: Path = CAPTURE) -> Path:
                                 mutation_scale=12))
 
     decades_x = [10.0 ** k for k in range(math.ceil(math.log10(x_left)),
-                                          round(math.log10(x_hi)) + 1)]
+                                          math.floor(math.log10(x_hi)) + 1)]
     decades_y = [10.0 ** k for k in range(round(math.log10(y_lo)), round(math.log10(y_hi)) + 1)]
     ax.set_xticks(decades_x)
     ax.set_xticklabels([_decade_label(v) for v in decades_x])
@@ -1815,7 +1924,7 @@ def figure_kl_k3(theme: Theme, capture: Path = CAPTURE) -> Path:
     ax.minorticks_off()
     ax.grid(axis="x", visible=False)
     ax.set_xlabel("probability ratio, policy / reference (log scale)")
-    ax.set_ylabel("per-token KL estimate (log scale)")
+    ax.set_ylabel("one token's KL estimate (log scale)")
     ax.set_title("One token pushed down costs far more than one pushed up", loc="left",
                  fontsize=12.5, pad=12)
     fig.tight_layout()
@@ -2426,7 +2535,7 @@ def figure_reward_model(theme: Theme, capture: Path = CAPTURE) -> Path:
     and InstructGPT's facts are this module's named constants. ``capture`` is
     accepted only so every figure has the same signature."""
     del capture
-    blue, grey = theme.series[0], theme.muted
+    grey = theme.muted
     ink, sec = theme.ink, theme.secondary
     fig, ax = _canvas(12.4, 7.95)
 
@@ -2527,7 +2636,7 @@ def figure_reward_model(theme: Theme, capture: Path = CAPTURE) -> Path:
     stations = [(0.2, 1.95), (2.3, 4.1), (4.45, 6.55), (7.15, 9.15), (9.75, 12.25)]
     box(*stations[0], *p2, ["a prompt"] + _prompt_lines(EXAMPLE_NEW_PROMPT), dashed=True,
         tag="example", gap=0.27)
-    box(*stations[1], *p2, [r"policy $\pi_\theta$", "writes a reply y"], edge=blue, lw=2.0)
+    box(*stations[1], *p2, [r"policy $\pi_\theta$", "writes a reply y"], lw=2.0)
     box(*stations[2], *p2, ["reward model", "scores the reply:", r"one number, $r_\phi(x, y)$"],
         lw=2.0, tag="learned")
     box(*stations[3], *p2, ["minus a KL penalty", "to the SFT model,",
