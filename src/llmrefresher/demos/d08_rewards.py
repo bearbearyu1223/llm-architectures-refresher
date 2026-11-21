@@ -36,6 +36,7 @@ network with its adapters switched off, so only one copy of the weights is in
 memory.
 
 Run: ``uv run demo08`` (``--quick`` runs every section at toy size)
+``uv run demo08 --temperature`` prints §2's temperature table (``d08_temperature.py``).
 """
 
 from __future__ import annotations
@@ -1248,6 +1249,11 @@ def _save(base: Eval, runs: list[Run], cen: Census, test) -> None:
 def main() -> None:
     hf_logging.disable_progress_bar()
     hf_logging.set_verbosity_error()
+    if "--temperature" in sys.argv:
+        # Post §2's temperature table: one forward pass, no training.
+        from .d08_temperature import run
+        run()
+        return
     quick = "--quick" in sys.argv
     sizes = QUICK if quick else FULL
     torch.manual_seed(0)

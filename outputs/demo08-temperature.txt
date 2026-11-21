@@ -1,0 +1,30 @@
+==========================================================================
+DEMO 08: Temperature at one token
+==========================================================================
+device        : mps (Apple arm64)
+torch         : 2.13.0
+platform      : Darwin 24.6.0 (arm64)
+device memory : 17.2 GB
+  model                              Qwen/Qwen2.5-0.5B-Instruct
+  precision                          float32, no LoRA adapters
+
+--------------------------------------------------------------------------
+Temperature at the third digit of 1081              [post §2]
+--------------------------------------------------------------------------
+  Question: What is 23 x 47? Answer with just the number.
+  answer so far                      "10", next is the third digit
+
+  token             score gap  T = 0.5  T = 1.0  T = 2.0
+  --------------------------------------------------------
+  '3'                    0.00   0.7553   0.5118   0.2084
+  '0'                   -0.63   0.2151   0.2731   0.1523
+  '2'                   -1.93   0.0159   0.0742   0.0794
+  '8'                   -2.19   0.0094   0.0572   0.0697
+  '6'                   -3.10   0.0015   0.0230   0.0441
+  all other tokens              0.0028   0.0608   0.4461
+
+  score gap: each token's raw score minus the top token's, at T = 1.
+  Each column divides every score by T, then turns them into
+  probabilities. No top-k or top-p, as in the training runs.
+
+  probability of '8' at T = 1.0, as in §1   0.0572
