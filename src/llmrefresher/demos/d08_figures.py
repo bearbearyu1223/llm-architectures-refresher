@@ -4,7 +4,8 @@ Twelve figures, in the post's order:
 
 * :func:`figure_sft_vs_grpo` (section 1): one question trained two ways.
 * :func:`figure_token_logprobs` (section 1): the model scoring that question's
-  answer token by token, from s1a and s1b.
+  answer token by token, and the answer's probability worked out from s1a's
+  values, as a product and as a sum of logs.
 * :func:`figure_baseline_reach` (section 2): the 200 test problems split four
   ways by greedy and by eight samples, from the split table printed after s2a.
 * :func:`figure_all_equal_groups` (section 4): groups with no signal, and
@@ -263,13 +264,25 @@ def least_sure(probs: tuple[float, ...]) -> int:
     return min(range(len(probs)), key=lambda i: (probs[i], i))
 
 
+def reconcile(probs, logprobs, total: float, whole: float) -> None:
+    """Raise unless the printed log-probs add to the printed total and the printed
+    probs multiply to the printed whole-answer probability, at 4 decimals. The
+    figure writes both calculations out, so they must hold as printed."""
+    if f"{sum(logprobs):.4f}" != f"{total:.4f}":
+        raise CaptureError(f"the log-probs add to {sum(logprobs):.4f}, not {total:.4f}")
+    if f"{math.prod(probs):.4f}" != f"{whole:.4f}":
+        raise CaptureError(f"the probs multiply to {math.prod(probs):.4f}, not {whole:.4f}")
+
+
 def parse_token_scores(text: str) -> TokenScores:
     """s1a's per-token table and s1b's totals, every value checked against the others.
 
     The row count must match "answer tokens scored"; the digits must spell the
     right answer of :func:`s1_example`, then ``<|im_end|>``; each prob must be
-    exp(log-prob), the total their sum, the whole-answer probability exp(total)
-    and the cross-entropy -total / n, all to the printed rounding.
+    exp(log-prob), the whole-answer probability exp(total) and the cross-entropy
+    -total / n, to the printed rounding. The figure writes out the sum of the
+    printed log-probs and the product of the printed probs, so those must equal
+    s1b's total and whole-answer probability exactly at 4 decimals.
     """
     problem = parse_s1_example(text)
     lines = _section(text, S1_SECTION)
@@ -299,8 +312,7 @@ def parse_token_scores(text: str) -> TokenScores:
     whole = kv("probability of the whole answer", _P)
     ce = kv("cross-entropy (mean of -log-prob)", r"\d+\.\d{4}")
     wrong_total = kv(f'same, for the wrong answer "{wrong}"', _LP)
-    if abs(sum(lps) - total) > 5e-5 * (n + 1):
-        raise CaptureError(f"s1b's sum {total} is not the sum of s1a's log-probs")
+    reconcile(ps, lps, total, whole)
     if abs(math.exp(total) - whole) > 1e-4:
         raise CaptureError(f"s1b's whole-answer probability {whole} is not exp({total})")
     if abs(-total / n - ce) > 1e-4:
@@ -1277,122 +1289,132 @@ def _signed(v: float) -> str:
     return f"{v:.4f}".replace("-", "−")
 
 
+def _chip(ax, x: float, y: float, text: str, fill: str, *, w: float, h: float,
+          size: float, bold: bool = False) -> None:
+    """A value on a rounded chip centred at ``(x, y)``, its ink chosen by the fill."""
+    _box(ax, x - w / 2, y - h / 2, w, h, fill, fill=fill, lw=0, z=3)
+    ax.text(x, y, text, ha="center", va="center", fontsize=size, color=ink_for(fill),
+            fontweight="bold" if bold else "normal", zorder=5)
+
+
 def figure_token_logprobs(theme: Theme, capture: Path = CAPTURE) -> Path:
     """The model scoring section 1's right answer, token by token (s1a, s1b).
 
-    Left: each answer token's probability. Right: the answer's log-prob as one
-    stacked bar of its tokens' log-probs, beside the wrong answer's total. The
-    emphasised token is :func:`least_sure`'s pick from the parsed probs, not a
-    typed index. Its share of the total and the other tokens' sum are arithmetic
-    on the parsed values, drawn as such.
+    Top: each answer token's probability, as bars. Below, in the same columns,
+    the calculation: the probabilities multiplied, giving s1b's probability of
+    the whole answer, and under each its log, the log-probs added, giving s1b's
+    sequence log-prob; an arrow links the two totals by e^x. Every factor, term
+    and total is a printed value; the parser checks that the printed values
+    multiply and add to the printed totals. The emphasised column is
+    :func:`least_sure`'s pick, and its share of the sum is arithmetic on the
+    parsed values.
 
     No series colour: this is the starting model's own scoring, before any
     training, so blue (SFT), orange (GRPO) or green (control) would each read as
     a result. The emphasis is the theme's ink, the rest its muted grey.
     """
     s = parse_token_scores(capture.read_text())
-    question, right, wrong = s1_example(s.problem)
-    assert right == s.right and wrong == s.wrong, "the parser checked both"
+    question, right, _ = s1_example(s.problem)
+    assert right == s.right, "the parser checked it"
     k = least_sure(s.probs)
     n = len(s.tokens)
     emph = theme.ink
     quiet = _over(theme.muted, _recessive(theme), theme.surface)
     names = ["end of turn" if t == END_OF_TURN else f"'{t}'" for t in s.tokens]
 
-    fig, (left, right_ax) = plt.subplots(1, 2, figsize=(11.2, 5.3),
-                                         gridspec_kw={"width_ratios": [1, 1.35], "wspace": 0.28})
+    x_lo, x_hi = -0.6, n - 0.4  # the bars' data range, shared by the calculation
+    W, left_in, right_in = 10.4, 1.75, 2.2  # inches: width, the bar panel's margins
+    unit = (W - left_in - right_in) / (x_hi - x_lo)  # inches per token column
+    calc_rows = 2.75  # the calculation's height, in column widths
+    calc_h, gap_h, top_h, head_h = calc_rows * unit, 0.75, 3.1, 1.45  # inches
+    H = calc_h + gap_h + top_h + head_h
+    fig = plt.figure(figsize=(W, H))
+    top = fig.add_axes((left_in / W, (calc_h + gap_h) / H, (W - left_in - right_in) / W,
+                        top_h / H))
+    calc = fig.add_axes((0, 0, 1, calc_h / H))
+    calc.set_xlim(x_lo - left_in / unit, x_hi + right_in / unit)
+    calc.set_ylim(0, calc_rows)  # one data unit is one column width both ways
+    calc.axis("off")
 
-    # -- left: how sure the model is of each token ------------------------------------
+    # -- top: how sure the model is of each token --------------------------------------
     xs = list(range(n))
     for x, p in zip(xs, s.probs, strict=True):
         hot = x == k
-        left.bar(x, p, 0.62, color=emph if hot else quiet, zorder=3)
-        left.annotate(f"{p:.4f}", (x, p), textcoords="offset points", xytext=(0, 4),
-                      ha="center", va="bottom", fontsize=11 if hot else 10.2,
-                      fontweight="bold" if hot else "normal",
-                      color=theme.ink if hot else theme.secondary, zorder=5)
-    # the note sits in the empty column above the emphasised bar
+        top.bar(x, p, 0.62, color=emph if hot else quiet, zorder=3)
+        top.annotate(f"{p:.4f}", (x, p), textcoords="offset points", xytext=(0, 4),
+                     ha="center", va="bottom", fontsize=11.5 if hot else 10.8,
+                     fontweight="bold" if hot else "normal",
+                     color=theme.ink if hot else theme.secondary, zorder=5)
     note_y = s.probs[k] + 0.42
-    left.text(k, note_y, "the one digit\nthe model\nis unsure of", ha="center", va="bottom",
-              fontsize=10.5, color=theme.ink, linespacing=1.2, zorder=5)
-    left.annotate("", xy=(k, s.probs[k] + 0.12), xytext=(k, note_y - 0.03),
-                  arrowprops=dict(arrowstyle="-|>", color=theme.ink, lw=1.2,
-                                  mutation_scale=11, shrinkA=0, shrinkB=0), zorder=5)
-    left.set_ylim(0, 1.12)
-    left.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
-    left.set_xlim(-0.6, n - 0.4)
-    left.set_xticks(xs)
-    left.set_xticklabels(names, fontsize=11.5)
-    left.tick_params(axis="x", length=0)
-    left.grid(axis="x", visible=False)
-    left.set_ylabel("probability the model gives the token")
-    left.set_xlabel(f'answer tokens of "{right}", in order')
-    left.set_title("How sure the model is of each token", loc="left", fontsize=12.5, pad=10)
+    top.text(k, note_y, "the one digit\nthe model\nis unsure of", ha="center", va="bottom",
+             fontsize=11, color=theme.ink, linespacing=1.2, zorder=5)
+    top.annotate("", xy=(k, s.probs[k] + 0.12), xytext=(k, note_y - 0.03),
+                 arrowprops=dict(arrowstyle="-|>", color=theme.ink, lw=1.2,
+                                 mutation_scale=11, shrinkA=0, shrinkB=0), zorder=5)
+    top.set_ylim(0, 1.12)
+    top.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
+    top.set_xlim(x_lo, x_hi)
+    top.set_xticks(xs)
+    top.set_xticklabels(names, fontsize=12.5, color=theme.ink)
+    top.tick_params(axis="x", length=0, pad=8)
+    top.grid(axis="x", visible=False)
+    top.set_ylabel("probability of the token")
+    top.set_title("How sure the model is of each token", loc="left", fontsize=12.5, pad=10)
 
-    # -- right: where the answer's log-prob comes from ----------------------------------
-    ax = right_ax
-    h = 0.5
-    y_right, y_wrong = 1.0, 0.0
-    lo, _ = axis_limits([s.total, s.wrong_total], 1.0)
-    edges = [0.0]
-    for lp in s.logprobs:
-        edges.append(edges[-1] + lp)
-    for i, lp in enumerate(s.logprobs):
-        ax.barh(y_right, lp, h, left=edges[i], color=emph if i == k else quiet, zorder=3)
-        if i:  # a surface-coloured seam between segments
-            ax.plot([edges[i]] * 2, [y_right - h / 2, y_right + h / 2], color=theme.surface,
-                    lw=1.6, zorder=4)
-    # inside the emphasised segment: its log-prob and its share of the total
-    mid = (edges[k] + edges[k + 1]) / 2
-    ax.text(mid, y_right + 0.07, f"{names[k]}  {_signed(s.logprobs[k])}", ha="center",
-            va="center", fontsize=11.5, fontweight="bold", color=ink_for(emph), zorder=5)
-    ax.text(mid, y_right - 0.12, f"{100 * s.logprobs[k] / s.total:.0f}% of the total",
-            ha="center", va="center", fontsize=10, color=ink_for(emph), zorder=5)
-    # the other tokens, above the bar, one label per contiguous run of them
-    runs = [list(range(0, k)), list(range(k + 1, n))]
-    for run in runs:
-        if not run:
-            continue
-        a, b = edges[run[0]], edges[run[-1] + 1]
-        x = (a + b) / 2
-        y_text = y_right + h / 2 + 0.2
-        ax.plot([x, x], [y_right + h / 2 + 0.02, y_text - 0.03], color=theme.secondary, lw=0.9,
-                zorder=5)
-        # a run that ends at 0 is right-aligned there, so it stays inside the axes
-        at_zero = run[0] == 0
-        ax.text(0.0 if at_zero else x, y_text,
-                "\n".join(f"{names[i]}  {_signed(s.logprobs[i])}" for i in run),
-                ha="right" if at_zero else "center", va="bottom", fontsize=9.8, color=theme.secondary,
-                linespacing=1.25, zorder=5)
-    others = sum(lp for i, lp in enumerate(s.logprobs) if i != k)
-    # the total, past the bar's end
-    ax.text(s.total - 0.15, y_right + 0.07, f"{_signed(s.total)} in all", ha="right",
-            va="center", fontsize=11.5, fontweight="bold", color=theme.ink, zorder=5)
-    ax.text(s.total - 0.15, y_right - 0.15,
-            f"probability {s.whole_prob:.4f}\nthe other {n - 1} tokens: {_signed(others)}",
-            ha="right", va="center", fontsize=10, color=theme.secondary, linespacing=1.25,
-            zorder=5)
-    # the wrong answer, one plain bar
-    ax.barh(y_wrong, s.wrong_total, h, color=quiet, zorder=3)
-    ax.text(s.wrong_total + 0.12, y_wrong, f"{_signed(s.wrong_total)} in all", ha="left",
-            va="center", fontsize=11.5, fontweight="bold", color=ink_for(quiet), zorder=5)
+    # -- below: the calculation, one column per token ----------------------------------
+    y_mul, y_add = 1.95, 0.95
+    chip_w, chip_h, size = 0.8, 0.3, 13
+    x_eq, xc = n - 0.42, n + 0.3
+    calc.text(x_lo - 0.15, y_mul + 0.5, "How the answer's probability is calculated",
+              ha="left", va="center", fontsize=12.5, fontweight="bold", color=theme.ink)
+    for y, op, values, label in [
+            (y_mul, "×", [f"{p:.4f}" for p in s.probs], "multiply the\nprobabilities"),
+            (y_add, "+", [_signed(lp) for lp in s.logprobs], "add their\nlogs")]:
+        calc.text(x_lo - 0.15, y, label, ha="right", va="center", fontsize=11,
+                  color=theme.secondary, linespacing=1.2)
+        for x, v in zip(xs, values, strict=True):
+            _chip(calc, x, y, v, emph if x == k else quiet, w=chip_w, h=chip_h, size=size,
+                  bold=x == k)
+            if x < n - 1:
+                calc.text(x + 0.5, y, op, ha="center", va="center", fontsize=15,
+                          color=theme.secondary)
+        calc.text(x_eq, y, "=", ha="center", va="center", fontsize=15, color=theme.secondary)
+    # each token's log, from its factor to its term
+    for x in xs:
+        _arrow(calc, x, y_mul - chip_h / 2 - 0.05, x, y_add + chip_h / 2 + 0.05,
+               theme.ink if x == k else theme.secondary, lw=1.6 if x == k else 1.1)
+        calc.text(x + 0.07, (y_mul + y_add) / 2, "log", ha="left", va="center",
+                  fontsize=10.5, style="italic", color=theme.secondary)
+    # the two totals, and the link between them
+    tot_w = 0.95
+    for y in (y_mul, y_add):
+        _box(calc, xc - tot_w / 2, y - chip_h / 2 - 0.02, tot_w, chip_h + 0.04, theme.ink,
+             lw=1.6, z=3)
+    calc.text(xc, y_mul, f"{s.whole_prob:.4f}", ha="center", va="center", fontsize=size,
+              fontweight="bold", color=theme.ink)
+    calc.text(xc, y_add, _signed(s.total), ha="center", va="center", fontsize=size,
+              fontweight="bold", color=theme.ink)
+    calc.text(xc, y_mul + chip_h / 2 + 0.1, "probability of\nthe whole answer", ha="center",
+              va="bottom", fontsize=10.5, color=theme.secondary, linespacing=1.15)
+    calc.text(xc, y_add - chip_h / 2 - 0.1, "sequence log-prob", ha="center", va="top",
+              fontsize=10.5, color=theme.secondary, linespacing=1.15)
+    _arrow(calc, xc, y_add + chip_h / 2 + 0.05, xc, y_mul - chip_h / 2 - 0.05, theme.ink,
+           lw=1.6)
+    calc.text(xc + 0.1, (y_mul + y_add) / 2, f"exp({_signed(s.total)})\n= {s.whole_prob:.4f}",
+              ha="left", va="center", fontsize=11.5, color=theme.ink, linespacing=1.3)
+    # the emphasised term's share of the sum, under it
+    calc.text(k, y_add - chip_h / 2 - 0.12, f"{100 * s.logprobs[k] / s.total:.0f}% of the sum",
+              ha="center", va="top", fontsize=11.5, fontweight="bold", color=theme.ink)
+    calc.text(x_lo - 0.15, 0.22, "Same result either way: adding the logs is the same as "
+              "multiplying the probabilities.", ha="left",
+              va="center", fontsize=11, color=theme.secondary)
 
-    ax.set_xlim(lo, 0)
-    ax.set_ylim(-0.55, 2.05)
-    ax.set_yticks([y_wrong, y_right])
-    ax.set_yticklabels([f'"{wrong}"\nwrong answer', f'"{right}"\nright answer'], fontsize=11)
-    ax.tick_params(axis="y", length=0)
-    ax.grid(axis="y", visible=False)
-    ax.axvline(0, color=theme.axis, lw=1.0, zorder=2)
-    ax.set_xlabel("log-prob of the answer (natural log; more negative = less likely)")
-    ax.set_title("Where the answer's log-prob comes from", loc="left", fontsize=12.5, pad=10)
-
-    fig.suptitle("One uncertain digit costs most of the answer's log-prob", x=0.06, y=0.995,
-                 ha="left", fontsize=13.5, fontweight="bold", color=theme.ink)
-    fig.text(0.06, 0.935, f'The starting model scores "{right}" for "{question}" Its '
-             f"{s.prompt_tokens} prompt tokens are masked out; only the answer's {n} tokens "
-             "are scored.", ha="left", va="center", fontsize=10.2, color=theme.secondary)
-    fig.subplots_adjust(left=0.06, right=0.98, top=0.83, bottom=0.13)
+    fig.suptitle("One uncertain digit costs most of the answer's probability", x=0.04,
+                 y=1 - 0.2 / H, ha="left", fontsize=14, fontweight="bold", color=theme.ink)
+    fig.text(0.04, 1 - 0.55 / H, f'The starting model scores "{right}" for "{question}" Its '
+             f"{s.prompt_tokens} prompt tokens are masked out;\nonly the answer's {n} tokens "
+             "are scored.", ha="left", va="top", fontsize=11, color=theme.secondary,
+             linespacing=1.3)
     return save_both(fig, SLUG, "token-logprobs", theme)
 
 

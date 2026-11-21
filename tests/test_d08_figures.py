@@ -682,7 +682,9 @@ def test_baseline_reach_prints_no_derivation(tmp_path, monkeypatch):
 
 # -- section 1's token-by-token scoring --------------------------------------------
 
-from llmrefresher.demos.d08_figures import least_sure, parse_token_scores  # noqa: E402
+import math  # noqa: E402
+
+from llmrefresher.demos.d08_figures import least_sure, parse_token_scores, reconcile  # noqa: E402
 
 
 def test_parse_token_scores():
@@ -716,7 +718,24 @@ def test_least_sure():
     assert least_sure((0.3, 0.3, 0.9)) == 0
 
 
+def test_reconcile():
+    reconcile((0.5, 0.5), (-0.6931, -0.6931), -1.3862, 0.25)
+    with pytest.raises(CaptureError):  # the sum is off in the 4th decimal
+        reconcile((0.5, 0.5), (-0.6931, -0.6931), -1.3863, 0.25)
+    with pytest.raises(CaptureError):  # the product is off in the 4th decimal
+        reconcile((0.5, 0.5), (-0.6931, -0.6931), -1.3862, 0.2501)
+
+
+def test_real_capture_reconciles():
+    s = parse_token_scores(REAL)
+    assert f"{math.prod(s.probs):.4f}" == f"{s.whole_prob:.4f}" == "0.0396"
+    assert f"{sum(s.logprobs):.4f}" == f"{s.total:.4f}" == "-3.2286"
+
+
 def test_token_logprobs_emphasises_the_least_sure_token(tmp_path, monkeypatch):
+    from matplotlib.colors import to_hex
+    from matplotlib.patches import FancyBboxPatch
+
     seen = {}
 
     def keep(fig, slug, name, theme):
@@ -727,16 +746,25 @@ def test_token_logprobs_emphasises_the_least_sure_token(tmp_path, monkeypatch):
     theme = THEMES[0]
     with styled(theme):
         d08_figures.figure_token_logprobs(theme, d08_figures.CAPTURE)
-    left, right = seen["fig"].axes
-    bars = left.patches
-    heights = [b.get_height() for b in bars]
-    from matplotlib.colors import to_hex
-    hot = [i for i, b in enumerate(bars) if to_hex(b.get_facecolor()) == theme.ink]
+    top, calc = seen["fig"].axes
+    scores = parse_token_scores(REAL)
+    heights = [b.get_height() for b in top.patches]
+    hot = [i for i, b in enumerate(top.patches) if to_hex(b.get_facecolor()) == theme.ink]
     # one bar emphasised, and it is the shortest one the capture printed
+    assert heights == list(scores.probs)
     assert hot == [heights.index(min(heights))]
-    assert heights == list(parse_token_scores(REAL).probs)
-    # the stacked bar's emphasised segment is the same token's log-prob
-    segs = [p for p in right.patches if to_hex(p.get_facecolor()) == theme.ink]
-    assert [round(p.get_width(), 4) for p in segs] == [parse_token_scores(REAL).logprobs[hot[0]]]
-    texts = " ".join(t.get_text() for ax in (left, right) for t in ax.texts)
-    assert all(v in texts for v in ("0.0572", "−2.8617", "−3.2286", "0.0396", "−7.1006", "89%"))
+    # in the calculation, the filled chips in the emphasis colour are that column's
+    # factor and term, and nothing else
+    chips = [p for p in calc.patches if isinstance(p, FancyBboxPatch) and p.get_fill()
+             and to_hex(p.get_facecolor()) == theme.ink]
+    assert len(chips) == 2
+    assert {round(p.get_x() + p.get_width() / 2, 6) for p in chips} == {hot[0]}
+    texts = [t.get_text() for ax in (top, calc) for t in ax.texts]
+    joined = " ".join(texts)
+    for p in scores.probs:
+        assert f"{p:.4f}" in texts
+    for lp in scores.logprobs:
+        assert f"{lp:.4f}".replace("-", "−") in texts
+    assert "0.0396" in texts and "−3.2286" in texts
+    assert "exp(−3.2286)\n= 0.0396" in texts and "89% of the sum" in joined
+    assert "1091" not in joined and "7.1006" not in joined
